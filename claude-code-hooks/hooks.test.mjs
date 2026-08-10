@@ -284,6 +284,97 @@ describe("Stop hook span synthesis", () => {
   });
 });
 
+// —— 诊断流程叙事 summary span（agent 自写哨兵段落，stop.mjs 抽取铸 span）——
+// agent 在最终回答末尾用 <!-- dbdog-diagnosis-summary --> 哨兵包裹一段叙事（investigate
+// skill 指令约束），stop.mjs 抽出来铸成独立 summary span 随 root 推送——前端 banner 直接
+// 渲染，不再 web 侧按需调 LLM。
+describe("诊断流程叙事 summary span", () => {
+  function minTranscript(dir) {
+    return writeTranscript(dir, "min.jsonl", [
+      { type: "user", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+      {
+        type: "assistant",
+        timestamp: T("05.000"),
+        requestId: "r1",
+        message: { model: "m", usage: { input_tokens: 1, output_tokens: 1 }, content: [{ type: "text", text: "结论" }] },
+      },
+    ]);
+  }
+
+  it("抽取哨兵段落铸成 diagnosis.summary span，挂 root、内容为叙事正文", () => {
+    const dir = tempObsDir();
+    const transcript = minTranscript(dir);
+    seedState(dir, "sum1", transcript);
+    const narrative =
+      "实例 pg-prod 上 `get_dbdog_database_health_signals` 返回 **p95 2.3s**，随即查 `get_dbdog_database_query_performance` 锁定 signature X。";
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "sum1",
+        transcript_path: transcript,
+        hook_event_name: "Stop",
+        last_assistant_message: `结论如下。\n\n<!-- dbdog-diagnosis-summary -->\n${narrative}\n<!-- /dbdog-diagnosis-summary -->`,
+      },
+      dir,
+    );
+    const sum = readSpans(dir).find((s) => s.name === "diagnosis.summary");
+    expect(sum, "应铸出 diagnosis.summary span").toBeDefined();
+    expect(sum.kind).toBe("workflow");
+    expect(sum.parent_id).toBe("a".repeat(16)); // root
+    expect(sum.output).toBe(narrative);
+    expect(sum.tags.summary).toBe("1");
+    expect(sum.tags.trace_source).toBe("client");
+  });
+
+  it("无哨兵段落时不产 summary span（不静默造）", () => {
+    const dir = tempObsDir();
+    const transcript = minTranscript(dir);
+    seedState(dir, "sum2", transcript);
+    runHook(
+      "stop.mjs",
+      { session_id: "sum2", transcript_path: transcript, hook_event_name: "Stop", last_assistant_message: "结论如下，没有叙事块。" },
+      dir,
+    );
+    expect(readSpans(dir).find((s) => s.name === "diagnosis.summary")).toBeUndefined();
+  });
+
+  it("多个哨兵块取首个", () => {
+    const dir = tempObsDir();
+    const transcript = minTranscript(dir);
+    seedState(dir, "sum3", transcript);
+    runHook(
+      "stop.mjs",
+      {
+        session_id: "sum3",
+        transcript_path: transcript,
+        hook_event_name: "Stop",
+        last_assistant_message:
+          "<!-- dbdog-diagnosis-summary -->\n第一段\n<!-- /dbdog-diagnosis-summary -->\n<!-- dbdog-diagnosis-summary -->\n第二段\n<!-- /dbdog-diagnosis-summary -->",
+      },
+      dir,
+    );
+    expect(readSpans(dir).find((s) => s.name === "diagnosis.summary").output).toBe("第一段");
+  });
+
+  it("summary span_id 从 (trace_id, summary) 派生，多次 Stop 重发同 id（后写赢去重）", () => {
+    const dir = tempObsDir();
+    const transcript = minTranscript(dir);
+    seedState(dir, "sum4", transcript);
+    const input = {
+      session_id: "sum4",
+      transcript_path: transcript,
+      hook_event_name: "Stop",
+      last_assistant_message: "<!-- dbdog-diagnosis-summary -->\nv1\n<!-- /dbdog-diagnosis-summary -->",
+    };
+    runHook("stop.mjs", input, dir);
+    // 第二次：transcript 无新增行，但 root + summary 仍重发刷新（last-write-wins）
+    input.last_assistant_message = "<!-- dbdog-diagnosis-summary -->\nv2\n<!-- /dbdog-diagnosis-summary -->";
+    runHook("stop.mjs", input, dir);
+    const sums = readSpans(dir).filter((s) => s.name === "diagnosis.summary");
+    expect(new Set(sums.map((s) => s.span_id)).size, "多次 Stop 重发同 span_id").toBe(1);
+  });
+});
+
 // —— llm span 本地完整 prompt（input_local，2026-08-10）——
 // 上报侧 input 恒 null，完整 prompt 只在 spans.jsonl 里（DBDOG_OBS_STORE_LLM_INPUT 可关），
 // reportSpans 前剥离。快照取"该轮模型调用之前的滚动上下文"，截尾存。

@@ -94,6 +94,24 @@ function msBetween(fromIso, toIso) {
   return b - a;
 }
 
+/**
+ * 从最终回答里抽取诊断流程叙事总结。
+ * agent（受 investigate skill 指令约束）在回答末尾用 HTML 注释哨兵包裹一段叙事：
+ *   <!-- dbdog-diagnosis-summary --> …叙事… <!-- /dbdog-diagnosis-summary -->
+ * 哨兵在 markdown 渲染时不可见（段落作为正常散文给诊断者复盘）；此处靠哨兵稳定抽取，
+ * 铸成独立 summary span 随 root 一起推送，前端「诊断流程总结」banner 直接渲染——
+ * 不再 web 侧按需调 LLM（同一大脑 inline 写、零额外调用、省 token）。
+ * 抽不到 / 空 → null（不产 span，不静默造）。
+ */
+function extractSummary(lastAssistantMessage) {
+  if (typeof lastAssistantMessage !== "string" || !lastAssistantMessage) return null;
+  const m = lastAssistantMessage.match(
+    /<!--\s*dbdog-diagnosis-summary\s*-->([\s\S]*?)<!--\s*\/dbdog-diagnosis-summary\s*-->/
+  );
+  const body = m ? m[1].trim() : "";
+  return body || null;
+}
+
 /** 未配对 tool_use 跨批携带上限（state 文件防膨胀；超限丢最旧）。 */
 const PENDING_TOOL_USE_MAX = 200;
 
@@ -437,6 +455,32 @@ async function handleMain(input, state) {
     tags: { trace_source: "client", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
   });
   state.root_emitted = true;
+
+  // 诊断流程叙事 summary span：agent 在最终回答里自写的哨兵段落抽出来铸成独立 span。
+  // span_id 从 (trace_id,"summary") 派生——多次 Stop 重发同 id，读侧"后写赢"去重，
+  // 与 root 同批进 emit（sweep.mjs 重发路径也能带上，无需特殊处理）。抽不到则不产。
+  const narrative = extractSummary(input.last_assistant_message);
+  if (narrative) {
+    spans.push({
+      trace_id: state.trace_id,
+      span_id: deriveSpanId(state.trace_id, "summary"),
+      parent_id: state.root_span_id,
+      session_id: state.session_id,
+      kind: "workflow",
+      name: "diagnosis.summary",
+      model: null,
+      status: "ok",
+      ts: lastEntryTs ?? new Date().toISOString(),
+      duration_ms: null,
+      input: null,
+      output: cap(narrative),
+      tokens_input: null,
+      tokens_output: null,
+      tokens_cache_read: null,
+      tokens_cache_creation: null,
+      tags: { trace_source: "client", summary: "1", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
+    });
+  }
 
   const pending = await emit(spans, pendingIds(state.pending_spans));
   state.cursor = nextCursor;
