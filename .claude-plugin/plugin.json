@@ -1,5 +1,5 @@
 {
   "name": "dbdog-agent-obs",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "dbdog Agent Observability client hooks for Claude Code（mint → propagate → synthesize → sweep；子代理内部调用可见，span 树三层。脚本本体在 claude-code-hooks/，hooks/hooks.json 经 ${CLAUDE_PLUGIN_ROOT} 引用）"
 }

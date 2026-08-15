@@ -47,11 +47,13 @@ run(async () => {
 
   // 先甩出去再读 stdin——万一 stdin 是坏 JSON，也不能耽误收尸
   try {
-    spawn(process.execPath, [path.join(HERE, "sweep.mjs")], {
+    const child = spawn(process.execPath, [path.join(HERE, "sweep.mjs")], {
       detached: true,
       stdio: "ignore",
       env: process.env,
-    }).unref();
+    });
+    child.once("error", () => {}); // spawn 的运行期失败走异步 error 事件,不接住会崩掉 hook
+    child.unref();
   } catch {
     /* 起不来就算了，下次会话再试；绝不打断会话 */
   }

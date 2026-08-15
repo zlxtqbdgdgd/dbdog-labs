@@ -79,7 +79,10 @@ export function summaryEnv() {
     );
   }
   const timeoutMs = Number(process.env.DBDOG_SUMMARY_LLM_TIMEOUT_MS) || 30_000;
-  return { baseUrl, apiKey, model, timeoutMs };
+  // 输出预算(2026-08-14 提到 2048):实测 deepseek-v4-flash 一段合格总结 1194 output
+  // tokens,旧值 1024 连直答都会拦腰截断;推理模型的 thinking 另行关闭(见 generateSummary)。
+  const maxTokens = Number(process.env.DBDOG_SUMMARY_LLM_MAX_TOKENS) || 2048;
+  return { baseUrl, apiKey, model, timeoutMs, maxTokens };
 }
 
 // ---------- 裁剪 ----------
@@ -240,27 +243,45 @@ export function buildPrompt(factTable) {
  * Anthropic Messages 协议（plain fetch，无 SDK）。
  * GLM Coding Plan 走 ${BASE_URL}/v1/messages（base 用 https://open.bigmodel.cn/api/anthropic）。
  * system 放顶层字段，max_tokens 必填，响应从 content[].text 取。失败抛 Error（上层 best-effort 吞）。
+ *
+ * 推理模型兼容（2026-08-14，47 圈巡检 45 圈无总结的根因）：deepseek-v4 系经 Anthropic
+ * 兼容端点是推理模型——thinking 块先行，1024 的预算全被 thinking 烧光，text 一个字没出
+ * 就 stop_reason=max_tokens，「空 content」把 worker 静默弄死；加大预算没用（实测 4096
+ * 时 thinking 涨到 7761 字符，text 仍为 0，模型把 thinking 撑满给多少烧多少）。
+ * 根治是请求里显式 thinking:{type:"disabled"}（Anthropic 协议标准字段，实测 deepseek
+ * 端点认，直接 end_turn 出正文）。个别老兼容端点可能不认该字段而 4xx——去掉它重试一次，
+ * 行为退回 0.4.4（非推理模型本来就不需要）。
  */
 export async function generateSummary(messages, env) {
   const url = `${env.baseUrl.replace(/\/+$/, "")}/v1/messages`;
   const system = messages.find((m) => m.role === "system")?.content;
   const turns = messages.filter((m) => m.role !== "system");
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${env.apiKey}`,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model: env.model,
-      max_tokens: 1024,
-      temperature: 0.2,
-      ...(system ? { system } : {}),
-      messages: turns,
-    }),
-    signal: AbortSignal.timeout(env.timeoutMs),
-  });
+  const base = {
+    model: env.model,
+    max_tokens: env.maxTokens ?? 2048,
+    temperature: 0.2,
+    ...(system ? { system } : {}),
+    messages: turns,
+  };
+  const post = (body) =>
+    fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${env.apiKey}`,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(env.timeoutMs),
+    });
+
+  let res = await post({ ...base, thinking: { type: "disabled" } });
+  if (!res.ok && res.status === 400) {
+    // 老兼容端点不认 thinking 字段 → 去掉重试一次（幂等只读调用，重试无副作用）。
+    // 只对 400（bad request，"不认这个字段"一类）：401/403 重试无意义，
+    // 429 重试是给限流火上浇油（codex 复审反例:双发）。
+    res = await post(base);
+  }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`LLM HTTP ${res.status}: ${detail.slice(0, 300)}`);
@@ -271,7 +292,11 @@ export async function generateSummary(messages, env) {
     .map((b) => b.text ?? "")
     .join("")
     .trim();
-  if (!text) throw new Error("LLM 返回空 content");
+  if (!text) {
+    // 说清截停原因与块型——「空 content」三个字曾让 45 圈的死因整整藏了两天
+    const blocks = (data?.content ?? []).map((b) => b?.type ?? "?").join(",") || "(无)";
+    throw new Error(`LLM 无 text 输出：stop_reason=${data?.stop_reason ?? "?"}，content 块=[${blocks}]`);
+  }
   return {
     text,
     model: env.model,

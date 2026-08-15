@@ -239,7 +239,7 @@ transcript 里、tool_use 参数不入缓冲、长度以 usage 的 token 计数�
 | `DBDOG_OBS_SWEEP_IDLE_MS` | 2 小时 | 状态文件多久没被写过才算"会话已结束"，可以安全接管 |
 | `DBDOG_OBS_SWEEP_TTL_MS` | 7 天 | 已排空的主会话状态文件保留多久 |
 | `DBDOG_OBS_SWEEP_SUB_TTL_MS` | 1 天 | 子代理状态文件保留多久（不会复活，排空即可删） |
-| `DBDOG_OBS_SWEEP_BATCH` | 200 | 单批补发条数（服务端限 1000 条 / 5MB） |
+| `DBDOG_OBS_SWEEP_BATCH` | 50 | 单批补发条数（服务端限 1000 条 / 5MB；2026-08-14 自 200 调小，配合 sweep 侧 10s 缺省上报超时——`DBDOG_OBS_REPORT_TIMEOUT_MS` 显式配置仍最高优先） |
 
 三条设计要点：
 

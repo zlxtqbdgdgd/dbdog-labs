@@ -60,6 +60,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/claude-code-hooks/session-end.mjs\"",
+            "timeout": 30,
+            "statusMessage": "dbdog-obs: flush session tail"
+          }
+        ]
+      }
     ]
   }
 }

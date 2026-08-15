@@ -51,6 +51,16 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "DBDOG_OBS_REPORT_URL='http://<dbdog-mcp地址>/api/v2/llmobs/spans' DBDOG_OBS_API_KEY='<填入dbdog_开头的API key>' node /ABSOLUTE/PATH/TO/dbdog-client-kit/claude-code-hooks/session-end.mjs"
+          }
+        ]
+      }
     ]
   }
 }

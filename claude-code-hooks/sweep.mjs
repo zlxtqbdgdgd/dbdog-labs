@@ -36,8 +36,20 @@ const TTL_MS = envMs("DBDOG_OBS_SWEEP_TTL_MS", 7 * DAY);
 /** 子代理状态文件保留多久——子代理不会复活，排空即无保留价值；
  *  且并行子代理一次就留下几十个文件（实测有会话起了 42 个）。 */
 const SUB_TTL_MS = envMs("DBDOG_OBS_SWEEP_SUB_TTL_MS", 1 * DAY);
-/** 单批补发条数上限（服务端限 1000 条 / 5MB，留足余量）。 */
-const BATCH = envMs("DBDOG_OBS_SWEEP_BATCH", 200);
+/** 单批补发条数上限（2026-08-14 调 200→50，经验值）：全文 span 的 input/output 各
+ *  8K **字符**封顶（UTF-8 字节数可再放大——中文约 3 字节/字符，JSON 转义还会加码），
+ *  50 条 ASCII 约 0.8MB、重中文场景约 2.4MB。回填实测 100 条/批（1–2MB）WAN 上 1–2s
+ *  完成，50 条 + 10s 预算按此留了数倍余量；但这是典型链路的经验值，不是最坏情况承诺
+ *  ——极端慢链路请调 DBDOG_OBS_SWEEP_BATCH / DBDOG_OBS_REPORT_TIMEOUT_MS。
+ *  旧组合 200 条骑在 3s 缺省超时上，47 圈巡检实测 3 个积压文件（213/141/24 条）横跨
+ *  30+ 个 SessionStart 反复补发不动（一批超时→整体留着→下次原样再撞）。
+ *  服务端限 1000 条/5MB 不变。 */
+const BATCH = envMs("DBDOG_OBS_SWEEP_BATCH", 50);
+
+// sweep 不在任何交互路径上（SessionStart/SessionEnd detached 起），上报超时缺省放宽到
+// 10s 与批量匹配；用户显式配的 DBDOG_OBS_REPORT_TIMEOUT_MS 仍最高优先。3s 缺省是按
+// Stop 关键路径定的（lib.mjs reportTimeoutMs），收尸场景照搬它正是排不空的另一半原因。
+if (!process.env.DBDOG_OBS_REPORT_TIMEOUT_MS) process.env.DBDOG_OBS_REPORT_TIMEOUT_MS = "10000";
 
 /** 子代理状态文件名形如 <session_id>.<agent_id>.json；主会话是 <session_id>.json。 */
 function isSubagentState(fileName) {

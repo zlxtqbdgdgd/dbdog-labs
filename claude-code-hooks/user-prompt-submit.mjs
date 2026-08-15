@@ -51,6 +51,8 @@ run(async () => {
           transcript_path: prev.transcript_path ?? input.transcript_path ?? null,
           pending_tool_uses: prev.pending_tool_uses ?? {},
           last_entry_ts: prev.last_entry_ts ?? null,
+          // 尾组延续信息一并交给收尾批:交界拆开的 requestId 组要按旧身份重发(同键同 ts)
+          partial_llm: prev.partial_llm ?? null,
         }
       : null;
 
