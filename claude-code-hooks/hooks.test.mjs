@@ -10,6 +10,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HOOK_DIR = path.dirname(fileURLToPath(import.meta.url));
+// 版本章（设计 D6）的判据：hook 盖的 hooks_version 必须等于插件清单里的版本。
+// 这里也**现读清单**而不写字面量——把版本抄进测试，bump 时忘了同步就只会绿着骗人。
+const PLUGIN_VERSION = JSON.parse(
+  fs.readFileSync(path.join(HOOK_DIR, "..", ".claude-plugin", "plugin.json"), "utf8"),
+).version;
 const tempDirs = [];
 
 afterEach(() => {
@@ -332,6 +337,14 @@ describe("Stop hook span synthesis", () => {
     expect(new Set(spans.map((s) => s.session_id))).toEqual(new Set(["s1"]));
     const root = spans.find((s) => s.kind === "agent");
     expect(root.output).toBe("结论如下");
+
+    // 版本章（D6）：root 盖 hooks_version，值来自插件清单；非 root 一律不盖
+    // （一棵树一份章，llm/tool 上再抄一遍只是把同一事实复制 N 遍）。
+    expect(root.parent_id).toBeNull();
+    expect(root.tags.hooks_version).toBe(PLUGIN_VERSION);
+    for (const s of spans.filter((x) => x.span_id !== root.span_id)) {
+      expect(s.tags?.hooks_version, `${s.kind}/${s.name} 不该盖版本章`).toBeUndefined();
+    }
   });
 
   it("pairs a tool_use with a tool_result that arrives in a later batch", () => {
@@ -683,6 +696,14 @@ describe("subagent path tracing", () => {
     // 子代理内部的调用挂子代理自己的 agent span，不再直接挂父侧 tool span
     expect(bash.parent_id).toBe(subAgent.span_id);
     expect(subLlm.parent_id).toBe(subAgent.span_id);
+
+    // 版本章（D6）判据是「kind=agent 且无 parent_id」——子代理也是 agent span，
+    // 但有 parent_id，不得盖章；只有真 root 盖。
+    expect(root.tags.hooks_version).toBe(PLUGIN_VERSION);
+    expect(subAgent.parent_id).toBeTruthy();
+    expect(subAgent.tags.hooks_version).toBeUndefined();
+    expect(agentTool.tags.hooks_version).toBeUndefined();
+    expect(subLlm.tags.hooks_version).toBeUndefined();
   });
 
   it("nests L2 when Agent tool_result only has agentId in the async-launch text", () => {
@@ -2180,6 +2201,9 @@ describe("codex 复审阻断项", () => {
     expect(root.input).toContain("诊断: 为何慢");
     expect(root.output).toContain("根因在 X");
     expect(root.ts).toBe(st.started_at); // ts 锚 trace 起点,与 Stop 的 root 同键可折叠
+    // 版本章(D6):SessionEnd 补的 root 与 Stop 的 root 同形,同样盖 hooks_version
+    expect(root.parent_id).toBeNull();
+    expect(root.tags.hooks_version).toBe(PLUGIN_VERSION);
     const llm = spans.filter((s) => s.kind === "llm");
     expect(llm).toHaveLength(1);
     expect(llm[0].parent_id).toBe(st.root_span_id);

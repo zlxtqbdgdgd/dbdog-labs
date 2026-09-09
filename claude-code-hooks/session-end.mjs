@@ -41,6 +41,7 @@ import {
   readState,
   readStdinJson,
   reportSpans,
+  rootSpanTags,
   run,
   writeState,
 } from "./lib.mjs";
@@ -202,7 +203,7 @@ async function flushMainTail(input, state) {
       tokens_output: null,
       tokens_cache_read: null,
       tokens_cache_creation: null,
-      tags: { trace_source: "client", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
+      tags: rootSpanTags(state),
     });
     state.root_emitted = true;
   }

@@ -38,6 +38,7 @@ import {
   run,
   deriveSpanId,
   pendingIds,
+  rootSpanTags,
 } from "./lib.mjs";
 import { PENDING_TOOL_USE_MAX, msBetween, readNewLines, synthesize } from "./synthesize.mjs";
 import { summaryEnv } from "./summary.mjs";
@@ -218,7 +219,7 @@ async function handleMain(input, state) {
     tokens_output: null,
     tokens_cache_read: null,
     tokens_cache_creation: null,
-    tags: { trace_source: "client", ...(state.ml_app ? { ml_app: state.ml_app } : {}) },
+    tags: rootSpanTags(state),
   });
   state.root_emitted = true;
 

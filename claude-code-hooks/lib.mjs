@@ -42,6 +42,45 @@ export function spansPath() {
   return process.env.DBDOG_OBS_SPANS?.trim() || path.join(obsDir(), "spans.jsonl");
 }
 
+let hooksVersionCache;
+
+/**
+ * 本 kit 自己的版本——**从插件清单读，不在脚本里抄常量**（同一事实只许一个 owning path）。
+ * 定位是确定性的：hooks.json 里每个 hook 都就地执行
+ * `${CLAUDE_PLUGIN_ROOT}/claude-code-hooks/<x>.mjs`，install.mjs 也只改 settings.json 的
+ * env 块、从不拷贝脚本，所以本文件永远与 `.claude-plugin/plugin.json` 保持同一层相对关系，
+ * 不需要读 CLAUDE_PLUGIN_ROOT。读不到/无该字段一律 "unknown"——版本章只记不拦，
+ * 缺章不得影响 span 落盘（hook 纪律：不抛、不打断会话）。模块级缓存一次。
+ */
+export function hooksVersion() {
+  if (hooksVersionCache === undefined) {
+    let v;
+    try {
+      const manifest = JSON.parse(
+        fs.readFileSync(new URL("../.claude-plugin/plugin.json", import.meta.url), "utf8"),
+      );
+      v = typeof manifest.version === "string" ? manifest.version.trim() : "";
+    } catch {
+      v = "";
+    }
+    hooksVersionCache = v || "unknown";
+  }
+  return hooksVersionCache;
+}
+
+/**
+ * root span 的 tags——Stop 与 SessionEnd 两个 root 合成点共用这一份。
+ * `hooks_version` 是版本章（设计 D6「五个全自动，谁经手谁盖；只记不拦」）里 hook 那一格：
+ * 一条 trace 得说得出自己跑在哪一版 hook 上，否则跨 run 对比时无从判断差异是不是版本引起的。
+ */
+export function rootSpanTags(state) {
+  return {
+    trace_source: "client",
+    hooks_version: hooksVersion(),
+    ...(state.ml_app ? { ml_app: state.ml_app } : {}),
+  };
+}
+
 export function readState(sessionId, agentId) {
   try {
     return JSON.parse(fs.readFileSync(statePath(sessionId, agentId), "utf8"));
