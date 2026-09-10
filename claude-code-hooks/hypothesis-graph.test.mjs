@@ -313,6 +313,41 @@ describe("hypothesis-graph · compact graph for the server (2026-09-10)", () => 
   });
 });
 
+describe("hypothesis-graph · covered_through（2026-09-10）", () => {
+  // server 判「图落后于 span」靠事件时间覆盖面：图里带上参与出图的最晚 span ts，
+  // 读侧拿它跟 span 水位 max(ts) 比。按入库时间比会一律 stale——SessionEnd 先出图后上报，
+  // 图必然先于尾部 span 入库，可图的内容是全的（出图读的是本地 spans.jsonl）。
+  it("取参与出图的全部 span 里最晚的 ts 原值，不取 now", () => {
+    const g = build([
+      llm("l1", "2026-09-10T08:30:00.000Z", { output: "Propose [H1] type=cause; claim=c; expect=e" }),
+      dbdog("t1", "get_dbdog_metric", "2026-09-10T08:31:20.500Z", "[H1] expect=e; intent=read"),
+      llm("l2", "2026-09-10T08:30:40.000Z", { output: "无关" }),
+    ]);
+    expect(g.covered_through).toBe("2026-09-10T08:31:20.500Z");
+  });
+
+  it("本地工具虽然不进图，事件时间照样算进覆盖面", () => {
+    // 本地 Read/Grep 不占 seq、不进边，但它们确实是这次会话的 span，server 水位 max(ts) 会算上；
+    // 覆盖面漏掉它们就会被误判成 stale。
+    const g = build([
+      dbdog("t1", "get_dbdog_metric", "2026-09-10T08:30:00.000Z", "[H1] type=cause; claim=c; expect=e"),
+      tool("l1", "Read", "2026-09-10T08:32:00.000Z"),
+    ]);
+    expect(g.covered_through).toBe("2026-09-10T08:32:00.000Z");
+  });
+
+  it("一条 span 都没有就是 null", () => {
+    expect(build([]).covered_through).toBeNull();
+  });
+
+  it("compactGraph 带上 covered_through", () => {
+    const c = compactGraph(build([
+      dbdog("t1", "get_dbdog_metric", "2026-09-10T08:30:00.000Z", "[H1] type=cause; claim=c; expect=e"),
+    ]));
+    expect(c.covered_through).toBe("2026-09-10T08:30:00.000Z");
+  });
+});
+
 describe("graph-worker · pushes the graph to the server on the root span", () => {
   it("re-emits the root span with a compact graph through DBDOG_OBS_REPORT_URL", async () => {
     const http = await import("node:http");
