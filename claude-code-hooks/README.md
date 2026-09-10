@@ -135,6 +135,10 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   （`local_tools_excluded` / `local_tools_excluded_by_name`）。SessionEnd 先出图后上报——本地落盘一完成就起
   graph worker，网络上报排在后面；Claude Code 给 hook 的 30s 预算被慢链路吃掉、hook 被 "Hook cancelled"
   杀掉也不影响图（未送达的 span 留在 `pending_spans`，sweep 补发）。
+  图里带 `covered_through`：参与出图的全部 span 里**最晚的 `ts`**（事件时间原值，没有 span 时为 `null`）。
+  server 判「图落后于 span」用它跟该 trace 的 span 水位 `max(ts)` 比——两端都是事件时间。别按入库时间比：
+  先出图后上报意味着图必然先于尾部 span 入库，那样判会一律 stale，可图的内容其实是全的
+  （出图读的是本地 `spans.jsonl`，尾部 span 已经落盘）。
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
   `DBDOG_OBS_CONTENT_CHARS`（**上报侧**内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS`
   先例；本地 `spans.jsonl` 不受它约束，超限字段另落 `<字段>_local` 全量副本，见「span 形状」）、
