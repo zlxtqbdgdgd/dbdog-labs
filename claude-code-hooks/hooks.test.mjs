@@ -76,6 +76,33 @@ describe("hypothesis intent tags", () => {
   });
 });
 
+describe("点分编号即谱系：没写 < 也要挂得上（2026-09-10 实测）", () => {
+  // 实测：一轮 460 次点分编号的调用，**写了 `<父` 的是 0 次**——模型读到 [H4.1] 就认为
+  // 层级已经表达完了，那个 `<H4` 在它看来是冗余。旧例子 `[H2.1<H1.2]`（H2.1 的父是 H1.2）
+  // 恰恰在教「编号与父无关」，是这个行为的来源。约定改成**编号即谱系**，`<` 只在跨号派生时写。
+  it("[H4.1] 的父按点分前缀推成 H4", () => {
+    expect(parseIntent("[H4.1] type=cause; claim=x")?.parent).toBe("H4");
+    expect(hypothesisTags("[H4.1] type=cause; claim=x").parent_hypothesis_id).toBe("H4");
+  });
+
+  it("多级也推：[H4.3.2] 的父是 H4.3", () => {
+    expect(parseIntent("[H4.3.2] claim=x")?.parent).toBe("H4.3");
+  });
+
+  it("顶层没有父：[H4] 不推出 H", () => {
+    expect(parseIntent("[H4] claim=x")?.parent).toBeUndefined();
+    expect(hypothesisTags("[H4] claim=x").parent_hypothesis_id).toBeUndefined();
+  });
+
+  it("显式写的父优先——跨号派生只能靠它，不许被点分前缀覆盖", () => {
+    expect(parseIntent("[H2.1<H1.2] claim=x")?.parent).toBe("H1.2");
+  });
+
+  it("带 - 后缀的容错编号也按点分推：[H4.1-root] 的父是 H4", () => {
+    expect(parseIntent("[H4.1-root] claim=x")?.parent).toBe("H4");
+  });
+});
+
 describe("hypothesis intent tags · English keys (intent-v2, 2026-09-10)", () => {
   // 单源改到 dbdog-mcp 的 telemetry.intent schema 描述（英文键）：type/claim/expect/close/intent，
   // 源码来源 basis=source; code_ref=file:line。中文键继续认（历史 span），内部表示不变。

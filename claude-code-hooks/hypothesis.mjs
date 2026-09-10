@@ -68,11 +68,27 @@ export function parseFields(body) {
   return out;
 }
 
+/**
+ * 谁是它的父：**显式写的 `<父` 优先**（跨号派生只能靠它），没写就按**点分前缀**推
+ * （`H4.1` → `H4`，`H4.3.2` → `H4.3`）；顶层编号没有父。
+ *
+ * 为什么要推：2026-09-10 实测一轮 460 次点分编号的调用，写了 `<父` 的是 **0 次**——
+ * 模型读到 `[H4.1]` 就认为层级已经表达完了，那个 `<H4` 在它看来是冗余。
+ * 不推的话这些节点全是孤儿，树上挂不到任何地方（页面表现：H4.1 没挂在 H4 右边）。
+ * 容错后缀（`[H4.1-root]`）先剥掉再推。
+ */
+export function parentOfId(id, explicit) {
+  if (explicit) return explicit;
+  const bare = String(id ?? "").replace(/-[A-Za-z0-9_]+$/, "");
+  const i = bare.lastIndexOf(".");
+  return i > 0 ? bare.slice(0, i) : undefined;
+}
+
 export function parseIntent(intent) {
   if (typeof intent !== "string" || !intent.trim()) return null;
   const m = HEAD.exec(normalizeHypothesisText(intent));
   if (!m) return null;
-  return { id: m[1], parent: m[2] || undefined, ...parseFields(m[3]) };
+  return { id: m[1], parent: parentOfId(m[1], m[2]), ...parseFields(m[3]) };
 }
 
 /** 写了 claim=/expect= 等字段却没有 [H..] 头（不守约定的典型形态）。 */

@@ -22,6 +22,19 @@
 //     [--scenarios 000,001,204] [--limit N] [--prompt-source auto|platform|dataset] \
 //     [--model MODEL] [--judge-model MODEL] [--concurrency 2] [--timeout-sec 900] [--dry-run]
 //
+// 盲测评测那条路另外四个开关（真实用户用不上）：
+//   --workdir <路径>            固定工作目录 = 被诊断系统的源码树（给了就不铺模板、不删目录）
+//   --deny-root <路径>          禁读根，可重复；生成 Read/Grep/Glob 三条 deny 规则
+//   --guard-hook <命令行>       PreToolUse 护栏钩子，补 deny 挡不住的 Bash 读文件那条洞
+//
+// **题面里禁止加料**（owner 2026-09-10 定）：题面是用户会怎么问，我们不知道真实用户怎么用，
+// 往里塞我们的引导语，测出来的就不是产品面的真实行为了。假设书写约定的唯一定义处是
+// `src/toolsets/shared/schema.ts` 里 telemetry.intent 的描述，skill 正文只讲用法并引用同一行示例；
+// agent 从工具描述里学，不靠题面兜底。曾经有过一个 --prompt-prefix-file 开关，已按这条删除。
+// **例外只有复现时间窗**：它是用例自己的数据，不是引导语——真实用户本来就会说「几点到几点有问题」，
+// 不说反而不像真实提问。来源是 `record.metadata.repro`（复现那一步写入），没有就原样发题、
+// 绝不编一个窗口出来。见 lib/case-window.mjs。
+//
 // run 先建后跑（P3/D7）：开跑前先 POST 控制面建一条 run 拿 uuid，events 的 experiment_id 用它，
 // 于是判题包的 judge_summary 当场有落点、重测能挂 --parent（对比页按 parent 找基线）。
 // --parent 收 uuid / run 名 / 逻辑名（同逻辑名多条取最新一条），解析不到直接停。
@@ -43,6 +56,8 @@ import {
   requireCredential,
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
+import { mergeAgentSettings } from "./lib/blind-guard.mjs";
+import { promptWithWindow } from "./lib/case-window.mjs";
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -65,6 +80,14 @@ const argOf = (name, dflt) => {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
 };
 const has = (name) => process.argv.includes(name);
+/** 可重复参数：`--deny-root a --deny-root b` → ["a","b"]。 */
+const argsOf = (name) => {
+  const out = [];
+  for (let i = 0; i < process.argv.length; i++) {
+    if (process.argv[i] === name && process.argv[i + 1]) out.push(process.argv[i + 1]);
+  }
+  return out;
+};
 
 function fail(msg) {
   console.error(`✗ ${msg}`);
@@ -95,6 +118,14 @@ const NOTES = argOf("--notes", "");
 // 用户目录同一份，跑批测的就是产品面；SERVER_INSTRUCTIONS/skill 是 DD 逐字镜像不可加料）。
 // --workdir-template none 恢复空目录（量「裸」行为用）。
 const WORKDIR_TEMPLATE = argOf("--workdir-template", path.join(ROOT, "clients", "diag-workdir-template"));
+// --workdir：固定工作目录（评测场景 = 被诊断系统的内核源码树，让 `code` skill 能面对源码、
+// 把根因钉到 file:line）。给了它就**不铺模板**——往源码树里铺 CLAUDE.md 会弄脏被测树，
+// 作弊体检那关会报 HEAD 不干净。
+const WORKDIR = argOf("--workdir", "");
+if (WORKDIR && !fs.existsSync(WORKDIR)) fail(`--workdir 不存在：${WORKDIR}`);
+// 盲测护栏（可选，见 lib/blind-guard.mjs）。真实用户不需要，评测才要。
+const DENY_ROOTS = argsOf("--deny-root");
+const GUARD_HOOK = argOf("--guard-hook", "");
 const DRY = has("--dry-run");
 
 requireCredential();
@@ -117,7 +148,12 @@ function loadHooksSettings() {
       }
     }
   }
-  return JSON.stringify({ hooks: parsed.hooks });
+  // 护栏与采集共用这一份：同一个 claude 进程只收一份 --settings，各传各的会互相覆盖。
+  return JSON.stringify(mergeAgentSettings({
+    hooks: parsed.hooks,
+    denyRoots: DENY_ROOTS,
+    guardHookCommand: GUARD_HOOK,
+  }));
 }
 const hooksSettings = loadHooksSettings();
 
@@ -188,20 +224,29 @@ async function runOne(record, idx, ctx) {
   const label = (meta.num || meta.slug)
     ? `${meta.num ?? idx} ${meta.slug ?? ""}`.trim()
     : (kindTag ? kindTag.slice(5) : `#${idx}`);
-  const prompt = ctx.promptOf(record);
-  if (!prompt) {
+  // 题面原样发出去，不加料（见文件头「题面里禁止加料」）。唯一拼进去的是**复现时间窗**——
+  // 那是这条用例自己的数据、真实用户本来就会说的，不是我们的引导语（lib/case-window.mjs）。
+  const bare = ctx.promptOf(record);
+  if (!bare) {
     return { record, label, error: `无提示词（scenario ${meta.scenario_id ?? "?"} 不在 ${ctx.source} 源里）` };
   }
+  const prompt = promptWithWindow(bare, meta?.repro);
 
   console.error(`▶ [${label}] 开跑（${ctx.source} NL，${prompt.length} 字符）`);
   const t0 = Date.now();
   // 每用例独立 cwd（保持 e2e 的 H1 隔离），按模板铺 CLAUDE.md 等 host 层引导。
-  const caseCwd = fs.mkdtempSync(path.join(os.tmpdir(), "llmobs-case-"));
-  if (WORKDIR_TEMPLATE !== "none" && fs.existsSync(WORKDIR_TEMPLATE)) {
+  // --workdir 给了就用它、不铺模板也不删：那是被诊断系统的源码树，铺文件会弄脏它。
+  const fixedCwd = Boolean(WORKDIR);
+  const caseCwd = fixedCwd ? WORKDIR : fs.mkdtempSync(path.join(os.tmpdir(), "llmobs-case-"));
+  if (!fixedCwd && WORKDIR_TEMPLATE !== "none" && fs.existsSync(WORKDIR_TEMPLATE)) {
     for (const f of fs.readdirSync(WORKDIR_TEMPLATE)) {
       fs.copyFileSync(path.join(WORKDIR_TEMPLATE, f), path.join(caseCwd, f));
     }
   }
+  const dropCwd = () => {
+    if (fixedCwd) return;                       // 固定目录是别人的，删了就闯祸
+    dropCwd();
+  };
   let run;
   try {
     run = await runAgentCli({
@@ -219,7 +264,7 @@ async function runOne(record, idx, ctx) {
       timeoutMs: TIMEOUT_MS,
     });
   } catch (e) {
-    try { fs.rmSync(caseCwd, { recursive: true, force: true }); } catch { /* */ }
+    dropCwd();
     const failure = `agent 失败：${e.message || e}`;
     const partial = e?.partial;
     if (!partial?.sessionId) {
@@ -232,7 +277,7 @@ async function runOne(record, idx, ctx) {
     console.error(`☠ [${label}] ${failure}；已收尸${reapErr ? `（${reapErr}）` : ""}`);
     run = { ...partial, prose: "", partialProse: partial.prose || "", failure };
   }
-  try { fs.rmSync(caseCwd, { recursive: true, force: true }); } catch { /* */ }
+  dropCwd();
   const durationMs = Date.now() - t0;
 
   // trace_id：stream-json 的 session_id → hooks 状态文件。
@@ -249,10 +294,9 @@ async function runOne(record, idx, ctx) {
   const noTrace = !traceId;
   if (noTrace) console.error(`✗ [${label}] 未捞到 trace_id（hooks 未生效？session=${run.sessionId || "?"}）`);
 
-  // 确定性指标（从 stream-json 内存算，trace 树是同源数据）。
+  // 确定性指标。工具那三个（tool_calls / tool_errors / degraded_calls）由 orchestrationMetrics
+  // 从 **span 树** 出，含子代理；这里的 stream-json 只用来出 tool_calls_main_session。
   const tools = run.toolCalls ?? [];
-  const toolErrors = tools.filter((t) => t.outcome === "error").length;
-  const degraded = tools.filter((t) => typeof t.output === "string" && t.output.includes('"capability_unavailable"')).length;
   const usage = run.usage ?? {};
   const score = (label2, value) =>
     Number.isFinite(value) ? [{ label: label2, metric_type: "score", score_value: value, metric_source: "deterministic" }] : [];
@@ -261,15 +305,12 @@ async function runOne(record, idx, ctx) {
   // 以前只有 LLM 判题事后能看出「fan-out 多少、撞没撞并发上限、假设收没收口、结论引用的假设
   // 树上有没有」，一次判题很贵；这些事实本来就写在 span 上，每轮自动出数才有分布可谈。
   // **本轮只观测不管控**：不设阈值、不加 cap。
-  // 既有的 `tool_calls` 那条不动（它数的是 stream-json 的调用，与 span 树口径不同——
-  // run A 实测 264 vs 329，差在哪没查），所以这里把同名的那条排掉，不发第二份。
   const traceSpans = traceSpansOf(ctx.obsDir, traceId);
   const orch = traceSpans ? orchestrationMetrics(traceSpans) : null;
-  const orchMetrics = orch
-    ? Object.entries(orch)
-      .filter(([label2]) => label2 !== "tool_calls")
-      .flatMap(([label2, value]) => score(label2, value))
-    : [];
+  // tool_calls / tool_errors / degraded_calls 三条都由它出（span 树，含子代理）。
+  // 原来这里把 tool_calls 过滤掉、留 stream-json 那份——那份只有主会话，委派越重低报越多
+  // （2026-09-10 实测 411 vs 1128，15 个子代理）。owner 定：子代理也要数。
+  const orchMetrics = orch ? Object.entries(orch).flatMap(([label2, value]) => score(label2, value)) : [];
 
   // LLM-judge（用户侧模型；失败不阻塞事件写入，记 error_message）。没跑完的用例没有结论可判，不浪费一次判题。
   let judged;
@@ -291,9 +332,9 @@ async function runOne(record, idx, ctx) {
     ...score("tokens_input", usage.input_tokens),
     ...score("tokens_output", usage.output_tokens),
     ...score("tokens_cache_read", usage.cache_read_input_tokens),
-    ...score("tool_calls", tools.length),
-    ...score("tool_errors", toolErrors),
-    ...score("degraded_calls", degraded),
+    // 主会话那份单独留一条：两个数并排才看得出这一轮把多少活派给了子代理。
+    // 读不到 span 时（hooks 没生效）上面三条整个不发——缺数据不许发一串 0。
+    ...score("tool_calls_main_session", tools.length),
     ...score("num_turns", run.numTurns ?? NaN),
     ...score("cost_usd", run.costUsd ?? NaN),
     ...orchMetrics,
@@ -346,7 +387,9 @@ if (SCENARIOS.length) {
   records = all.filter((r) => {
     const m = r.metadata ?? {};
     const kind = (r.tags ?? []).find((t) => t.startsWith("kind:"))?.slice(5);
-    return SCENARIOS.includes(String(m.num)) || SCENARIOS.includes(String(m.slug))
+    // record id 也算一种选法，且是最精确的那种：loop-diagnose 拿 loop-pending 吐的就是它。
+    return SCENARIOS.includes(String(r.id))
+      || SCENARIOS.includes(String(m.num)) || SCENARIOS.includes(String(m.slug))
       || SCENARIOS.includes(String(m.scenario_id)) || (kind && SCENARIOS.includes(kind));
   });
 }
