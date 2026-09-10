@@ -9,7 +9,7 @@
 
 | 字段 | 何时 | 取值 |
 |---|---|---|
-| `[H2.1<H1.2]` | 每次调用必带 | 编号 `H` + 数字点分；派生假设 `<` 接父编号，后面不再有 `>` |
+| `[H2.1<H1.2]` | 每次调用必带 | 编号 `H` + 数字点分；派生假设 `<` 接父编号，后面不再有 `>`。解析器容忍编号带一个 `-` 后缀（如 `[H0-anchor]`、`[H1-root]`，模型偶尔这样写），但约定仍是 `H1` / `H2.1`，后缀是容错不是格式 |
 | `type=` | 编号首次出现 | `symptom`（能不能锚定到实例/语句）/ `cause`（为什么） |
 | `claim=` | 编号首次出现 | 这个假设自己的内容，子假设写它与兄弟的区别 |
 | `expect=` | 每次 | 看到什么算成立、看到什么算证伪 |
@@ -22,3 +22,6 @@
 报告的 `## How do we know` 结尾放 hypothesis ledger，每个编号一行：`H1 refuted — 依据`。
 
 历史 span 的中文键（类型/假设/判据/关/意图，证伪/证实/未决，提出，## 假设收口）解析器仍认。
+
+图落 server：hook 在 SessionEnd 出图后，紧凑形的图（去掉每次调用的 input/output/intent，`graph_version:1`）会随
+root span 推到 server（server 存 root 行的 `graph` 列），web 读 `GET /api/v2/llmobs/trace/{id}/graph`。

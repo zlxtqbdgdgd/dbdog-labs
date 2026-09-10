@@ -8,7 +8,9 @@
 //   [H2.1<H1.2] type=cause; claim=…; expect=…; close=H1.1:refuted; intent=…; basis=source; code_ref=file:line
 // 中文键（类型/假设/判据/关/意图，证伪/证实/未决）是 intent-v1 的历史形态，继续认，内部表示不变：
 //   type → confirm | cause，verdict → falsified | confirmed | open。
-export const ID = "H[0-9]+(?:\\.[0-9]+)*";
+// 编号 = H + 数字点分；容忍一个 `-` 后缀（2026-09-10 实测模型按英文键写出 [H0-anchor]、[H1-root]，
+// 不收就整圈挂不上；约定里仍只写 H1 / H2.1 这种，后缀是容错不是格式）。
+export const ID = "H[0-9]+(?:\\.[0-9]+)*(?:-[A-Za-z0-9_]+)?";
 // 父编号后可带一个多余的 >：模板「[H<编号><H<父编号>]」常被照抄成 [H2.1<H2>]（2026-09-09 一轮 21 次）
 export const HEAD = new RegExp(`^\\s*\\[\\s*(${ID})\\s*(?:<\\s*(${ID})\\s*>?)?\\s*\\]\\s*([\\s\\S]*)$`);
 const KV = /^\s*(type|claim|expect|close|intent|basis|code_ref|假设|判据|关|意图|类型)\s*=\s*(.*?)\s*$/i;
