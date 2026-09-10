@@ -12,7 +12,10 @@
 //     切过去就是把功能删掉。等新面补上再动，别为了「前缀统一」提前搬。
 
 const BASE = (process.env.DBDOG_BASE_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
-const API_KEY = process.env.DBDOG_API_KEY || "";
+// `DBDOG_OBS_API_KEY` 是 hooks 装插件时写进 Claude Code settings.json 的那把——**同一把 key**。
+// agent 在那个环境里跑脚本时它本来就在，认它等于用户少配一次；不认的话，
+// 用户会拿着一把已经配好的 key，被要求再配一个只是名字不同的变量。
+const API_KEY = process.env.DBDOG_API_KEY || process.env.DBDOG_OBS_API_KEY || "";
 const TOKEN = process.env.DBDOG_INTERNAL_TOKEN || "";
 const ORG = process.env.DBDOG_ORG || "default";
 
@@ -20,10 +23,19 @@ const ORG = process.env.DBDOG_ORG || "default";
  * 鉴权头的**唯一产地**。两种凭证不并发：有 API key 就走用户面，
  * 免得内部 token 在场时静默盖掉用户面、让「用 API key 到底通不通」永远验不出来。
  */
-function authHeaders() {
+function authHeaders({ internalOnly = false } = {}) {
+  // internalOnly：这条路由在 server 端硬验内部 bearer（探针直查口是唯一一个），
+  // 用户面那把 key 打过去只会 401。**不能让优先级决定它**——装了 hooks 的人环境里
+  // 永远有 DBDOG_OBS_API_KEY，API key 一优先，这类口就再也用不上了。
+  if (internalOnly) return TOKEN ? { authorization: `Bearer ${TOKEN}`, "x-dbdog-org": ORG } : {};
   if (API_KEY) return { "DD-API-KEY": API_KEY };
   if (TOKEN) return { authorization: `Bearer ${TOKEN}`, "x-dbdog-org": ORG };
   return {};
+}
+
+/** 有没有内部凭证（与「当前生效的是哪一种」是两回事）。 */
+export function hasInternalToken() {
+  return Boolean(TOKEN);
 }
 
 /** 当前生效的凭证种类：脚本据此打印自己在用哪一面，出错时一眼看出是不是拿错了 key。 */
@@ -38,7 +50,7 @@ export function credentialKind() {
 export function requireCredential() {
   const kind = credentialKind();
   if (kind === "none") {
-    console.error("✗ 需要凭证：DBDOG_API_KEY（控制台 /settings/api-keys 签发，推荐）或 DBDOG_INTERNAL_TOKEN（内部面）");
+    console.error("✗ 需要凭证：DBDOG_API_KEY 或 DBDOG_OBS_API_KEY（控制台 /settings/api-keys 签发，装 hooks 时配的就是它）；内部面可用 DBDOG_INTERNAL_TOKEN");
     process.exit(1);
   }
   return kind;
@@ -496,11 +508,11 @@ export async function patchCPExperiment(experimentID, attributes) {
  * 带状态码的调用（`call` 一律抛错，探一条路由在不在得看状态码）。
  * 用于「这条写口 server 有没有」这类判定——404/405 是缺口，不是故障。
  */
-export async function callStatus(method, p, body) {
+export async function callStatus(method, p, body, opts = {}) {
   const res = await fetch(`${BASE}${p}`, {
     method,
     headers: {
-      ...authHeaders(),
+      ...authHeaders(opts),
       ...(body ? { "content-type": "application/json" } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,

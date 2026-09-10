@@ -34,7 +34,7 @@
 //      DBDOG_MCP_URL / DBDOG_MCP_BEARER（仅 --mcp-http）；腿二额外要 DBDOG_INTERNAL_TOKEN。
 import fs from "node:fs";
 import path from "node:path";
-import { callStatus, requireCredential } from "./lib/exp-client.mjs";
+import { callStatus, hasInternalToken, requireCredential } from "./lib/exp-client.mjs";
 import { dbdogEvidence, probeOne, summarize, windowOfTrace } from "./lib/probe.mjs";
 
 const argOf = (name, dflt) => {
@@ -50,10 +50,11 @@ const MCP_HTTP = has("--mcp-http");
 // 腿二默认关。`--server-direct` 是它的极端形态（只跑腿二），自然隐含开。
 const WITH_DIRECT = SERVER_DIRECT_ONLY || has("--with-direct");
 if (!CASE) fail("--case 必填（判题包里的 cases/<event_id> 目录）");
-const CRED = requireCredential();
+requireCredential();
 // 直查口在 handler 里硬验内部 bearer（server `llmobs_probe_query.go` 的闸一），拿 API key 去打只会 401。
-// 与其让它在每条证据上静默记一行「拒绝凭证」，不如开跑前就停住并说明它是内部工具。
-if (WITH_DIRECT && CRED !== "internal") {
+// 判据是**有没有**内部凭证，不是「当前生效的是不是它」——装了 hooks 的人环境里永远有
+// DBDOG_OBS_API_KEY，按生效凭证判的话，两个都配齐了照样会被拒。
+if (WITH_DIRECT && !hasInternalToken()) {
   fail("腿二（--with-direct / --server-direct）只认 DBDOG_INTERNAL_TOKEN——它是内部归因工具，不在产品路径上");
 }
 
@@ -158,7 +159,7 @@ async function httpLeg() {
 
 // ── 腿二：server 直查口 ──────────────────────────────────────────────────────
 async function directQuery(spec) {
-  const res = await callStatus("POST", "/api/v2/llmobs/probe/query", spec);
+  const res = await callStatus("POST", "/api/v2/llmobs/probe/query", spec, { internalOnly: true });
   if (res.status === 404 || res.status === 405) {
     return { status: "unavailable", detail: `直查口还没上线（HTTP ${res.status} POST /api/v2/llmobs/probe/query）——腿二本轮全缺` };
   }
