@@ -28,6 +28,14 @@
 // ④ 收尾出了新 span 就再触发一次诊断总结（detached，同 stop.mjs）——此时尾部结论
 //    span 已补齐，总结吃到的是完整 trace。Stop 时刻的 spawn 保持不动：两个 worker
 //    产同键同 ts 的 workflow span，读侧后写赢，互不打架。
+//
+// 两阶段（2026-09-10 无头诊断实测：span 尾巴 1MB、上报走慢隧道，网络把 Claude Code 给
+// SessionEnd 的 30s 预算吃光，hook 被 "Hook cancelled" 杀掉，排在最后的 graph worker
+// 永远起不来——图既没落本地也没推 server）：
+//   阶段 A 只做本地：synthesize + appendSpans + writeState（pending_spans 先记下**全部**
+//          尚未送达的 span_id）→ 立刻 detached 起 summary / graph worker；
+//   阶段 B 才做网络：分批 reportSpans，送达的从 pending 摘掉、再 writeState。
+//   hook 中途被杀只损失阶段 B 的上报（pending 仍在，sweep 补发），图与本地落盘不受影响。
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -103,22 +111,37 @@ function lastAssistantText(lines) {
 }
 
 /**
- * 落盘 + 分批上报本轮新 span；返回未送达的 span_id 列表。积压（carriedOverIds）原样带回、
- * 不在这里重发（与 stop.mjs emit 同理，2026-09-08）：本流程末尾会 detached 起 sweep，
- * 由它分批补发；SessionEnd 30s 预算只用来收本会话的尾。
+ * 阶段 A：只落盘。返回新的 pending 列表 = 积压（carriedOverIds）+ 本批全部 span_id——
+ * 本批此刻一条都还没送达，先全记上；阶段 B 送达多少摘多少。积压原样带回、不在本流程重发
+ * （与 stop.mjs emit 同理，2026-09-08）：流程末尾会 detached 起 sweep，由它分批补发；
+ * SessionEnd 30s 预算只用来收本会话的尾。
  */
-async function emitBatched(spans, carriedOverIds) {
+function appendOnly(spans, carriedOverIds) {
   appendSpans(spans);
+  return [...carriedOverIds, ...spans.map((s) => s.span_id)];
+}
+
+/** 阶段 B：分批上报，返回未送达的 span_id。 */
+async function reportPending(spans) {
   const failed = [];
   for (let i = 0; i < spans.length; i += BATCH) {
     const part = spans.slice(i, i + BATCH);
     if (!(await reportSpans(part))) failed.push(...part.map((s) => s.span_id));
   }
-  return [...carriedOverIds, ...failed];
+  return failed;
 }
 
-/** carry 收尾：与 stop.mjs flushCarry 同构（SessionEnd 也可能是交界后的第一个事件）。 */
-async function flushCarry(input, state) {
+/** 阶段 B 收口：送达的从 pending 摘掉（同 span_id 重发只要送达一次就算清），再落状态。 */
+async function settle(spans, state, write) {
+  if (!spans.length) return;
+  const failed = new Set(await reportPending(spans));
+  const delivered = new Set(spans.map((s) => s.span_id).filter((id) => !failed.has(id)));
+  state.pending_spans = pendingIds(state.pending_spans).filter((id) => !delivered.has(id));
+  write(state);
+}
+
+/** carry 收尾：与 stop.mjs flushCarry 同构（SessionEnd 也可能是交界后的第一个事件）。queue.main 收待上报 span。 */
+function flushCarry(input, state, queue) {
   const c = state.carry;
   if (!c) return false;
   delete state.carry;
@@ -143,8 +166,8 @@ async function flushCarry(input, state) {
     partialLlm: c.partial_llm ?? null,
   });
   if (!spans.length) return true;
-  const pending = await emitBatched(spans, []);
-  state.pending_spans = [...pendingIds(state.pending_spans), ...pending];
+  state.pending_spans = appendOnly(spans, pendingIds(state.pending_spans));
+  queue.main.push(...spans);
   return true;
 }
 
@@ -153,7 +176,7 @@ async function flushCarry(input, state) {
  *  · 尾部有新结论文本 → 刷新 root output（同 span_id、ts 恒锚 started_at → 后写赢），
  *    重算总结的事实表读的正是 root output（trimSpans 裁掉 llm output）；
  *  · 尾部没有新文本且 root 已发 → 不动（空串覆盖会把 Stop 落定的结论抹掉）。 */
-async function flushMainTail(input, state) {
+function flushMainTail(input, state, queue) {
   const transcript = input.transcript_path ?? state.transcript_path;
   if (!transcript) return 0;
   let lines = [];
@@ -212,9 +235,9 @@ async function flushMainTail(input, state) {
   }
   if (!spans.length) return 0;
 
-  const pending = await emitBatched(spans, pendingIds(state.pending_spans));
+  state.pending_spans = appendOnly(spans, pendingIds(state.pending_spans));
+  queue.main.push(...spans);
   state.cursor = nextCursor;
-  state.pending_spans = pending;
   state.last_entry_ts = lastEntryTs;
   state.partial_llm = partialLlm ?? null;
   state.pending_tool_uses = Object.fromEntries(
@@ -229,7 +252,7 @@ async function flushMainTail(input, state) {
  * output 没有 input.last_assistant_message 可用，取子代理 transcript 里最后一段
  * 助手文本作近似（agent span 同 span_id 重发、读侧后写赢，SubagentStop 发过的不受损）。
  */
-async function flushSubagents(input, state) {
+function flushSubagents(input, state, queue) {
   const transcript = input.transcript_path ?? state.transcript_path;
   const sessionId = input.session_id;
   if (!transcript || !sessionId) return 0;
@@ -324,38 +347,41 @@ async function flushSubagents(input, state) {
       });
     }
 
-    const pending = await emitBatched(spans, pendingIds(sub.pending_spans));
     flushed += spans.length;
-    writeState(
-      sessionId,
-      {
-        cursor: nextCursor,
-        pending_spans: pending,
-        last_entry_ts: lastEntryTs,
-        started_at: startedAt ?? null,
-        prompt: prompt ?? null,
-        pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
-        trace_id: state.trace_id,
-        partial_llm: partialLlm ?? null,
-      },
-      agentId,
-    );
+    const subState = {
+      cursor: nextCursor,
+      pending_spans: appendOnly(spans, pendingIds(sub.pending_spans)),
+      last_entry_ts: lastEntryTs,
+      started_at: startedAt ?? null,
+      prompt: prompt ?? null,
+      pending_tool_uses: Object.fromEntries([...pendingToolUses.entries()].slice(-PENDING_TOOL_USE_MAX)),
+      trace_id: state.trace_id,
+      partial_llm: partialLlm ?? null,
+    };
+    writeState(sessionId, subState, agentId);
+    queue.subs.push({ agentId, state: subState, spans });
   }
   return flushed;
 }
 
 /** trace 相关收尾（有 trace 状态才有事做;sweep 排空独立于此,见 run()）。 */
 async function handleTraceTail(input, state) {
-  const flushed = await flushCarry(input, state);
+  // 待上报队列：阶段 A 只往里放，阶段 B 才发（main 是主状态文件名下的，subs 各自一个子状态文件）
+  const queue = { main: [], subs: [] };
+
+  // —— 阶段 A：只做本地（synthesize + appendSpans + writeState）——
+  const flushed = flushCarry(input, state, queue);
   if (state.active === false) {
     // 停用后的行不属于任何 trace；子代理丢弃是既有语义（见 user-prompt-submit.mjs）
     if (flushed) writeState(input.session_id, state);
+    await settle(queue.main, state, (st) => writeState(input.session_id, st));
     return;
   }
-  const flushedMain = await flushMainTail(input, state);
-  const flushedSub = await flushSubagents(input, state);
+  const flushedMain = flushMainTail(input, state, queue);
+  const flushedSub = flushSubagents(input, state, queue);
   writeState(input.session_id, state);
 
+  // —— worker 都在上报之前起：网络把 30s 预算吃光、hook 被杀，图与总结也已经在跑了 ——
   // 收尾出了新 span → 总结重算一次（吃到补齐后的完整 trace）。detached：SessionEnd 的
   // 30s 超时罩不住 LLM 调用，且 worker 失败自己会在 summary-worker.log 留痕。
   // 新旧 worker 竞态由 worker 侧的代次校验兜底（summary-worker.mjs，水位=原始行数）。
@@ -365,6 +391,12 @@ async function handleTraceTail(input, state) {
   // ⑤ 假设图：不依赖任何 env，也不看这次有没有新 span——SessionEnd 是 trace 最后一次收尾，
   //    图要按收尾后的全量 span 画（Stop 时刻的图会缺尾部结论与 in-flight 子代理）。
   spawnDetached([GRAPH_WORKER, input.session_id], input.session_id, "graph worker");
+
+  // —— 阶段 B：网络上报，送达的从 pending 摘掉。被杀只丢这一步，sweep 会补发 ——
+  await settle(queue.main, state, (st) => writeState(input.session_id, st));
+  for (const sub of queue.subs) {
+    await settle(sub.spans, sub.state, (st) => writeState(input.session_id, st, sub.agentId));
+  }
 }
 
 run(async () => {

@@ -2540,3 +2540,100 @@ describe("summary 代次校验与上报失败留痕", () => {
     expect(gen.watermark, "水位必须按原始行数(3),不是去重后的 span 数(2)").toBe(3);
   });
 });
+
+// —— SessionEnd 先出图后上报（2026-09-10 无头诊断实测）——
+// span 尾巴 1MB、上报走慢隧道：Claude Code 给 SessionEnd hook 30s 预算，原来 emitBatched 先 appendSpans
+// 再逐批 reportSpans，网络把 30s 吃光，hook 被 "Hook cancelled" 杀掉，排在最后的 spawnDetached(graph-worker)
+// 永远到不了——图既没落本地也没推 server。改法：阶段 A 只做本地（synthesize + appendSpans + writeState，
+// pending 记下全部未送达 id）→ 立刻起 graph worker → 阶段 B 才上报。hook 被杀只损失阶段 B（sweep 补发）。
+describe("SessionEnd 先出图后上报：上报吃光预算、hook 被杀，图不受影响", () => {
+  const waitFor = async (pred, ms) => {
+    const started = Date.now();
+    while (Date.now() - started < ms) {
+      if (pred()) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return pred();
+  };
+
+  /** 黑洞 sink：收到请求既不回应也不关闭——模拟把预算吃光的慢隧道。 */
+  async function startBlackHole() {
+    const sockets = new Set();
+    const server = http.createServer(() => { /* 永不回应 */ });
+    server.on("connection", (s) => sockets.add(s));
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    return {
+      url: `http://127.0.0.1:${server.address().port}/api/v2/llmobs/spans`,
+      close: async () => {
+        for (const s of sockets) s.destroy();
+        await new Promise((r) => server.close(r));
+      },
+    };
+  }
+
+  it("graph-worker.log 出现、尾部 span 已落盘且全部记在 pending", async () => {
+    const dir = tempObsDir();
+    const hole = await startBlackHole();
+    const tr = writeTranscript(dir, "bh.jsonl", [
+      { type: "user", uuid: "u-q", timestamp: T("00.000"), message: { role: "user", content: "诊断: 为什么卡住" } },
+      {
+        type: "assistant", uuid: "a1", timestamp: T("05.000"), requestId: "req_bh1",
+        message: { model: "m", usage: { input_tokens: 5, output_tokens: 6 }, content: [
+          { type: "text", text: "先看指标" },
+          { type: "tool_use", id: "tu_bh", name: "mcp__dbdog-mcp__get_dbdog_metric", input: {
+            queries: [{ metric_name: "opengauss.rows" }],
+            telemetry: { intent: "[H1] type=cause; claim=checkpoint storm; expect=checkpoint_delay rises" },
+          } },
+        ] },
+      },
+      { type: "user", uuid: "r1", timestamp: T("06.000"), message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_bh", content: "x".repeat(20000) }] } },
+      {
+        type: "assistant", uuid: "a2", timestamp: T("08.000"), requestId: "req_bh2",
+        message: { model: "m", usage: { input_tokens: 7, output_tokens: 8 }, content: [{ type: "text", text: "根因在 X。" }] },
+      },
+    ]);
+    const st = seedState(dir, "bh", tr); // Stop 从未发生：root + 整条尾巴都靠 SessionEnd 补
+    let child;
+    try {
+      child = spawn(process.execPath, [path.join(HOOK_DIR, "session-end.mjs")], {
+        env: {
+          ...process.env,
+          DBDOG_OBS_MODE: "triggered",
+          DBDOG_OBS_DIR: dir,
+          DBDOG_OBS_SPANS: path.join(dir, "spans.jsonl"),
+          DBDOG_OBS_REPORT_URL: hole.url,
+          DBDOG_OBS_API_KEY: "dbdog_test",
+          DBDOG_OBS_REPORT_TIMEOUT_MS: "60000", // 慢隧道：单批就超过 hook 预算
+        },
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      child.stdin.end(JSON.stringify({ session_id: "bh", transcript_path: tr, hook_event_name: "SessionEnd", reason: "exit" }));
+      const exited = new Promise((r) => child.on("close", r));
+      // 5s 后 kill = Claude Code 的 "Hook cancelled"
+      const killer = setTimeout(() => child.kill("SIGKILL"), 5000);
+      const graphLog = path.join(dir, "graph-worker.log");
+      const appeared = (await waitFor(() => fs.existsSync(graphLog), 5000)) || (await waitFor(() => fs.existsSync(graphLog), 5000));
+      clearTimeout(killer);
+      child.kill("SIGKILL");
+      await exited;
+      expect(appeared, "graph worker 必须在上报之前就被 spawn 并跑完").toBe(true);
+      const ok = await waitFor(() => fs.readFileSync(graphLog, "utf8").includes(`trace=${st.trace_id} 假设 1`), 5000);
+      expect(ok, fs.readFileSync(graphLog, "utf8")).toBe(true);
+      expect(fs.existsSync(path.join(dir, "graphs", st.trace_id, "forward-path.md"))).toBe(true);
+
+      // 阶段 A 已落盘：root + 尾部 llm/tool span 都在 spans.jsonl
+      const spans = readSpans(dir).filter((s) => s.trace_id === st.trace_id);
+      expect(spans.some((s) => s.span_id === st.root_span_id && s.kind === "agent")).toBe(true);
+      expect(spans.filter((s) => s.kind === "llm")).toHaveLength(2);
+      expect(spans.some((s) => s.kind === "tool" && s.name === "get_dbdog_metric")).toBe(true);
+      // 一条都没送达：全部记在 pending，留给 sweep 补发；游标已推到 EOF
+      const state = readState(dir, "bh");
+      expect(new Set(state.pending_spans)).toEqual(new Set(spans.map((s) => s.span_id)));
+      expect(state.cursor).toBe(fs.statSync(tr).size);
+      expect(state.root_emitted).toBe(true);
+    } finally {
+      try { child?.kill("SIGKILL"); } catch {}
+      await hole.close();
+    }
+  }, 30000);
+});
