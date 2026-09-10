@@ -160,6 +160,28 @@ describe("hypothesis-graph · prose", () => {
   });
 });
 
+describe("hypothesis-graph · call input/output (2026-09-10)", () => {
+  // owner：只看到「这次调用是干什么的」判断不了工具本身对不对——每次调用要带入参与返回。
+  // JSON 带全量（本地字段 *_local 优先），markdown 给节选；报错的调用返回全文放出来。
+  it("carries input and output on each call and renders excerpts", () => {
+    const longOut = "x".repeat(2000);
+    const g = build([
+      tool("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: '{"queries":[{"metric_name":"opengauss.rows"}]}', output: "short answer", output_local: longOut }),
+      tool("t2", "search_dbdog_logs", 2, "[H1] expect=e; intent=logs", {}, { input: '{"query":"status:error"}', output: "MCP error -32602: Invalid arguments", status: "error" }),
+    ]);
+    const calls = g.nodes[0].calls;
+    expect(calls[0].input).toBe('{"queries":[{"metric_name":"opengauss.rows"}]}');
+    expect(calls[0].output).toBe(longOut); // 本地全量优先
+    expect(calls[1].status).toBe("error");
+    const md = renderMd(g);
+    expect(md).toContain("入参：`{\"queries\":[{\"metric_name\":\"opengauss.rows\"}]}`");
+    expect(md).toContain("返回：" ); // 节选
+    expect(md).not.toContain("x".repeat(700)); // 长返回被截
+    expect(md).toContain("…（共 2000 字，全文见 forward-path.json）");
+    expect(md).toContain("MCP error -32602: Invalid arguments"); // 报错全文
+  });
+});
+
 describe("hypothesis-graph · io", () => {
   it("agentConclusion prefers the root agent span", () => {
     const spans = [
