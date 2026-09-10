@@ -1,6 +1,8 @@
 // intent-v1 假设字段解析。书写约定单源：
-// opengauss-issue-corpus/loop/lib/hypothesis-rules.txt
-// 必须与 loop/lib/build-hypotheses.py、dbdog-web/src/lib/llmobs-hypothesis-tree.ts 对齐。
+// dbdog-mcp/clients/diag-workdir-template/HYPOTHESIS.md
+// （2026-09-10 起：原指的 opengauss-issue-corpus/loop/lib/hypothesis-rules.txt 只有语料 loop
+//  够得着，三处解析器各自分叉过一次；新单源按三处解析器互证复原，与本文件同改同不改。）
+// 必须与 dbdog-web/src/lib/llmobs-hypothesis-tree.ts、skills/span-graph/scripts/from_spans.py 对齐。
 const ID = "H[0-9]+(?:\\.[0-9]+)*";
 // 父编号后可带一个多余的 >：模板「[H<编号><H<父编号>]」常被照抄成 [H2.1<H2>]（2026-09-09 一轮 21 次）
 const HEAD = new RegExp(`^\\s*\\[\\s*(${ID})\\s*(?:<\\s*(${ID})\\s*>?)?\\s*\\]\\s*([\\s\\S]*)$`);
