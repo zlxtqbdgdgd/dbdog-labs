@@ -1,5 +1,8 @@
-// intent-v2 假设字段解析（2026-09-10 起英文键为准）。书写约定的单源是 dbdog-mcp 里
-// `telemetry.intent` 的 schema 描述（src/toolsets/shared/schema.ts，随 tools/list 必达任何客户端），
+// intent-v2 假设字段解析（2026-09-10 起英文键为准）。书写约定的规范文字在 dbdog-mcp 的
+// `src/toolsets/shared/schema.ts`（`telemetry.intent` 描述），但**模型实际读到它的地方是 skill 正文**
+// （investigate 的「Hypothesis ledger」段，经 load_dbdog_skill 发出去）——
+// 2026-09-10 在活栈上实证：tools/list 服务出去的 intent 描述只有官方那一句，dbdog 扩展不在里面，
+// 因为 inputSchema 一律由官方 descriptor 逐字回写（ADR-0004），zod 只用于校验。
 // 工作目录模板 dbdog-mcp/clients/diag-workdir-template/HYPOTHESIS.md 是它的展开版。
 // 三处解析器同一套正则：本文件（hook 打 span tag）、本目录 hypothesis-graph.mjs（假设图）、
 // dbdog-web/src/lib/llmobs-hypothesis-tree.ts（控制台建树）。改一处三处同改。
