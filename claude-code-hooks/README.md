@@ -130,7 +130,11 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   含每次调用入参/返回）；配了上报 env 时，再把**紧凑形**的图（去掉每次调用的 input/output/intent、
   `graph_version:1`）挂在 root span 上随 root 同键重发到 server——图会随 root span 推到 server（server
   存 root 行的 `graph` 列），web 读 `GET /api/v2/llmobs/trace/{id}/graph`，不再各自从 span 现算。
-  失败只在同目录 `graph-worker.log` 留一行，不影响 trace。
+  失败只在同目录 `graph-worker.log` 留一行，不影响 trace。图只统计 dbdog（MCP）工具调用：`seq` 是 dbdog
+  调用的序号（从 1 起连续），Grep/Read/Bash 等本地工具不进图、只在 summary 里计次
+  （`local_tools_excluded` / `local_tools_excluded_by_name`）。SessionEnd 先出图后上报——本地落盘一完成就起
+  graph worker，网络上报排在后面；Claude Code 给 hook 的 30s 预算被慢链路吃掉、hook 被 "Hook cancelled"
+  杀掉也不影响图（未送达的 span 留在 `pending_spans`，sweep 补发）。
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
   `DBDOG_OBS_CONTENT_CHARS`（**上报侧**内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS`
   先例；本地 `spans.jsonl` 不受它约束，超限字段另落 `<字段>_local` 全量副本，见「span 形状」）、

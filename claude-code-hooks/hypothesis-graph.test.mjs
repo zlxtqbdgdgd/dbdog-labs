@@ -13,6 +13,10 @@ function tool(spanId, name, ts, intent, tags = {}, extra = {}) {
   if (intent !== undefined) s.intent = intent;
   return s;
 }
+/** hook 落盘的 dbdog 调用形状（synthesize.mjs）：name 是剥掉 mcp__<server>__ 前缀的裸名，server 记在 tags.mcp_server。 */
+function dbdog(spanId, name, ts, intent, tags = {}, extra = {}) {
+  return tool(spanId, name, ts, intent, { mcp_server: "dbdog-mcp", ...tags }, extra);
+}
 function llm(spanId, ts, { output, output_local, thinking_local, kind = "llm" } = {}) {
   const s = { span_id: spanId, kind, name: "anthropic.messages", trace_id: "aa", ts, tags: {} };
   if (output !== undefined) s.output = output;
@@ -25,8 +29,8 @@ const byId = (g) => Object.fromEntries(g.nodes.map((n) => [n.id, n]));
 describe("hypothesis-graph · build", () => {
   it("tags build parent and tool edges", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H1", hypothesis_type: "confirm", hypothesis: "instance anchored" }),
-      tool("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H2", parent_hypothesis_id: "H1", hypothesis_type: "cause", hypothesis: "plan shape wrong" }),
+      dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H1", hypothesis_type: "confirm", hypothesis: "instance anchored" }),
+      dbdog("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H2", parent_hypothesis_id: "H1", hypothesis_type: "cause", hypothesis: "plan shape wrong" }),
       tool("t3", "Bash", 3),
     ]);
     expect(g.nodes.map((n) => n.id)).toEqual(["H1", "H2"]);
@@ -34,12 +38,13 @@ describe("hypothesis-graph · build", () => {
     const kinds = new Set(g.edges.map((e) => `${e.kind} ${e.from} ${e.to ?? e.tool}`));
     expect(kinds.has("parent H1 H2")).toBe(true);
     expect(kinds.has("tool H1 get_dbdog_metric")).toBe(true);
-    expect(g.unattached_tools).toHaveLength(1);
-    expect(g.unattached_tools[0].tool).toBe("Bash");
+    // 本地工具（Bash）不进图：既不算未挂，也不占 seq——只在 summary 里计次
+    expect(g.unattached_tools).toHaveLength(0);
+    expect(g.summary.local_tools_excluded_by_name).toEqual({ Bash: 1 });
   });
 
   it("falls back to the English intent line and creates the placeholder parent", () => {
-    const g = build([tool("t1", "get_dbdog_metric", 1, "[H3<H2] type=cause; claim=short-circuit failed; expect=plan shows a full scan")]);
+    const g = build([dbdog("t1", "get_dbdog_metric", 1, "[H3<H2] type=cause; claim=short-circuit failed; expect=plan shows a full scan")]);
     expect(g.nodes[0].id).toBe("H2");
     expect(g.nodes[0].declared).toBe(false);
     expect(g.nodes[1]).toMatchObject({ id: "H3", declared: true, parent: "H2", type: "cause", expect: "plan shows a full scan" });
@@ -47,8 +52,8 @@ describe("hypothesis-graph · build", () => {
 
   it("records resolve edges and verdicts from close=", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=there are slow queries; expect=any found"),
-      tool("t2", "get_dbdog_metric", 2, "[H2<H1] type=cause; claim=bad plan; expect=full scan; close=H1:supported; intent=read the plan"),
+      dbdog("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=there are slow queries; expect=any found"),
+      dbdog("t2", "get_dbdog_metric", 2, "[H2<H1] type=cause; claim=bad plan; expect=full scan; close=H1:supported; intent=read the plan"),
     ]);
     expect(byId(g).H1.verdict).toBe("confirmed");
     expect(g.edges.filter((e) => e.kind === "resolve")).toEqual([{ kind: "resolve", from: "H2", to: "H1", verdict: "confirmed", span_id: "t2" }]);
@@ -56,18 +61,21 @@ describe("hypothesis-graph · build", () => {
 
   it("classifies unattached calls", () => {
     const g = build([
-      tool("t1", "load_dbdog_skill", 1, "type=cause; claim=<saturated>; expect=<cpu spikes>"),
+      dbdog("t1", "load_dbdog_skill", 1, "type=cause; claim=<saturated>; expect=<cpu spikes>"),
       tool("t2", "Bash", 2),
-      tool("t3", "get_dbdog_metric", 3, ""),
+      dbdog("t3", "get_dbdog_metric", 3, ""),
     ]);
-    expect(Object.fromEntries(g.unattached_tools.map((u) => [u.span_id, u.reason]))).toEqual({ t1: "intent_without_head", t2: "no_intent", t3: "no_intent" });
+    // t2 是本地 Bash：整体排除，不再算 no_intent；seq 也不占（t3 是第 2 次 dbdog 调用）
+    expect(Object.fromEntries(g.unattached_tools.map((u) => [u.span_id, u.reason]))).toEqual({ t1: "intent_without_head", t3: "no_intent" });
+    expect(g.unattached_tools.map((u) => u.seq)).toEqual([1, 2]);
     expect(g.summary.unattached_intent_without_head).toBe(1);
+    expect(g.summary.local_tools_excluded).toBe(1);
   });
 
   it("calls carry seq, purpose and agent", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", "2026-09-09T01:00:00Z", "[H1] claim=a; expect=b; intent=read metrics"),
-      tool("t2", "ddsql_run_query", "2026-09-09T01:00:05Z", "[H1] expect=b; intent=query sql", { agent_id: "abcdef1234" }),
+      dbdog("t1", "get_dbdog_metric", "2026-09-09T01:00:00Z", "[H1] claim=a; expect=b; intent=read metrics"),
+      dbdog("t2", "ddsql_run_query", "2026-09-09T01:00:05Z", "[H1] expect=b; intent=query sql", { agent_id: "abcdef1234" }),
     ]);
     const calls = g.nodes[0].calls;
     expect(calls.map((c) => c.seq)).toEqual([1, 2]);
@@ -80,7 +88,7 @@ describe("hypothesis-graph · build", () => {
   it("marks source-derived hypotheses and whether they got runtime evidence", () => {
     const g = build([
       llm("l1", 1, { output: "Propose [H5] type=cause; claim=pruning walks every partition; basis=source; code_ref=pruning.cpp:412" }),
-      tool("t1", "get_dbdog_metric", 2, "[H6] type=cause; claim=checkpoint storm; basis=source; code_ref=bufmgr.cpp:88; expect=checkpoint_delay rises"),
+      dbdog("t1", "get_dbdog_metric", 2, "[H6] type=cause; claim=checkpoint storm; basis=source; code_ref=bufmgr.cpp:88; expect=checkpoint_delay rises"),
     ]);
     const n = byId(g);
     expect(n.H5).toMatchObject({ basis: "source", code_ref: "pruning.cpp:412", declared: false });
@@ -97,7 +105,7 @@ describe("hypothesis-graph · prose", () => {
   it("English Propose line fills the undeclared parent", () => {
     const g = build([
       llm("l1", 1, { output: "Delegating.\nPropose [H2] type=cause; claim=connection pool exhausted; expect=active connections at the cap\nSpawn." }),
-      tool("t1", "get_dbdog_metric", 2, "[H2.1<H2] type=cause; claim=pool held by slow transactions; expect=long transactions > 30s"),
+      dbdog("t1", "get_dbdog_metric", 2, "[H2.1<H2] type=cause; claim=pool held by slow transactions; expect=long transactions > 30s"),
     ]);
     const n = byId(g);
     expect(n.H2).toMatchObject({ text: "connection pool exhausted", type: "cause", expect: "active connections at the cap", declared: false, proposed_in: { span_id: "l1", in: "output" } });
@@ -128,8 +136,8 @@ describe("hypothesis-graph · prose", () => {
 
   it("closes from the hypothesis ledger at the end of How do we know (and legacy 假设收口)", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=anchored; expect=found"),
-      tool("t2", "get_dbdog_metric", 2, "[H2<H1] type=cause; claim=bad plan; expect=full scan; close=H1:supported"),
+      dbdog("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=anchored; expect=found"),
+      dbdog("t2", "get_dbdog_metric", 2, "[H2<H1] type=cause; claim=bad plan; expect=full scan; close=H1:supported"),
       { span_id: "root", kind: "agent", name: "claude-code.task", trace_id: "aa", ts: 9,
         output: "## How do we know\n\nevidence…\n\nHypothesis ledger:\n- H1 refuted — instance not found\n- H2 inconclusive — plan missing\n- H3 supported — source confirmed\n\n## The root cause\nH2 supported" },
       { span_id: "llm9", kind: "llm", name: "anthropic.messages", trace_id: "aa", ts: 8, output: "## 假设收口\n- H3 证实 —— 源码核到" },
@@ -148,15 +156,72 @@ describe("hypothesis-graph · prose", () => {
 
   it("renders the tree", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=slow queries exist; expect=any found; intent=find slow sql"),
-      tool("t2", "get_dbdog_metric", 2, "[H2.1<H2] type=cause; claim=bad plan; expect=full scan; close=H1:supported; intent=read plan"),
-      tool("t3", "load_dbdog_skill", 3, "type=cause; claim=<saturated>"),
+      dbdog("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=slow queries exist; expect=any found; intent=find slow sql"),
+      dbdog("t2", "get_dbdog_metric", 2, "[H2.1<H2] type=cause; claim=bad plan; expect=full scan; close=H1:supported; intent=read plan"),
+      dbdog("t3", "load_dbdog_skill", 3, "type=cause; claim=<saturated>"),
       tool("t4", "Bash", 4),
     ]);
     const md = renderMd(g);
-    for (const needle of ["slow queries exist", "判据：any found", "find slow sql", "H2", "未声明", "H2.1 → H1", "证实", "intent 不带 [H..] 头", "Bash", "## 假设出现顺序"]) {
+    for (const needle of ["slow queries exist", "判据：any found", "find slow sql", "H2", "未声明", "H2.1 → H1", "证实", "intent 不带 [H..] 头", "## 假设出现顺序"]) {
       expect(md, needle).toContain(needle);
     }
+    // 本地工具只在概览里计次，不再列进「未挂到假设的工具调用」
+    expect(md).toContain("本地工具调用 1 次未计入（Bash 1）");
+    expect(md).not.toContain("`Bash` × 1");
+  });
+});
+
+describe("hypothesis-graph · 只统计 dbdog（MCP）工具调用（2026-09-10）", () => {
+  // owner：假设树里 Grep/Glob/Read 这类 Claude Code 本地工具没用，而且「H1 上来就是第 23 步」看不懂——
+  // seq 原来是整条 trace 全部工具调用的全局序号，前面 22 次都是本地读文件。
+  // 判据不是白名单：hook 落盘的 MCP 调用带 tags.mcp_server（name 已剥前缀），server 导出/别处的可能保留 mcp__ 前缀；
+  // 两者之外一律按本地工具排除（Grep/Glob/Read/Bash/Edit/Agent/SendMessage/ReadMcpResourceTool…）。
+  const spans = () => [
+    tool("l1", "Read", 1),
+    tool("l2", "Grep", 2),
+    tool("l3", "Glob", 3),
+    dbdog("t1", "get_dbdog_metric", 4, "[H1] type=cause; claim=checkpoint storm; expect=checkpoint_delay rises"),
+    tool("t2", "mcp__dbdog__search_dbdog_logs", 5, "[H1] expect=error lines; intent=read logs"),
+  ];
+
+  it("seq 从 1 起只数 dbdog 调用；本地工具不进边、不算未挂、不占 seq", () => {
+    const g = build(spans());
+    const n = byId(g);
+    expect(n.H1.first_seq).toBe(1); // 不是 4
+    expect(n.H1.calls.map((c) => [c.seq, c.tool])).toEqual([[1, "get_dbdog_metric"], [2, "search_dbdog_logs"]]);
+    expect(g.edges.filter((e) => e.kind === "tool")).toHaveLength(2);
+    expect(g.unattached_tools).toHaveLength(0);
+    expect(g.tool_call_count).toBe(2);
+    expect(g.tool_call_count_all).toBe(5);
+    expect(g.summary.local_tools_excluded).toBe(3);
+    expect(g.summary.local_tools_excluded_by_name).toEqual({ Read: 1, Grep: 1, Glob: 1 });
+  });
+
+  it("close= 的 seq 同口径", () => {
+    const g = build([
+      tool("l1", "Read", 1),
+      dbdog("t1", "get_dbdog_metric", 2, "[H1] type=cause; claim=a; expect=b"),
+      tool("l2", "Grep", 3),
+      dbdog("t2", "search_dbdog_logs", 4, "[H2<H1] type=cause; claim=c; expect=d; close=H1:refuted"),
+    ]);
+    expect(byId(g).H1.closed_by).toMatchObject({ from: "H2", seq: 2, span_id: "t2" });
+  });
+
+  it("renderMd 说明 seq 是 dbdog 调用序号，并把本地工具计次写进概览", () => {
+    const md = renderMd(build(spans()));
+    expect(md).toContain("seq 是 dbdog（MCP）工具调用的序号");
+    expect(md).toContain("本地工具调用 3 次未计入（");
+    for (const needle of ["Read 1", "Grep 1", "Glob 1"]) expect(md).toContain(needle);
+    expect(md).toContain("工具调用 5 次");
+    expect(md).toContain("dbdog（MCP）调用 2 次");
+  });
+
+  it("compactGraph 带上排除计数与全量调用数", () => {
+    const c = compactGraph(build(spans()));
+    expect(c.summary.local_tools_excluded).toBe(3);
+    expect(c.summary.local_tools_excluded_by_name).toEqual({ Read: 1, Grep: 1, Glob: 1 });
+    expect(c.tool_call_count).toBe(2);
+    expect(c.tool_call_count_all).toBe(5);
   });
 });
 
@@ -166,8 +231,8 @@ describe("hypothesis-graph · call input/output (2026-09-10)", () => {
   it("carries input and output on each call and renders excerpts", () => {
     const longOut = "x".repeat(2000);
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: '{"queries":[{"metric_name":"opengauss.rows"}]}', output: "short answer", output_local: longOut }),
-      tool("t2", "search_dbdog_logs", 2, "[H1] expect=e; intent=logs", {}, { input: '{"query":"status:error"}', output: "MCP error -32602: Invalid arguments", status: "error" }),
+      dbdog("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: '{"queries":[{"metric_name":"opengauss.rows"}]}', output: "short answer", output_local: longOut }),
+      dbdog("t2", "search_dbdog_logs", 2, "[H1] expect=e; intent=logs", {}, { input: '{"query":"status:error"}', output: "MCP error -32602: Invalid arguments", status: "error" }),
     ]);
     const calls = g.nodes[0].calls;
     expect(calls[0].input).toBe('{"queries":[{"metric_name":"opengauss.rows"}]}');
@@ -198,7 +263,7 @@ describe("hypothesis-graph · io", () => {
     const p = path.join(d, "spans.jsonl");
     fs.writeFileSync(p, [
       JSON.stringify({ span_id: "x", kind: "agent", trace_id: "cc", ts: 1, output: "answer" }),
-      JSON.stringify(tool("t1", "get_dbdog_metric", 2, "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "cc" })),
+      JSON.stringify(dbdog("t1", "get_dbdog_metric", 2, "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "cc" })),
     ].join("\n") + "\n");
     expect(resolveInput(d)).toBe(p);
     const { md } = run(d, { trace: "cc" });
@@ -208,7 +273,7 @@ describe("hypothesis-graph · io", () => {
   });
 
   it("parsedFromSpan carries intent= purpose next to tag-derived fields", () => {
-    const p = parsedFromSpan(tool("t", "get_dbdog_metric", 1, "[H1] claim=a; intent=why", { hypothesis_id: "H1", hypothesis: "a" }));
+    const p = parsedFromSpan(dbdog("t", "get_dbdog_metric", 1, "[H1] claim=a; intent=why", { hypothesis_id: "H1", hypothesis: "a" }));
     expect(p).toMatchObject({ id: "H1", text: "a", purpose: "why" });
     expect(parseIntent("[H2.1<H2>] type=cause; claim=x")).toMatchObject({ id: "H2.1", parent: "H2" });
     expect(scanProposals("Propose [H7] type=cause; claim=y")).toEqual([["H7", expect.objectContaining({ id: "H7", text: "y", type: "cause" })]]);
@@ -221,8 +286,8 @@ describe("graph-worker", () => {
     fs.writeFileSync(path.join(dir, "sess1.json"), JSON.stringify({ trace_id: "tr1", root_span_id: "tr1root", session_id: "sess1" }));
     fs.writeFileSync(path.join(dir, "spans.jsonl"), [
       JSON.stringify({ span_id: "tr1root", kind: "agent", name: "claude-code.task", trace_id: "tr1", ts: 1, output: "## How do we know\nHypothesis ledger:\n- H1 supported — seen" }),
-      JSON.stringify(tool("t1", "get_dbdog_metric", 2, "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "tr1" })),
-      JSON.stringify(tool("t9", "get_dbdog_metric", 3, "[H1] claim=other trace", {}, { trace_id: "tr2" })),
+      JSON.stringify(dbdog("t1", "get_dbdog_metric", 2, "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "tr1" })),
+      JSON.stringify(dbdog("t9", "get_dbdog_metric", 3, "[H1] claim=other trace", {}, { trace_id: "tr2" })),
     ].join("\n") + "\n");
     const r = spawnSync(process.execPath, [path.join(import.meta.dirname, "graph-worker.mjs"), "sess1"], { env: { ...process.env, DBDOG_OBS_DIR: dir }, encoding: "utf8" });
     expect(r.status).toBe(0);
@@ -236,7 +301,7 @@ describe("graph-worker", () => {
 describe("hypothesis-graph · compact graph for the server (2026-09-10)", () => {
   it("strips call input/output but keeps span refs, and bounds the size", () => {
     const g = build([
-      tool("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: "x".repeat(5000), output: "y".repeat(5000) }),
+      dbdog("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: "x".repeat(5000), output: "y".repeat(5000) }),
     ]);
     const c = compactGraph(g);
     expect(c.nodes[0].calls[0]).toMatchObject({ seq: 1, span_id: "t1", tool: "get_dbdog_metric", purpose: "read" });
@@ -259,7 +324,7 @@ describe("graph-worker · pushes the graph to the server on the root span", () =
     fs.writeFileSync(path.join(dir, "sess2.json"), JSON.stringify({ trace_id: "tr9", root_span_id: "tr9root", session_id: "sess2" }));
     fs.writeFileSync(path.join(dir, "spans.jsonl"), [
       JSON.stringify({ span_id: "tr9root", parent_id: null, kind: "agent", name: "claude-code.task", trace_id: "tr9", ts: "2026-09-10T08:00:00Z", output: "answer", output_local: "answer full", tags: { ml_app: "x" } }),
-      JSON.stringify(tool("t1", "get_dbdog_metric", "2026-09-10T08:00:01Z", "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "tr9", output: "big".repeat(100) })),
+      JSON.stringify(dbdog("t1", "get_dbdog_metric", "2026-09-10T08:00:01Z", "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "tr9", output: "big".repeat(100) })),
     ].join("\n") + "\n");
     // 必须异步 spawn：spawnSync 会把本进程事件循环卡死，上面这个同进程 http server 根本接不到连接，
     // worker 的 fetch 只能撞 reportTimeoutMs() 的 3s 超时后落「未送达」（2026-09-10 实证）。

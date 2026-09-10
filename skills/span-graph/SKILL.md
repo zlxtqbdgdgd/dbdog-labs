@@ -51,7 +51,7 @@ node S/from_spans.mjs ~/.claude/dbdog-obs/spans.jsonl --trace <trace_id> --out �
 
 `tags.hypothesis_id` / `parent_hypothesis_id` 优先,否则解析 intent 的 `[H2<H1] type=…; claim=…; expect=…; close=…; intent=…; basis=…; code_ref=…`(英文键为准,中文键 类型/假设/判据/关/意图 仍认;与 hook 的 hypothesis.mjs、dbdog-web 控制台同一套规则)。markdown 里有:
 
-- 假设树:缩进 = 父子;每个假设下面一张表,列出该假设名下的工具调用(seq 是整条 trace 的全局序号、时间、主会话或哪个子代理、工具、意图、状态)
+- 假设树:缩进 = 父子;每个假设下面一张表,列出该假设名下的工具调用(seq 是 dbdog(MCP)工具调用的序号、从 1 起连续,Grep/Read/Bash 等本地工具不进图、只在概览里计次;时间、主会话或哪个子代理、工具、意图、状态)
 - 源码来源的假设(`basis=source`)单独标出它有没有现场取证调用——没有的按约定只能算假设,不能进结论
 - 假设出现顺序
 - 假设收口(`close=` 谁在第几步关了谁;结论正文 How do we know 结尾的 hypothesis ledger 也认)
