@@ -107,6 +107,14 @@ describe("hypothesis intent tags · English keys (intent-v2, 2026-09-10)", () =>
     expect(hypothesisTags("[H1] claim=x; basis=guess")).not.toHaveProperty("hypothesis_basis");
   });
 
+  it("tolerates an id suffix like [H0-anchor] and an unknown type (2026-09-10 实测：模型按英文键写了 [H0-anchor] type=scope，28/33 次调用因此挂不上)", () => {
+    const p = parseIntent("[H0-anchor] type=scope; claim=bench has a slow t0/t1 query in the window; intent=locate the instance");
+    expect(p?.id).toBe("H0-anchor");
+    expect(p?.type).toBeUndefined();
+    expect(parseIntent("[H1.2-io<H1-root] claim=x")?.parent).toBe("H1-root");
+    expect(hypothesisTags("[H0-anchor] claim=x").hypothesis_id).toBe("H0-anchor");
+  });
+
   it("still accepts the legacy Chinese keys", () => {
     const p = parseIntent("[H2.1<H2] 类型=根因; 假设=扫描量对不上; 判据=temp_bytes 反推; 关=H1:证伪");
     expect(p).toMatchObject({ id: "H2.1", parent: "H2", type: "cause", text: "扫描量对不上", resolve: [{ id: "H1", verdict: "falsified" }] });

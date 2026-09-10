@@ -3,9 +3,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { agentConclusion, build, parsedFromSpan, renderMd, resolveInput, run, scanClosing, scanProposals } from "./hypothesis-graph.mjs";
+import { agentConclusion, build, compactGraph, parsedFromSpan, renderMd, resolveInput, run, scanClosing, scanProposals } from "./hypothesis-graph.mjs";
 import { parseIntent } from "./hypothesis.mjs";
 
 function tool(spanId, name, ts, intent, tags = {}, extra = {}) {
@@ -230,5 +230,53 @@ describe("graph-worker", () => {
     expect(md).toContain("`tr1`");
     expect(md).not.toContain("other trace");
     expect(fs.readFileSync(path.join(dir, "graph-worker.log"), "utf8")).toContain("trace=tr1 假设 1");
+  });
+});
+
+describe("hypothesis-graph · compact graph for the server (2026-09-10)", () => {
+  it("strips call input/output but keeps span refs, and bounds the size", () => {
+    const g = build([
+      tool("t1", "get_dbdog_metric", 1, "[H1] type=cause; claim=c; expect=e; intent=read", {}, { input: "x".repeat(5000), output: "y".repeat(5000) }),
+    ]);
+    const c = compactGraph(g);
+    expect(c.nodes[0].calls[0]).toMatchObject({ seq: 1, span_id: "t1", tool: "get_dbdog_metric", purpose: "read" });
+    expect(c.nodes[0].calls[0]).not.toHaveProperty("input");
+    expect(c.nodes[0].calls[0]).not.toHaveProperty("output");
+    expect(c.edges.find((e) => e.kind === "tool")).not.toHaveProperty("intent");
+    expect(JSON.stringify(c).length).toBeLessThan(2000);
+    expect(c.graph_version).toBe(1);
+  });
+});
+
+describe("graph-worker · pushes the graph to the server on the root span", () => {
+  it("re-emits the root span with a compact graph through DBDOG_OBS_REPORT_URL", async () => {
+    const http = await import("node:http");
+    const received = [];
+    const server = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { received.push(JSON.parse(b)); res.writeHead(202); res.end("{}"); }); });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    const port = server.address().port;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "obs-"));
+    fs.writeFileSync(path.join(dir, "sess2.json"), JSON.stringify({ trace_id: "tr9", root_span_id: "tr9root", session_id: "sess2" }));
+    fs.writeFileSync(path.join(dir, "spans.jsonl"), [
+      JSON.stringify({ span_id: "tr9root", parent_id: null, kind: "agent", name: "claude-code.task", trace_id: "tr9", ts: "2026-09-10T08:00:00Z", output: "answer", output_local: "answer full", tags: { ml_app: "x" } }),
+      JSON.stringify(tool("t1", "get_dbdog_metric", "2026-09-10T08:00:01Z", "[H1] type=cause; claim=c; expect=e", {}, { trace_id: "tr9", output: "big".repeat(100) })),
+    ].join("\n") + "\n");
+    // 必须异步 spawn：spawnSync 会把本进程事件循环卡死，上面这个同进程 http server 根本接不到连接，
+    // worker 的 fetch 只能撞 reportTimeoutMs() 的 3s 超时后落「未送达」（2026-09-10 实证）。
+    const status = await new Promise((resolve) => {
+      spawn(process.execPath, [path.join(import.meta.dirname, "graph-worker.mjs"), "sess2"], {
+        env: { ...process.env, DBDOG_OBS_DIR: dir, DBDOG_OBS_REPORT_URL: `http://127.0.0.1:${port}/api/v2/llmobs/spans`, DBDOG_OBS_API_KEY: "dbdog_test" },
+        stdio: "ignore",
+      }).on("close", resolve);
+    });
+    await new Promise((r) => server.close(r));
+    expect(status).toBe(0);
+    expect(received).toHaveLength(1);
+    const root = received[0].spans[0];
+    expect(root.span_id).toBe("tr9root");
+    expect(root.graph.nodes[0].id).toBe("H1");
+    expect(root.graph.nodes[0].calls[0]).not.toHaveProperty("output");
+    expect(root).not.toHaveProperty("output_local"); // stripLocal 照旧
+    expect(fs.readFileSync(path.join(dir, "graph-worker.log"), "utf8")).toContain("已推 root+graph");
   });
 });

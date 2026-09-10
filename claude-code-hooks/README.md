@@ -125,6 +125,12 @@ tail -3 ~/.claude/dbdog-obs/spans.jsonl # 应有 kind:"agent"(root) 与 kind:"ll
   提示词成文 → 作为一条 `kind=workflow`/`name=diagnosis-summary` 的 span 推上去；控制台 banner 读它。
   不阻塞 Stop（用户零等待）、后写赢；未配/失败 = 没总结，不影响 trace。设计见
   `dbdog-web/docs/design/llmobs-investigation-narrative.md`。
+- **假设图**（2026-09-10）：SessionEnd 在本 trace 收尾后 detached 起后台 `graph-worker.mjs`，读本 trace 的
+  span 出图写到 `<DBDOG_OBS_DIR>/graphs/<trace_id>/forward-path.{md,json}` + `forward-conclusion.md`（本地全量，
+  含每次调用入参/返回）；配了上报 env 时，再把**紧凑形**的图（去掉每次调用的 input/output/intent、
+  `graph_version:1`）挂在 root span 上随 root 同键重发到 server——图会随 root span 推到 server（server
+  存 root 行的 `graph` 列），web 读 `GET /api/v2/llmobs/trace/{id}/graph`，不再各自从 span 现算。
+  失败只在同目录 `graph-worker.log` 留一行，不影响 trace。
 - env：`DBDOG_OBS_DIR`（状态/产物目录）、`DBDOG_OBS_SPANS`（spans 路径）、
   `DBDOG_OBS_CONTENT_CHARS`（**上报侧**内容截断，默认 8000，对齐 `DBDOG_TELEMETRY_OUTPUT_CHARS`
   先例；本地 `spans.jsonl` 不受它约束，超限字段另落 `<字段>_local` 全量副本，见「span 形状」）、
