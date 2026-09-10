@@ -76,6 +76,43 @@ describe("hypothesis intent tags", () => {
   });
 });
 
+describe("hypothesis intent tags · English keys (intent-v2, 2026-09-10)", () => {
+  // 单源改到 dbdog-mcp 的 telemetry.intent schema 描述（英文键）：type/claim/expect/close/intent，
+  // 源码来源 basis=source; code_ref=file:line。中文键继续认（历史 span），内部表示不变。
+  it("parses the canonical English line and keeps the internal representation", () => {
+    const line =
+      "[H2.1<H1.2] type=cause; claim=connection waits come from slow downstream I/O; expect=disk read latency rises with the waits, otherwise refuted; close=H1.1:refuted; intent=read disk latency for the window";
+    const p = parseIntent(line);
+    expect(p).toMatchObject({
+      id: "H2.1",
+      parent: "H1.2",
+      type: "cause",
+      text: "connection waits come from slow downstream I/O",
+      expect: "disk read latency rises with the waits, otherwise refuted",
+      intent: "read disk latency for the window",
+      resolve: [{ id: "H1.1", verdict: "falsified" }],
+    });
+    expect(parseIntent("[H1] type=symptom; claim=instance is anchored")?.type).toBe("confirm");
+    expect(parseIntent("[H3] claim=x; close=H1:supported,H2:inconclusive")?.resolve).toEqual([
+      { id: "H1", verdict: "confirmed" },
+      { id: "H2", verdict: "open" },
+    ]);
+  });
+
+  it("carries basis and code_ref into span tags", () => {
+    const tags = hypothesisTags("[H4] type=cause; claim=partition pruning walks every partition; expect=plan shows all partitions scanned; basis=source; code_ref=src/gausskernel/optimizer/util/pruning.cpp:412");
+    expect(tags.hypothesis_basis).toBe("source");
+    expect(tags.code_ref).toBe("src/gausskernel/optimizer/util/pruning.cpp:412");
+    expect(hypothesisTags("[H1] claim=x; basis=telemetry").hypothesis_basis).toBe("telemetry");
+    expect(hypothesisTags("[H1] claim=x; basis=guess")).not.toHaveProperty("hypothesis_basis");
+  });
+
+  it("still accepts the legacy Chinese keys", () => {
+    const p = parseIntent("[H2.1<H2] 类型=根因; 假设=扫描量对不上; 判据=temp_bytes 反推; 关=H1:证伪");
+    expect(p).toMatchObject({ id: "H2.1", parent: "H2", type: "cause", text: "扫描量对不上", resolve: [{ id: "H1", verdict: "falsified" }] });
+  });
+});
+
 describe("Agent Obs hook trigger", () => {
   it("does not create trace state for an ordinary prompt in triggered mode", () => {
     const dir = tempObsDir();

@@ -274,4 +274,4 @@ mcp 不双写、不上报，跟没装一样）：
 - **`spans.jsonl` 无限增长**：只追加不轮转（2026-09-08 实测 376MB / 56,582 行，其中 70% 是
   已移除的 `input_local`）。读侧已全部流式，不再受文件大小威胁；但收尸要按 id 回捞就依赖它，
   不能随便删。轮转（归档到子目录、活跃文件名不变）待做，需同步语料仓 `llmobs-ingest.py`、
-  diag-pair `from_spans.py`、dbdog-web 三处消费者。
+  span-graph `hypothesis-graph.mjs`、dbdog-web 三处消费者。
