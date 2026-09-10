@@ -1,5 +1,5 @@
 {
   "name": "dbdog-agent-obs",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "dbdog Agent Observability client hooks for Claude Code（mint → propagate → synthesize → sweep → graph（SessionEnd 自动出假设图到 dbdog-obs/graphs/<trace_id>/）；子代理内部调用可见，span 树三层。脚本本体在 claude-code-hooks/，hooks/hooks.json 经 ${CLAUDE_PLUGIN_ROOT} 引用；另带四个 skill：diag-flywheel（诊断飞轮客户端：沉淀用例 / 探针 / 判题包 / 重测对比 / 训练语料，用自己的 API key 直连 server）、span-graph（hook span → 假设图,零模型,与 hook 同一实现）、evidence-chain（现象+根因+修复 → 反向真取证,五段式）、diag-compare（正反对比 → 六类结论 + dbdog 改进清单,跨单号聚合），见 skills/*/SKILL.md）"
 }

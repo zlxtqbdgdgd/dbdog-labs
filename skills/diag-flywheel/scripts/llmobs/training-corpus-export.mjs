@@ -11,7 +11,12 @@
 //
 // 用法：
 //   node scripts/llmobs/training-corpus-export.mjs --out <dir>
+//     [--dataset <用例集名> [--project default-project]]
 //     [--from <iso>] [--to <iso>] [--ml-app <x>] [--include-needs-fix] [--page-limit 1000]
+//
+//   --dataset：只导**这个用例集的题**跑出来的诊断（跑批跑出来的 + 题沉淀自的那次）。
+//   不带它就是全库时间窗——owner 2026-09-10：「如果是全库它的命令就不该在某个用例集里面」，
+//   所以控制台用例集页生成的命令一定带它。
 //
 // env 同 run-experiment（DBDOG_BASE_URL / DBDOG_API_KEY 或 DBDOG_INTERNAL_TOKEN / DBDOG_ORG）。
 //
@@ -21,6 +26,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { baseUrl, getTrace, searchAllSpans, findAllAnnotationsByContent, requireCredential } from "./lib/exp-client.mjs";
+import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
 import { rootSpanOf } from "./lib/judge-package.mjs";
 import { EVAL_TAG_KEYS, buildSample, flattenJudgeLabels, selectSample } from "./lib/training-corpus.mjs";
 
@@ -33,6 +39,8 @@ const fail = (m) => { console.error(`✗ ${m}`); process.exit(1); };
 
 const OUT = argOf("--out", "");
 const ML_APP = argOf("--ml-app", "");
+const DATASET = argOf("--dataset", "");
+const PROJECT = argOf("--project", "default-project");
 const INCLUDE_NEEDS_FIX = has("--include-needs-fix");
 const PAGE_LIMIT = Math.min(Math.max(Number(argOf("--page-limit", "1000")) || 1000, 1), 5000); // server 上限 5000
 
@@ -72,6 +80,23 @@ const roots = await searchAllSpans(query, {
   onPage: (page, total) => console.error(`· 取回 ${page.length}（累计 ${total}）`),
 });
 console.error(`可信 ✅ 的 root span：${roots.length} 条`);
+
+// ── 按用例集筛：只留这个集合的题跑出来的 trace ─────────────────────────────
+// 在客户端筛而不是塞进 spans/search：trace↔题的线在 PG（records / events），spans 在 CH，
+// server 没有跨这两边的检索口，而这条线 loop-pending 本来就在算（同一份 lib）。
+let datasetScope = null;
+if (DATASET) {
+  try {
+    datasetScope = await resolveDatasetTraces({ project: PROJECT, dataset: DATASET });
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+  const before = roots.length;
+  for (let i = roots.length - 1; i >= 0; i--) {
+    if (!datasetScope.traceIds.has(String(roots[i].trace_id ?? ""))) roots.splice(i, 1);
+  }
+  console.error(`用例集 ${DATASET}（${datasetScope.records.length} 条题、${datasetScope.traceIds.size} 次诊断）：${before} → ${roots.length} 条`);
+}
 
 const excluded = { not_trustworthy: 0, lucky_guess: 0, needs_fix: 0, needs_fix_unjudged: 0, no_trace: 0 };
 const picked = [];

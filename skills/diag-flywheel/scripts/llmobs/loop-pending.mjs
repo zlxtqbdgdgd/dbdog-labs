@@ -21,10 +21,8 @@
 //     --json        出机器可读的 JSON（loop 脚本用这个）
 //
 // env：DBDOG_BASE_URL + DBDOG_API_KEY（或装 hooks 时配的 DBDOG_OBS_API_KEY）。
-import {
-  CP, call, findProject, findDataset, listRecords, listCPExperiments,
-  listAllExperimentEvents, requireCredential,
-} from "./lib/exp-client.mjs";
+import { CP, call, requireCredential } from "./lib/exp-client.mjs";
+import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
 
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
 const has = (n) => process.argv.includes(n);
@@ -38,29 +36,14 @@ if (!DATASET) fail("--dataset 必填");
 if (!["run", "judge", "both"].includes(KIND)) fail(`--kind 只能是 run|judge|both，收到 ${KIND}`);
 requireCredential();
 
-const project = await findProject(PROJECT);
-if (!project?.id) fail(`project 不存在：${PROJECT}`);
-const dataset = await findDataset(project.id, DATASET);
-if (!dataset?.id) fail(`dataset 不存在：${DATASET}（project ${PROJECT}）`);
-const records = await listRecords(project.id, dataset.id);
-
-// 这条用例跑过哪些诊断：experiments → events，按 dataset_record_id 归堆。
-const runsByRecord = new Map();
-for (const exp of await listCPExperiments({ projectID: project.id })) {
-  let events = [];
-  try {
-    events = await listAllExperimentEvents(exp.id);
-  } catch {
-    continue; // 单个 run 取不到 events 不该让整轮检测失败
-  }
-  for (const ev of events) {
-    const rid = ev.dataset_record_id;
-    if (!rid) continue;
-    const list = runsByRecord.get(rid) ?? [];
-    list.push({ experimentId: exp.id, experimentName: exp.name, traceId: ev.trace_id ?? "", eventId: ev.id });
-    runsByRecord.set(rid, list);
-  }
+// 用例集 → 题 → 历次诊断，解析线单源在 lib/dataset-traces.mjs（导语料按集合筛也用它）
+let resolved;
+try {
+  resolved = await resolveDatasetTraces({ project: PROJECT, dataset: DATASET });
+} catch (e) {
+  fail(e instanceof Error ? e.message : String(e));
 }
+const { project, dataset, records, runsByRecord } = resolved;
 
 // 判过没有：判题结果由 server 投影到 root span 的 `evaluation.*` tag（P2/ADR-0051），
 // 所以问 spans 就够，不用回头翻 annotation 原件。
