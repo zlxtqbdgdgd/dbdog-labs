@@ -54,6 +54,9 @@ const WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "summary-
 /** sweep 收尸脚本（与 session-start.mjs 用同一个）。 */
 const SWEEP = path.join(path.dirname(fileURLToPath(import.meta.url)), "sweep.mjs");
 
+/** 假设图 worker（2026-09-10）：trace 收尾后自动出 <obsDir>/graphs/<trace_id>/forward-path.md，装了插件就有图。 */
+const GRAPH_WORKER = path.join(path.dirname(fileURLToPath(import.meta.url)), "graph-worker.mjs");
+
 /** 单批上报条数上限（对齐 sweep 的量级；服务端限 1000 条/5MB，留足余量）。 */
 const BATCH = 100;
 
@@ -359,6 +362,9 @@ async function handleTraceTail(input, state) {
   if (flushedMain + flushedSub > 0 && summaryEnv()) {
     spawnDetached([WORKER, input.session_id], input.session_id, "summary worker");
   }
+  // ⑤ 假设图：不依赖任何 env，也不看这次有没有新 span——SessionEnd 是 trace 最后一次收尾，
+  //    图要按收尾后的全量 span 画（Stop 时刻的图会缺尾部结论与 in-flight 子代理）。
+  spawnDetached([GRAPH_WORKER, input.session_id], input.session_id, "graph worker");
 }
 
 run(async () => {
