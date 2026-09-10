@@ -113,7 +113,14 @@ export function hypothesisRefsIn(text) {
  * 的 `spans` 原样、或 hooks 落盘的 spans.jsonl 过滤出同一条 trace 的那些）。
  *
  * 返回（缺数据时给 null，不给 0——「没读到」和「真的是 0」不是一回事）：
- *   · `tool_calls`                  工具调用数（= kind=tool 的 span 数，与假设树同一份计数）
+ *   · `tool_calls`                  工具调用数（= kind=tool 的 span 数，与假设树同一份计数）。
+ *                                  **整棵树都数，子代理里的照数**——原来跑批那份数的是
+ *                                  Claude CLI 的 stream-json，只有主会话，委派越重低报越多
+ *                                  （2026-09-10 实测 411 vs 1128，15 个子代理）。
+ *   · `tool_errors`                 status=error 的调用数（同样含子代理）
+ *   · `degraded_calls`              dbdog 明说「这个能力没有」的返回数（ADR-0001 结构化降级）。
+ *                                  **与 tool_errors 分开数**：混在一起会把「dbdog 没这个能力」
+ *                                  记成「模型调坏了」，归因方向正好反了。
  *   · `subagent_count`              子代理数（kind=agent 且有 parent_id）
  *   · `subagent_depth_max`          子代理最大嵌套层数（root 记 0，只有 root 时是 0）
  *   · `subagent_peak_concurrent`    同时在跑的子代理峰值（扫描线）
@@ -155,8 +162,17 @@ export function orchestrationMetrics(spans) {
     if (verdict && verdict !== "open") resolved += 1;
   }
 
+  // 降级判据要看**本地全量**字段：远端那份被截断过，判据可能正好被截掉。
+  const outText = (s2) => {
+    const v = s2?.output_local ?? s2?.output;
+    return typeof v === "string" ? v : v == null ? "" : JSON.stringify(v);
+  };
+  const toolSpans = all.filter((s2) => s2?.kind === "tool");
+
   return {
     tool_calls: calls.length,
+    tool_errors: toolSpans.filter((s2) => s2.status === "error").length,
+    degraded_calls: toolSpans.filter((s2) => outText(s2).includes('"capability_unavailable"')).length,
     subagent_count: subs.length,
     subagent_depth_max: depthMax,
     subagent_peak_concurrent: peakConcurrent(

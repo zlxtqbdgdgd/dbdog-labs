@@ -101,6 +101,47 @@ describe("hypothesis-graph · build", () => {
   });
 });
 
+describe("hypothesis-graph · 点分编号即谱系（2026-09-10）", () => {
+  // 实测一轮 460 次点分编号的调用，写了 `<父` 的是 0 次，span 标签上的 parent_hypothesis_id
+  // 因此全空，H4.1 在图上是孤儿、挂不到 H4 右边。标签是钩子盖的——**老 span 的标签补不回来**，
+  // 所以建图这一侧也要能自己按编号推，不能只依赖标签。
+  it("标签没有父时按点分前缀推：H4.1 挂到 H4 底下", () => {
+    const g = build([
+      dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H4", hypothesis: "母假设" }),
+      dbdog("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H4.1" }),   // 标签里没有 parent
+    ]);
+    expect(byId(g)["H4.1"].parent).toBe("H4");
+    expect(new Set(g.edges.map((e) => `${e.kind} ${e.from} ${e.to ?? e.tool}`)).has("parent H4 H4.1")).toBe(true);
+  });
+
+  it("父节点自己没被提出过：走与显式 <父 同一条路——补占位并标 declared:false，由 undeclared 计数暴露", () => {
+    // 实测形态：只有 H4.1…H4.5，没有裸 H4（模型先分组再编号，母假设从没写过）。
+    // 缺陷本身修在约定那一侧（mcp 的 telemetry.intent：派生前必须先提出父假设）；
+    // 这里不新造一份计数——`summary.undeclared` 本来就在数「这个节点是我们补的」。
+    const g = build([
+      dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H4.1" }),
+      dbdog("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H4.2" }),
+    ]);
+    expect(byId(g)["H4"].declared).toBe(false);
+    expect(byId(g)["H4.1"].parent).toBe("H4");
+    expect(g.summary.undeclared).toBe(1);
+  });
+
+  it("标签里显式写了父就用它，不许被点分前缀覆盖（跨号派生只能靠显式）", () => {
+    const g = build([
+      dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H1.2" }),
+      dbdog("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H2.1", parent_hypothesis_id: "H1.2" }),
+    ]);
+    expect(byId(g)["H2.1"].parent).toBe("H1.2");
+  });
+
+  it("顶层编号没有父，不许推出一个空的 H", () => {
+    const g = build([dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H4" })]);
+    expect(byId(g)["H4"].parent).toBeFalsy();
+    expect(byId(g)["H"]).toBeUndefined();
+  });
+});
+
 describe("hypothesis-graph · prose", () => {
   it("English Propose line fills the undeclared parent", () => {
     const g = build([

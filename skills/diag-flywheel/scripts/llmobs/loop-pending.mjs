@@ -86,9 +86,11 @@ if (JSON_OUT) {
     ...(KIND !== "judge" ? { need_run: needRun } : {}),
     ...(KIND !== "run" ? { need_judge: needJudge } : {}),
   };
+  // 写完**不要** process.exit：往管道写是异步的，exit 不等它刷完，后半截直接丢
+  // （2026-09-10 实测：105KB 被截到 41KB，报出来长得像上游数据坏了）。
+  // 重定向到文件看不出来——文件写是同步的。让脚本自然结束即可。
   console.log(JSON.stringify(out, null, 1));
-  process.exit(0);
-}
+} else {
 
 const one = (s, n = 56) => String(s).replace(/\s+/g, " ").trim().slice(0, n);
 console.log(`用例集 ${DATASET}（${records.length} 条用例）`);
@@ -108,4 +110,5 @@ if (KIND !== "run") {
     console.log(`\n  ↳ 判它们：把每条 trace 交给 agent 按 dbdog/llm-obs-diag-judge 判，`);
     console.log(`     判完用 judge-package-import.mjs 回流（或让 agent 直接写回）。`);
   }
+}
 }

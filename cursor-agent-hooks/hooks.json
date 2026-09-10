@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/before-submit-prompt.mjs\"",
+        "timeout": 10
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/pre-tool-use.mjs\"",
+        "matcher": "^MCP:",
+        "timeout": 10
+      }
+    ],
+    "afterMCPExecution": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/after-mcp-execution.mjs\"",
+        "timeout": 15
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/post-tool-use-failure.mjs\"",
+        "matcher": "^MCP:",
+        "timeout": 15
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/after-agent-response.mjs\"",
+        "timeout": 10
+      }
+    ],
+    "afterAgentThought": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/after-agent-thought.mjs\"",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/stop.mjs\"",
+        "timeout": 15
+      }
+    ],
+    "subagentStart": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/subagent-start.mjs\"",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "node \"/ABSOLUTE/PATH/TO/dbdog-labs/cursor-agent-hooks/subagent-stop.mjs\"",
+        "timeout": 15
+      }
+    ]
+  }
+}
