@@ -43,11 +43,14 @@ describe("hypothesis-graph · build", () => {
     expect(g.summary.local_tools_excluded_by_name).toEqual({ Bash: 1 });
   });
 
-  it("falls back to the English intent line and creates the placeholder parent", () => {
+  it("falls back to the English intent line; a父 that was never stated is **not** invented", () => {
+    // 2026-09-10 owner 定：不留兜底。原来这里会给 H2 补一个 declared:false 的占位节点，
+    // 现在不补——H2 从没被提出过就是缺陷，让它可见（orphan_hypotheses）然后修源头。
     const g = build([dbdog("t1", "get_dbdog_metric", 1, "[H3<H2] type=cause; claim=short-circuit failed; expect=plan shows a full scan")]);
-    expect(g.nodes[0].id).toBe("H2");
-    expect(g.nodes[0].declared).toBe(false);
-    expect(g.nodes[1]).toMatchObject({ id: "H3", declared: true, parent: "H2", type: "cause", expect: "plan shows a full scan" });
+    expect(g.nodes.map((n) => n.id)).toEqual(["H3"]);
+    expect(g.nodes[0]).toMatchObject({ id: "H3", declared: true, type: "cause", expect: "plan shows a full scan" });
+    expect(g.nodes[0].parent).toBeFalsy();
+    expect(g.summary.orphan_hypotheses).toBe(1);
   });
 
   it("records resolve edges and verdicts from close=", () => {
@@ -114,17 +117,24 @@ describe("hypothesis-graph · 点分编号即谱系（2026-09-10）", () => {
     expect(new Set(g.edges.map((e) => `${e.kind} ${e.from} ${e.to ?? e.tool}`)).has("parent H4 H4.1")).toBe(true);
   });
 
-  it("父节点自己没被提出过：走与显式 <父 同一条路——补占位并标 declared:false，由 undeclared 计数暴露", () => {
-    // 实测形态：只有 H4.1…H4.5，没有裸 H4（模型先分组再编号，母假设从没写过）。
-    // 缺陷本身修在约定那一侧（mcp 的 telemetry.intent：派生前必须先提出父假设）；
-    // 这里不新造一份计数——`summary.undeclared` 本来就在数「这个节点是我们补的」。
+  it("父节点从没被提出过：**不补占位**，如实留成孤儿并计数", () => {
+    // owner 2026-09-10 定：不留兜底——父不存在就是缺陷，让它可见然后修源头。
+    // 补一个空节点会把「这一支是断的」这件事盖掉，从此没人知道。
+    // 实测形态：只有 H4.1…H4.5，没有裸 H4（模型先分组再编号，母假设一次没写）。
     const g = build([
       dbdog("t1", "get_dbdog_metric", 1, undefined, { hypothesis_id: "H4.1" }),
       dbdog("t2", "search_dbdog_logs", 2, undefined, { hypothesis_id: "H4.2" }),
     ]);
-    expect(byId(g)["H4"].declared).toBe(false);
-    expect(byId(g)["H4.1"].parent).toBe("H4");
-    expect(g.summary.undeclared).toBe(1);
+    expect(byId(g)["H4"]).toBeUndefined();
+    expect(byId(g)["H4.1"].parent).toBeFalsy();
+    expect(g.summary.orphan_hypotheses).toBe(2);
+  });
+
+  it("显式写了父、而那个父从没被提出过：同样不补占位", () => {
+    const g = build([dbdog("t1", "get_dbdog_metric", 1, "[H3<H2] type=cause; claim=x")]);
+    expect(byId(g)["H2"]).toBeUndefined();
+    expect(byId(g)["H3"].parent).toBeFalsy();
+    expect(g.summary.orphan_hypotheses).toBe(1);
   });
 
   it("标签里显式写了父就用它，不许被点分前缀覆盖（跨号派生只能靠显式）", () => {
@@ -203,7 +213,11 @@ describe("hypothesis-graph · prose", () => {
       tool("t4", "Bash", 4),
     ]);
     const md = renderMd(g);
-    for (const needle of ["slow queries exist", "判据：any found", "find slow sql", "H2", "未声明", "H2.1 → H1", "证实", "intent 不带 [H..] 头", "## 假设出现顺序"]) {
+    // `[H2.1<H2]` 里的 H2 从没被提出过 → 不补占位（owner 2026-09-10：不留兜底），
+    // H2.1 如实成为孤儿，由 orphan_hypotheses 计数暴露。
+    expect(g.summary.orphan_hypotheses).toBe(1);
+    expect(g.nodes.map((n) => n.id)).not.toContain("H2");
+    for (const needle of ["slow queries exist", "判据：any found", "find slow sql", "H2.1 → H1", "证实", "intent 不带 [H..] 头", "## 假设出现顺序"]) {
       expect(md, needle).toContain(needle);
     }
     // 本地工具只在概览里计次，不再列进「未挂到假设的工具调用」

@@ -325,16 +325,24 @@ export function build(spans) {
     toolEdges.push({ kind: "tool", from: p.id, tool, seq, span_id: s.span_id, intent });
   }
 
+  // 父节点不存在时**不补占位**（owner 2026-09-10 定：不留兜底）。
+  // 那说明模型从一个自己从没提出过的假设往下派生（实测：只有 H4.1…H4.5，没有裸 H4），
+  // 是真缺陷。凭空造一个空节点会把「这一支是断的」盖掉，从此没人知道。
+  // 如实留成孤儿，由 summary.orphan_hypotheses 计数暴露，修在约定那一侧。
   const parentEdges = [];
   const seen = new Set();
+  let orphans = 0;
   for (const n of [...nodes.values()]) {
-    if (n.parent) {
-      ensure(nodes, n.parent);
-      const key = `${n.parent} ${n.id}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        parentEdges.push({ kind: "parent", from: n.parent, to: n.id });
-      }
+    if (!n.parent) continue;
+    if (!nodes.has(n.parent)) {
+      orphans += 1;
+      n.parent = undefined;      // 不留指向不存在节点的边
+      continue;
+    }
+    const key = `${n.parent} ${n.id}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      parentEdges.push({ kind: "parent", from: n.parent, to: n.id });
     }
   }
 
@@ -358,6 +366,8 @@ export function build(spans) {
       hypotheses: nodeList.length,
       undeclared: nodeList.filter((n) => !n.declared).length,
       parent_edges: parentEdges.length,
+      // 父编号（点分推出的或显式写的）指向的节点从没被提出过的数量。0 才算这棵树是连的。
+      orphan_hypotheses: orphans,
       tool_edges: toolEdges.length,
       resolve_edges: resolveEdges.length,
       unattached_tools: unattached.length,
