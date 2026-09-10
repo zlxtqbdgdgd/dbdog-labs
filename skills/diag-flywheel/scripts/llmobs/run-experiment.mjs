@@ -22,10 +22,7 @@
 //     [--scenarios 000,001,204] [--limit N] [--prompt-source auto|platform|dataset] \
 //     [--model MODEL] [--judge-model MODEL] [--concurrency 2] [--timeout-sec 900] [--dry-run]
 //
-// 盲测评测那条路另外四个开关（真实用户用不上）：
-//   --workdir <路径>            固定工作目录 = 被诊断系统的源码树（给了就不铺模板、不删目录）
-//   --deny-root <路径>          禁读根，可重复；生成 Read/Grep/Glob 三条 deny 规则
-//   --guard-hook <命令行>       PreToolUse 护栏钩子，补 deny 挡不住的 Bash 读文件那条洞
+// --workdir <路径>：固定工作目录 = 被诊断系统的源码树（给了就不铺模板、不删目录）。
 //
 // **题面里禁止加料**（owner 2026-09-10 定）：题面是用户会怎么问，我们不知道真实用户怎么用，
 // 往里塞我们的引导语，测出来的就不是产品面的真实行为了。假设书写约定的唯一定义处是
@@ -56,7 +53,6 @@ import {
   requireCredential,
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
-import { mergeAgentSettings } from "./lib/blind-guard.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
@@ -80,15 +76,6 @@ const argOf = (name, dflt) => {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
 };
 const has = (name) => process.argv.includes(name);
-/** 可重复参数：`--deny-root a --deny-root b` → ["a","b"]。 */
-const argsOf = (name) => {
-  const out = [];
-  for (let i = 0; i < process.argv.length; i++) {
-    if (process.argv[i] === name && process.argv[i + 1]) out.push(process.argv[i + 1]);
-  }
-  return out;
-};
-
 function fail(msg) {
   console.error(`✗ ${msg}`);
   process.exit(1);
@@ -123,9 +110,6 @@ const WORKDIR_TEMPLATE = argOf("--workdir-template", path.join(ROOT, "clients", 
 // 作弊体检那关会报 HEAD 不干净。
 const WORKDIR = argOf("--workdir", "");
 if (WORKDIR && !fs.existsSync(WORKDIR)) fail(`--workdir 不存在：${WORKDIR}`);
-// 盲测护栏（可选，见 lib/blind-guard.mjs）。真实用户不需要，评测才要。
-const DENY_ROOTS = argsOf("--deny-root");
-const GUARD_HOOK = argOf("--guard-hook", "");
 const DRY = has("--dry-run");
 
 requireCredential();
@@ -148,12 +132,7 @@ function loadHooksSettings() {
       }
     }
   }
-  // 护栏与采集共用这一份：同一个 claude 进程只收一份 --settings，各传各的会互相覆盖。
-  return JSON.stringify(mergeAgentSettings({
-    hooks: parsed.hooks,
-    denyRoots: DENY_ROOTS,
-    guardHookCommand: GUARD_HOOK,
-  }));
+  return JSON.stringify({ hooks: parsed.hooks });
 }
 const hooksSettings = loadHooksSettings();
 
@@ -376,7 +355,7 @@ async function runOne(record, idx, ctx) {
   const orchLine = orch
     ? ` · 子代理 ${orch.subagent_count}（峰值 ${orch.subagent_peak_concurrent}，深 ${orch.subagent_depth_max}${orch.subagent_limit_hits ? `，撞上限 ${orch.subagent_limit_hits} 次` : ""}）· 假设 ${orch.hypothesis_count}/收口 ${orch.hypothesis_resolved}${orch.hypothesis_dangling_refs ? `/悬空引用 ${orch.hypothesis_dangling_refs}` : ""}`
     : "";
-  console.error(`${noTrace || run.failure ? "✗" : "✓"} [${label}] ${judged.verdict ?? "judge-err"} · ${Math.round(durationMs / 1000)}s · ${tools.length} tools · trace ${traceId.slice(0, 8) || "—"}${orchLine}`);
+  console.error(`${noTrace || run.failure ? "✗" : "✓"} [${label}] ${judged.verdict ?? "judge-err"} · ${Math.round(durationMs / 1000)}s · ${orch ? `${orch.tool_calls} tools（主会话 ${tools.length}）` : `${tools.length} tools`} · trace ${traceId.slice(0, 8) || "—"}${orchLine}`);
   return { record, label, judged, traceId, durationMs, noTrace, ...(run.failure ? { error: run.failure } : {}) };
 }
 
