@@ -16,6 +16,11 @@
 // 注意：钩子的命令行会被原样回灌给模型（"PreToolUse:Bash hook error: [<命令行>]: <理由>"），
 // 所以调用方**不要**把禁读根写进钩子的 argv——否则 agent 触一次护栏就白拿到答案目录的绝对路径。
 
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 /** 绕道通道：出网抓原文、查进程反推自己在被测哪一例。与禁读根无关，恒挡。 */
 const ALWAYS_DENY = [
   "WebSearch", "WebFetch",
@@ -71,4 +76,31 @@ export function mergeAgentSettings({ hooks = {}, denyRoots = [], guardHookComman
   if (wantsGuard) out.permissions = { deny: buildDenyRules(denyRoots) };
 
   return out;
+}
+
+/**
+ * 把护栏钩子装成一个**带禁读根的临时副本**，回它的调用命令行。
+ *
+ * 为什么要拷副本而不是传参数：钩子被拒时 Claude Code 会把**钩子命令行原样**回灌给模型
+ * （`PreToolUse:Bash hook error: [<命令行>]: <理由>`）。禁读根写进 argv，agent 触一次护栏
+ * 就白拿到答案目录的绝对路径——护栏本身成了泄漏面。所以根必须**烧进副本的源码里**，
+ * 命令行只剩 `python3 /var/folders/…/g.py`。
+ *
+ * 此前这一步由每个调用方各写一遍（语料仓的 diagnose.sh 一份、本机 loop runner 一份，
+ * 后者干脆把根硬编码进源码）。收成一个函数，换机器不用再改任何文件。
+ *
+ * 返回 null 表示没给禁读根——**调用方必须当错误处理**，不能当「不用挡」：
+ * 盲测护栏少一层是静默失效，跑批照跑、分数照涨，没有任何迹象。
+ */
+export function installGuardCopy(denyRoots, { tmpdir = os.tmpdir() } = {}) {
+  const roots = (denyRoots ?? []).map((r) => String(r).replace(/\/+$/, "")).filter(Boolean);
+  if (roots.length === 0) return null;
+  const src = path.join(path.dirname(fileURLToPath(import.meta.url)), "diag-guard.py");
+  const body = fs.readFileSync(src, "utf8");
+  const anchor = "ROOTS_OVERRIDE = []";
+  if (!body.includes(anchor)) throw new Error("diag-guard.py 缺 ROOTS_OVERRIDE 锚点");
+  const dir = fs.mkdtempSync(path.join(tmpdir, "dbdog-guard-"));
+  const dst = path.join(dir, "g.py");
+  fs.writeFileSync(dst, body.replace(anchor, `ROOTS_OVERRIDE = ${JSON.stringify(roots)}`));
+  return `python3 ${dst}`;
 }

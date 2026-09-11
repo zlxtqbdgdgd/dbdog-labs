@@ -54,7 +54,7 @@ import {
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
-import { mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
+import { installGuardCopy, mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -115,7 +115,10 @@ const WORKDIR = argOf("--workdir", "");
 if (WORKDIR && !fs.existsSync(WORKDIR)) fail(`--workdir 不存在：${WORKDIR}`);
 // 盲测护栏（本地评测专用，不进产品仓）
 const DENY_ROOTS = argsOf("--deny-root");
-const GUARD_HOOK = argOf("--guard-hook", "");
+// --guard-hook 仍收（调用方要用自己的钩子时给），但**默认不再要求给**：
+// 本仓自带 lib/diag-guard.py，有禁读根就自动装一份注入了根的临时副本。
+// 此前每个调用方各自带一份钩子，有的干脆把禁读根硬编码进源码，换台机器必须改文件。
+const GUARD_HOOK = argOf("--guard-hook", "") || (DENY_ROOTS.length ? installGuardCopy(DENY_ROOTS) ?? "" : "");
 const DRY = has("--dry-run");
 
 requireCredential();
