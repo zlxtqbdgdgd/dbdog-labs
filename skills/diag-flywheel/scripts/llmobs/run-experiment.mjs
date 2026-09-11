@@ -49,7 +49,7 @@ import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { runWorkerPool } from "../e2e/lib/worker-pool.mjs";
 import {
   loadDataset, postExperimentEvent, postSpans, dedupSpans, getExperimentSummary, baseUrl,
-  createExperimentRun, resolveExperimentRef,
+  createExperimentRun, resolveExperimentRef, patchCPExperiment,
   requireCredential,
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
@@ -410,6 +410,21 @@ const run = await createExperimentRun({
   },
 });
 ctx.runID = run.id;
+
+// 轮次状态由这里收尾（飞轮设计 §13.2 #7）：此前从不写，跑完的轮次永远是 running，读侧分不清完没完。
+// 取值同 DD：running / completed / failed / interrupted（server 按同一集合校验）。被 Ctrl-C / kill 打断就写 interrupted。
+const settleStatus = async (status) => {
+  try {
+    await patchCPExperiment(run.id, { status });
+  } catch (e) {
+    console.error(`⚠ 写轮次状态 ${status} 失败：${e.message || e}`);
+  }
+};
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.once(sig, () => {
+    void settleStatus("interrupted").finally(() => process.exit(130));
+  });
+}
 console.error(`run=${run.id} name=${run.name}（逻辑名 ${run.experiment ?? EXPERIMENT}；跑一次就是一条新 run，同名不复用旧行）${parent ? ` parent=${parent.id}` : ""}`);
 
 // 每次运行独立 obs 目录（状态文件 + spans.jsonl 干净隔离）；mcp.json 全程共用一份。
@@ -460,5 +475,7 @@ try {
 } catch { /* 汇总失败不影响退出码 */ }
 console.error(`== 控制台：/llmobs/experiments?experiment_id=${run.id}（run 名 ${run.name}）`);
 const failed = errN === results.length || noTraceN > 0;
+// 全部挂了 = failed；否则 completed——单条挂了照实写在它自己的事件上（status=error），不拖累整轮
+await settleStatus(errN === results.length ? "failed" : "completed");
 console.error(failed ? "EXPERIMENT-RUN-FAILED" : "EXPERIMENT-RUN-DONE");
 process.exit(failed ? 1 : 0);

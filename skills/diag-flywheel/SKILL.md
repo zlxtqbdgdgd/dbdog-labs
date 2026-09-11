@@ -65,7 +65,8 @@ node $S/llmobs/judge-package-export.mjs --experiment <run 名或 uuid> --out ./p
 ```
 
 包是自包含的(判题方不能回头追问,所以材料一次给全):`manifest.json` + 判题 skill 正文 +
-每例的 `trace.json` / `forward.md`(正向假设树)/ `reverse.md` / `ground-truth.md` / `probe.json`。
+每例的 `trace.json` / `forward.md`(正向假设树)/ `reverse.md` / `ground-truth.md` / `probe.json` /
+`prior-judgments.json`(这道题之前几轮提过的待修——判这一轮要逐条复验还没关的)。
 
 把 `./pkg` 交给一个强模型会话,让它按包里 `skill/SKILL.md` 判,产出 `annotations.jsonl` +
 `summary.md`,然后:
@@ -74,16 +75,22 @@ node $S/llmobs/judge-package-export.mjs --experiment <run 名或 uuid> --out ./p
 node $S/llmobs/judge-package-import.mjs --package ./pkg --annotator <判题模型名>
 ```
 
+`--annotator` 必填:两轮结论不一样时,得分得清是 agent 变了还是判题换了。
+待修要**一条一个落点**(`attribution.items`,带稳定 key),之前几轮提过的写复验(`attribution.checks`);
+一段话塞好几处改动的旧写法 import 会整包拒。
+
 导入后 server 自动把批注投影成三处:批注原件、experiment 的分数、trace root 上的
 `evaluation.*` 标签。**判题方只交一次**。
 
-> 能连上 server 时其实不必走包——直接让 agent 用 MCP 工具现取现判即可,判据与产物形状完全一样。
+> 能连上 server 时其实不必走包——直接让 agent 用 MCP 工具现取现判即可,判据与产物形状完全一样;
+> 之前几轮的待修用 `node $S/llmobs/case-history.mjs --record <record_id> --before <trace_id>` 拿。
 > 包是给「判题模型在连不上 dbdog 的环境里」准备的。
 
 ### ④ 去控制台看
 
-- **判题页**:待判 / 已判,以及 **dbdog 要修清单**(按「改哪里」聚合,每条指到具体 span)
-- **诊断页**:每行带判题结果 chip,可筛「可信 ❌」把该抓 bug 的挑出来
+- **用例集**:表头选轮次,「判题」列是那一轮判成什么、「历次」列一轮一格看走势;点开看这道题的**待修条目**——
+  修没修好只看后续轮次的复验,每条带「修这一条,重跑验证」的指令
+- **用例诊断日志**:每行带判题结果 chip 与所属轮次,可筛「只看未判 / 只看要修」
 - **跑批页**:run 列表与对比
 
 ### ⑤ 改完重测,看变好还是变坏
