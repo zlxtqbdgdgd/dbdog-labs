@@ -49,13 +49,14 @@ import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { runWorkerPool } from "../e2e/lib/worker-pool.mjs";
 import {
   loadDataset, postExperimentEvent, postSpans, dedupSpans, getExperimentSummary, baseUrl,
-  createExperimentRun, resolveExperimentRef,
+  createExperimentRun, resolveExperimentRef, patchCPExperiment,
   requireCredential,
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
 import { mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
+import { runStatusOf } from "./lib/run-status.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 // hooks 母版 2026-07-14 迁到公开仓 dbdog-labs（本仓 clients/claude-code-hooks 只剩指路 README）。
@@ -418,6 +419,32 @@ const run = await createExperimentRun({
 ctx.runID = run.id;
 console.error(`run=${run.id} name=${run.name}（逻辑名 ${run.experiment ?? EXPERIMENT}；跑一次就是一条新 run，同名不复用旧行）${parent ? ` parent=${parent.id}` : ""}`);
 
+// 轮次终态**建行之后立刻挂**，不只在正常收尾那一条路上写：被 Ctrl-C、被 launchd 杀、
+// 顶层抛异常，这三种都会让那一轮永远停在 `running`（飞轮 §13.2 #7 就是这么来的）。
+// 只写一次：先到先得，正常收尾写 completed/failed，信号写 interrupted。
+let runStatusWritten = false;
+async function finishRun({ total, errored, signal = null, crashed = false }) {
+  if (runStatusWritten) return;
+  runStatusWritten = true;
+  const status = runStatusOf({ total, errored, signal, crashed });
+  try {
+    await patchCPExperiment(run.id, { status });
+    console.error(`轮次状态 → ${status}`);
+  } catch (e) {
+    // 写不上不该改变跑批的成败判定——但必须说出来，否则页面上又是一条永远 running 的轮次。
+    console.error(`⚠ 轮次状态没写上（仍是 running）：${e.message || e}`);
+  }
+}
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.once(sig, () => {
+    finishRun({ total: 0, errored: 0, signal: sig }).finally(() => process.exit(130));
+  });
+}
+process.once("uncaughtException", (e) => {
+  console.error(`✗ 顶层异常：${e?.stack || e}`);
+  finishRun({ total: 0, errored: 0, crashed: true }).finally(() => process.exit(1));
+});
+
 // 每次运行独立 obs 目录（状态文件 + spans.jsonl 干净隔离）；mcp.json 全程共用一份。
 const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "llmobs-exp-"));
 const obsDir = path.join(runDir, "obs");
@@ -465,6 +492,9 @@ try {
   if (js?.mean != null) console.error(`== server 汇总：judge_score mean=${js.mean.toFixed(3)} p50=${js.p50} (n=${js.count})`);
 } catch { /* 汇总失败不影响退出码 */ }
 console.error(`== 控制台：/llmobs/experiments?experiment_id=${run.id}（run 名 ${run.name}）`);
+// 轮次状态按「这一轮跑完了没有」写，**不跟退出码同口径**：退出码把「有一条没 trace」也算
+// 整轮失败（那是给调用方的信号），而轮次状态要跟用例级分开——个别用例挂了，轮次仍是跑完了。
+await finishRun({ total: results.length, errored: errN });
 const failed = errN === results.length || noTraceN > 0;
 console.error(failed ? "EXPERIMENT-RUN-FAILED" : "EXPERIMENT-RUN-DONE");
 process.exit(failed ? 1 : 0);
