@@ -3,3 +3,5 @@ node_modules/
 __pycache__/
 *.pyc
 .DS_Store
+# 跑批产物：每轮的 span / 状态文件 / 假设图（scripts/llmobs/lib/run-artifacts.mjs 的落点），机器本地不入库
+dbdog-obs/

@@ -33,7 +33,7 @@ const LABS = path.resolve(argOf("--labs", path.join(MCP_ROOT, "..", "dbdog-labs"
 const DEST = path.join(LABS, "skills", "diag-flywheel", "scripts");
 
 /**
- * 镜像清单 = 七个入口脚本的依赖闭包（`scripts/llmobs/` 12 个 + `scripts/e2e/lib/` 7 个）。
+ * 镜像清单 = 九个入口脚本的依赖闭包（`scripts/llmobs/` 12 个 + `scripts/e2e/lib/` 7 个）。
  * **不写死列表**：从入口出发解析 import，闭包变了这里自动跟着变（军规 3：能推导的不钉字面量）。
  * 测试与夹具不镜像——用户跑的是脚本，不是我们的守门。
  */
@@ -46,6 +46,7 @@ const ENTRIES = [
   "scripts/llmobs/training-corpus-export.mjs",
   "scripts/llmobs/loop-pending.mjs",
   "scripts/llmobs/case-history.mjs",
+  "scripts/llmobs/fix-mark.mjs",
   // 2026-09-11 加两条 loop 的入口：它们此前只在源码仓里，于是别人要跑就得 clone 整个 mcp
   // 仓只为拿两个文件（那台机器上的 runner 靠一个 MCP_REPO 变量指过去）。进了镜像之后，
   // 装了插件就有脚本，MCP_REPO 这个变量整个消失。

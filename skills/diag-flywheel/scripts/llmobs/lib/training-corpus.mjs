@@ -1,8 +1,8 @@
 // training-corpus.mjs — 训练语料的**纯函数**层（选样口径、样本形状），零 I/O、零 fetch。
 //
 // 单源关系（军规 3）：
-//   · 选样口径 = dbdog-web `docs/design/llmobs-diag-flywheel.md` D4 的四种组合，
-//     P4 那行「训练语料导出（筛可信 ✅ 蒙对 ❌）」是它的用法；这里只把 D4 翻译成判据，不另立口径。
+//   · 选样口径 = dbdog-web `docs/design/llmobs-diag-flywheel.md` D4（2026-09-11 版：证据撑得住 + 没有工具错 = 能当训练样本），
+//     这里只把 D4 翻译成判据，不另立口径。
 //   · 标签落到 span 上的键名 = 设计 §7.2 的服务端投影（root span 的 `evaluation.*` tag），
 //     server 侧单源在 `internal/api/llmobs_annotation_projection.go`。
 //   · 假设树不在这里重建——用 `judge-package.mjs` 的 `hypothesisTreeJson`（与 forward.md 同一份树）。
@@ -11,66 +11,50 @@ import { hypothesisTreeJson, rootSpanOf, stampOf } from "./judge-package.mjs";
 import { subagentSpans } from "./orchestration-metrics.mjs";
 
 /**
- * root span 上的 `evaluation.*` tag 键（设计 §7.2 投影出来的五个）。
- * CH 的 tags 是 `Map(String,String)` ⇒ 布尔到了这里是字符串 `"true"` / `"false"`，
- * 归因标签是逗号连接的一串——**都不是原生类型**，别直接当 boolean 用。
+ * root span 上的 `evaluation.*` tag 键（设计 §7.2 投影出来的三个，2026-09-11 改版）。
+ * CH 的 tags 是 `Map(String,String)` ⇒ 改进点类别到了这里是逗号连接的一串——**不是数组**，别直接当数组用。
  */
 export const EVAL_TAG_KEYS = {
-  trustworthy: "evaluation.trustworthy",
-  needs_fix: "evaluation.needs_fix",
   verdict: "evaluation.verdict",
-  lucky_guess: "evaluation.lucky_guess",
-  tags: "evaluation.tags",
+  evidence: "evaluation.evidence",
+  kinds: "evaluation.finding_kinds",
 };
 
 /** 判题 skill 的总结 span（hooks 的 `summary-worker.mjs` 推的那条；web `llmobs-trace-view.ts` 同一对常量）。 */
 export const SUMMARY_KIND = "workflow";
 export const SUMMARY_NAME = "diagnosis-summary";
 
-/** `"true"` / `"false"` → 布尔；**没有这个 tag 回 null**（「没判」与「判成 false」不是一回事）。 */
-export function tagBool(value) {
-  if (value === true || value === false) return value;
-  const v = String(value ?? "").trim().toLowerCase();
-  if (v === "true") return true;
-  if (v === "false") return false;
-  return null;
-}
-
 /** root span 的 `evaluation.*` 读回可用形（缺的是 null / []，不补默认值）。 */
 export function evaluationOf(span) {
   const tags = span?.tags ?? {};
-  const raw = String(tags[EVAL_TAG_KEYS.tags] ?? "").trim();
+  const raw = String(tags[EVAL_TAG_KEYS.kinds] ?? "").trim();
   return {
-    trustworthy: tagBool(tags[EVAL_TAG_KEYS.trustworthy]),
-    needs_fix: tagBool(tags[EVAL_TAG_KEYS.needs_fix]),
-    lucky_guess: tagBool(tags[EVAL_TAG_KEYS.lucky_guess]),
     verdict: tags[EVAL_TAG_KEYS.verdict] ? String(tags[EVAL_TAG_KEYS.verdict]) : null,
-    tags: raw ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [],
+    evidence: tags[EVAL_TAG_KEYS.evidence] ? String(tags[EVAL_TAG_KEYS.evidence]) : null,
+    kinds: raw ? raw.split(",").map((t) => t.trim()).filter(Boolean) : [],
   };
 }
 
 /**
- * 一条 root span 收不收、收成哪一档（D4 四种组合 → 训练集）。
+ * 一条 root span 收不收、收成哪一档（D4 2026-09-11 版：「这条 trace 还能用来干什么」是算出来的）。
  *
- * · 可信 ❌ / 没判可信 → 不收（D4：隔离，只用来抓 bug）。
- * · 蒙对 ✅ → 不收（对了没证据，学它就是学蒙）。**没判蒙对当没蒙**——`lucky_guess` 是
- *   「抓到了才填」的项，缺席是常态，按 true 处理会把整批好样本筛没。
- * · 要修 ❌ → `model`：纯模型 + prompt 行为样本，不论对错都进（D4 owner 原话：不同反应都是样本）。
- * · 要修 ✅ → 默认不收；`--include-needs-fix` 时收成 `dbdog_gap`（D4：这条 trace 还能用，
- *   只是 dbdog 缺采集/接口 —— 当训练样本要知道它带着已知缺口）。
- * · 没判要修（tag 缺席）→ 两档都不收：判了一半的样本进训练集，等于把「不知道」当成「没问题」。
+ * · 没判（没有 verdict）→ 不收：判了一半的样本进训练集，等于把「不知道」当成「没问题」。
+ * · 证据撑不住（`evidence=weak`）→ 不收：结论对也是蒙的，学它就是学蒙。证据没判也不收（同上一条理由）。
+ * · 有工具错（`finding_kinds` 含 `tool`）→ dbdog 返回过错值 / 空 / 报错，默认不收；
+ *   `--include-tool-errors` 时收成 `dbdog_gap`（trace 还能用，只是当训练样本要知道它带着已知缺口）。
+ * · 其余 → `model`：纯模型 + prompt 行为样本，不论对错都进（D4 owner 原话：不同反应都是样本）。
+ *   skill / model / scaffold / case / unsure 这几类改进点不影响收不收——它们说的是模型或题怎么样，不是数据假不假。
  */
-export function selectSample(span, { includeNeedsFix = false } = {}) {
+export function selectSample(span, { includeToolErrors = false } = {}) {
   const ev = evaluationOf(span);
-  if (ev.trustworthy !== true) return { keep: false, reason: "not_trustworthy", evaluation: ev };
-  if (ev.lucky_guess === true) return { keep: false, reason: "lucky_guess", evaluation: ev };
-  if (ev.needs_fix === false) return { keep: true, sample_kind: "model", reason: "", evaluation: ev };
-  if (ev.needs_fix === true) {
-    return includeNeedsFix
+  if (!ev.verdict) return { keep: false, reason: "unjudged", evaluation: ev };
+  if (ev.evidence !== "solid") return { keep: false, reason: ev.evidence === "weak" ? "weak_evidence" : "evidence_unjudged", evaluation: ev };
+  if (ev.kinds.includes("tool")) {
+    return includeToolErrors
       ? { keep: true, sample_kind: "dbdog_gap", reason: "", evaluation: ev }
-      : { keep: false, reason: "needs_fix", evaluation: ev };
+      : { keep: false, reason: "tool_error", evaluation: ev };
   }
-  return { keep: false, reason: "needs_fix_unjudged", evaluation: ev };
+  return { keep: true, sample_kind: "model", reason: "", evaluation: ev };
 }
 
 /** 总结 span 的 output（`kind=workflow` / `name=diagnosis-summary`）；没有这条 span 回 null。 */
@@ -84,7 +68,7 @@ export function summaryOutputOf(spans) {
  * 批注读口的 `annotated_interactions` → `{label: 原件}`。
  *
  * server 的行里 `value` 是 `json.RawMessage` ⇒ 到这里已经是**原生 JSON**
- * （布尔就是布尔、`attribution_tags` 就是数组），**不再解析一遍**，也不改形状——
+ * （数组就是数组、对象就是对象），**不再解析一遍**，也不改形状——
  * 训练语料要的是判题原件，不是我方再加工过的投影（投影已经在 span tag 上了）。
  * 同一条 trace 可能跨多个队列有 interaction：按取回顺序后写赢，与 D5「改判是覆盖」同向。
  */

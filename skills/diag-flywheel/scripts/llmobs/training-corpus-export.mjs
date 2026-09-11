@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 // training-corpus-export.mjs — 把判过的诊断 trace 导成训练语料（飞轮 P4「收口」，设计 §4 P4 行）。
 //
-// 为什么筛这一档（D4）：判题的第一层标签问的是「这条 trace 还能用来干什么」。
-//   可信 ✅ + 要修 ❌ = 纯模型 + prompt 的行为样本，**不论对错都是样本**（owner：不同反应没有 true bug）；
-//   可信 ✅ + 要修 ✅ = trace 还能用，但 dbdog 侧缺采集/接口 —— 要收就得知道它带着已知缺口（`--include-needs-fix`）；
-//   可信 ❌ = dbdog 撒过谎，整条作废，不进训练集；
-//   蒙对 ✅ = 对了没证据，学它就是学蒙，排除。
+// 为什么筛这一档（D4，2026-09-11 版）：「这条 trace 还能用来干什么」是从判题结果算出来的。
+//   判过 + 证据撑得住 + 没有工具错 = 纯模型 + prompt 的行为样本，**不论对错都是样本**（owner：不同反应没有 true bug）；
+//   有工具错 = dbdog 返回过错值 / 空 / 报错——要收就得知道它带着已知缺口（`--include-tool-errors`，打成 dbdog_gap）；
+//   证据撑不住 = 结论是蒙的，学它就是学蒙，排除；没判 / 证据没判 = 判了一半，排除。
 // 判据只认**服务端投影到 root span 上的 `evaluation.*` tag**（设计 §7.2）——分数是投影、批注是原件，
 // 筛选走投影（能下推到 CH 检索），原件随样本一起带走（`judge` 字段）。
 //
 // 用法：
 //   node scripts/llmobs/training-corpus-export.mjs --out <dir>
 //     [--dataset <用例集名> [--project default-project]]
-//     [--from <iso>] [--to <iso>] [--ml-app <x>] [--include-needs-fix] [--page-limit 1000]
+//     [--from <iso>] [--to <iso>] [--ml-app <x>] [--include-tool-errors] [--page-limit 1000]
 //
 //   --dataset：只导**这个用例集的题**跑出来的诊断（跑批跑出来的 + 题沉淀自的那次）。
 //   不带它就是全库时间窗——owner 2026-09-10：「如果是全库它的命令就不该在某个用例集里面」，
@@ -41,7 +40,7 @@ const OUT = argOf("--out", "");
 const ML_APP = argOf("--ml-app", "");
 const DATASET = argOf("--dataset", "");
 const PROJECT = argOf("--project", "default-project");
-const INCLUDE_NEEDS_FIX = has("--include-needs-fix");
+const INCLUDE_TOOL_ERRORS = has("--include-tool-errors");
 const PAGE_LIMIT = Math.min(Math.max(Number(argOf("--page-limit", "1000")) || 1000, 1), 5000); // server 上限 5000
 
 // 缺省窗 30 天：server 自己的兜底是近 24h（检索面的口径），对「攒一批语料」太窄——
@@ -60,26 +59,26 @@ if (!OUT) fail("--out 必填");
 requireCredential();
 if (Date.parse(FROM) >= Date.parse(TO)) fail(`--from（${FROM}）不早于 --to（${TO}）`);
 
-// ── 选样：服务端只筛「可信 ✅」，其余在客户端判 ────────────────────────────────
-// 为什么不把 lucky_guess / needs_fix 也塞进请求的 tags：`tags` 是**等值 AND**（server
-// `SearchSpans` 的 `tags[?] = ?`），只表达得了「等于」，表达不了「不等于 true」——
-// 而「没判蒙对」的 trace 根本没有那个 tag 键，等值筛会连它一起筛掉。所以拉回来自己判，
+// ── 选样：服务端只筛「证据撑得住」，其余在客户端判 ────────────────────────────
+// 为什么不把 finding_kinds 也塞进请求的 tags：`tags` 是**等值 AND**（server
+// `SearchSpans` 的 `tags[?] = ?`），只表达得了「等于」，表达不了「不含 tool」——
+// 而 finding_kinds 是逗号连接的一串，等值筛根本对不上。所以拉回来自己判，
 // 顺便把每条被排除的理由计进分布（manifest 里说得清「为什么只剩这么点」）。
 const query = {
   root_only: true,
   kind: "agent",
-  tags: { [EVAL_TAG_KEYS.trustworthy]: "true" },
+  tags: { [EVAL_TAG_KEYS.evidence]: "solid" },
   from: FROM,
   to: TO,
   ...(ML_APP ? { ml_app: ML_APP } : {}),
 };
 
-console.error(`窗 ${FROM} → ${TO}${ML_APP ? `　ml_app=${ML_APP}` : ""}　${INCLUDE_NEEDS_FIX ? "含" : "不含"}要修 dbdog 的样本`);
+console.error(`窗 ${FROM} → ${TO}${ML_APP ? `　ml_app=${ML_APP}` : ""}　${INCLUDE_TOOL_ERRORS ? "含" : "不含"}有工具错的样本`);
 const roots = await searchAllSpans(query, {
   limit: PAGE_LIMIT,
   onPage: (page, total) => console.error(`· 取回 ${page.length}（累计 ${total}）`),
 });
-console.error(`可信 ✅ 的 root span：${roots.length} 条`);
+console.error(`证据撑得住的 root span：${roots.length} 条`);
 
 // ── 按用例集筛：只留这个集合的题跑出来的 trace ─────────────────────────────
 // 在客户端筛而不是塞进 spans/search：trace↔题的线在 PG（records / events），spans 在 CH，
@@ -98,10 +97,10 @@ if (DATASET) {
   console.error(`用例集 ${DATASET}（${datasetScope.records.length} 条题、${datasetScope.traceIds.size} 次诊断）：${before} → ${roots.length} 条`);
 }
 
-const excluded = { not_trustworthy: 0, lucky_guess: 0, needs_fix: 0, needs_fix_unjudged: 0, no_trace: 0 };
+const excluded = { unjudged: 0, weak_evidence: 0, evidence_unjudged: 0, tool_error: 0, no_trace: 0 };
 const picked = [];
 for (const root of roots) {
-  const pick = selectSample(root, { includeNeedsFix: INCLUDE_NEEDS_FIX });
+  const pick = selectSample(root, { includeToolErrors: INCLUDE_TOOL_ERRORS });
   if (!pick.keep) {
     excluded[pick.reason] = (excluded[pick.reason] ?? 0) + 1;
     continue;
@@ -151,9 +150,9 @@ const manifest = {
   // 选样条件写全（含缺省值算出来的窗）：这批语料日后要能被原样复现出来。
   selection: {
     from: FROM, to: TO, ml_app: ML_APP || null,
-    include_needs_fix: INCLUDE_NEEDS_FIX,
+    include_tool_errors: INCLUDE_TOOL_ERRORS,
     server_query: query,
-    client_filter: "evaluation.lucky_guess ≠ true，且 evaluation.needs_fix 判过（D4）",
+    client_filter: "evaluation.verdict 判过，且 evaluation.finding_kinds 不含 tool（D4 2026-09-11 版）",
     page_limit: PAGE_LIMIT,
   },
   counts: {

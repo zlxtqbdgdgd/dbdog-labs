@@ -54,6 +54,7 @@ import {
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
+import { runArtifactsDir } from "./lib/run-artifacts.mjs";
 import { installGuardCopy, mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
@@ -437,11 +438,15 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 console.error(`run=${run.id} name=${run.name}（逻辑名 ${run.experiment ?? EXPERIMENT}；跑一次就是一条新 run，同名不复用旧行）${parent ? ` parent=${parent.id}` : ""}`);
 
 // 每次运行独立 obs 目录（状态文件 + spans.jsonl 干净隔离）；mcp.json 全程共用一份。
-const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "llmobs-exp-"));
-const obsDir = path.join(runDir, "obs");
+// 落点是 dbdog-labs 仓下的 `dbdog-obs/runs/<experiment>/`（2026-09-11 owner 定，见
+// lib/run-artifacts.mjs 文件头）——**可推算**，事后回看不用先去 /var/folders 里猜目录。
+// mcp.json 不一起搬：里面有 MCP bearer，凭证不进 git 工作树，仍留临时目录。
+const obsDir = runArtifactsDir(LABS_ROOT, EXPERIMENT, run.id);
 fs.mkdirSync(obsDir, { recursive: true });
-const mcpConfigPath = path.join(runDir, "mcp.json");
+const secretDir = fs.mkdtempSync(path.join(os.tmpdir(), "llmobs-exp-"));
+const mcpConfigPath = path.join(secretDir, "mcp.json");
 fs.writeFileSync(mcpConfigPath, JSON.stringify(buildMcpConfig(), null, 2));
+console.error(`obs=${obsDir}（本轮 span / 状态文件 / 假设图都落这里）`);
 ctx.obsDir = obsDir;
 ctx.mcpConfigPath = mcpConfigPath;
 
