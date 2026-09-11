@@ -15,7 +15,8 @@
 //   node scripts/llmobs/loop-pending.mjs --dataset daily-diag [--project default-project]
 //     [--kind run|judge|both] [--json]
 //
-//     --kind run    只列「没跑过诊断」的用例    → 喂给 loop ②
+//     --kind run    只列「复现过、但还没诊断」的用例 → 喂给 loop ②
+//                   （没复现过的另列一桶 waiting_repro：现场不存在，发题只会空转）
 //     --kind judge  只列「跑过但没判」的诊断    → 喂给 loop ③
 //     --kind both   两样都列（默认）
 //     --json        出机器可读的 JSON（loop 脚本用这个）
@@ -23,6 +24,7 @@
 // env：DBDOG_BASE_URL + DBDOG_API_KEY（或装 hooks 时配的 DBDOG_OBS_API_KEY）。
 import { CP, call, requireCredential } from "./lib/exp-client.mjs";
 import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
+import { windowClause } from "./lib/case-window.mjs";
 
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
 const has = (n) => process.argv.includes(n);
@@ -63,19 +65,30 @@ if (KIND !== "run") {
   }
 }
 
+// 「能跑」不等于「没跑过」：还要现场真的存在过。复现那一步会把实例与时间窗写进
+// `metadata.repro`（case-window.mjs 用的是同一格）。没有这一格，说明这道题从没在靶机上
+// 复现，遥测里压根没有对应时段的数据——发出去只会让模型查一段空数据，空转出来的 trace
+// 还会顺着差集流进判题队列。所以没复现的不进待跑集合，但也**不静默扣着**，单列一桶报出来。
 const needRun = [];
+const waitingRepro = [];
 const needJudge = [];
+const metaOf = (rec) => rec.attributes?.metadata ?? rec.metadata ?? {};
 for (const rec of records) {
   const runs = runsByRecord.get(rec.id) ?? [];
   const prompt = rec.input?.prompt ?? "";
   if (runs.length === 0) {
-    needRun.push({ recordId: rec.id, prompt });
+    const repro = metaOf(rec).repro;
+    // 半截窗口（只有起或只有止）不是「没复现」，是那条复现记录坏了——分开报，
+    // 否则它会混在几百条「等复现」里，没人会去修它。
+    const reason = !repro ? "no_repro" : (windowClause(repro) ? "" : "incomplete_window");
+    if (reason) waitingRepro.push({ recordId: rec.id, prompt, reason });
+    else needRun.push({ recordId: rec.id, prompt, repro });
     continue;
   }
   for (const r of runs) {
     if (r.traceId && !judged.has(r.traceId)) {
       // eventId 一并给出：判题包按 event id 挑子集（judge-package-export --cases），
-      //  一例一个包一个会话，材料量和失败影响面都只算这一例。
+      // 一例一个包一个会话，材料量和失败影响面都只算这一例。
       needJudge.push({ recordId: rec.id, prompt, traceId: r.traceId, experiment: r.experimentName, eventId: r.eventId });
     }
   }
@@ -85,7 +98,7 @@ if (JSON_OUT) {
   const out = {
     project: PROJECT, dataset: DATASET, dataset_version: dataset.current_version ?? null,
     total_records: records.length,
-    ...(KIND !== "judge" ? { need_run: needRun } : {}),
+    ...(KIND !== "judge" ? { need_run: needRun, waiting_repro: waitingRepro } : {}),
     ...(KIND !== "run" ? { need_judge: needJudge } : {}),
   };
   // 写完**不要** process.exit：往管道写是异步的，exit 不等它刷完，后半截直接丢
@@ -97,8 +110,16 @@ if (JSON_OUT) {
 const one = (s, n = 56) => String(s).replace(/\s+/g, " ").trim().slice(0, n);
 console.log(`用例集 ${DATASET}（${records.length} 条用例）`);
 if (KIND !== "judge") {
-  console.log(`\n没跑过诊断：${needRun.length} 条` + (needRun.length ? "" : "（都跑过了）"));
+  console.log(`\n复现过、还没诊断：${needRun.length} 条` + (needRun.length ? "" : "（没有）"));
   for (const r of needRun) console.log(`  ${r.recordId}  ${one(r.prompt)}`);
+  if (waitingRepro.length) {
+    const broken = waitingRepro.filter((r) => r.reason === "incomplete_window");
+    console.log(`\n等复现（现场还不存在，不发题）：${waitingRepro.length} 条`);
+    if (broken.length) {
+      console.log(`  其中 ${broken.length} 条是复现记录坏了（只有半截时间窗），要回头修那条记录：`);
+      for (const r of broken) console.log(`    ${r.recordId}  ${one(r.prompt)}`);
+    }
+  }
   if (needRun.length) {
     console.log(`\n  ↳ 跑它们（拉题走盲视图，agent 看不到答案）：`);
     console.log(`     GET ${CP}/${project.id}/datasets/${dataset.id}/records?filter[view]=blind`);

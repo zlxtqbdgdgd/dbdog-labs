@@ -23,7 +23,7 @@ const ORG = process.env.DBDOG_ORG || "default";
  * 鉴权头的**唯一产地**。两种凭证不并发：有 API key 就走用户面，
  * 免得内部 token 在场时静默盖掉用户面、让「用 API key 到底通不通」永远验不出来。
  */
-function authHeaders({ internalOnly = false } = {}) {
+export function authHeaders({ internalOnly = false } = {}) {
   // internalOnly：这条路由在 server 端硬验内部 bearer（探针直查口是唯一一个），
   // 用户面那把 key 打过去只会 401。**不能让优先级决定它**——装了 hooks 的人环境里
   // 永远有 DBDOG_OBS_API_KEY，API key 一优先，这类口就再也用不上了。

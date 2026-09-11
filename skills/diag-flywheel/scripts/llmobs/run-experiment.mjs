@@ -54,6 +54,7 @@ import {
 } from "./lib/exp-client.mjs";
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
+import { mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -76,6 +77,8 @@ const argOf = (name, dflt) => {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : dflt;
 };
 const has = (name) => process.argv.includes(name);
+/** 可重复参数（本地评测专用）。 */
+const argsOf = (name) => { const o=[]; for (let i=0;i<process.argv.length;i++) if (process.argv[i]===name && process.argv[i+1]) o.push(process.argv[i+1]); return o; };
 function fail(msg) {
   console.error(`✗ ${msg}`);
   process.exit(1);
@@ -110,6 +113,9 @@ const WORKDIR_TEMPLATE = argOf("--workdir-template", path.join(ROOT, "clients", 
 // 作弊体检那关会报 HEAD 不干净。
 const WORKDIR = argOf("--workdir", "");
 if (WORKDIR && !fs.existsSync(WORKDIR)) fail(`--workdir 不存在：${WORKDIR}`);
+// 盲测护栏（本地评测专用，不进产品仓）
+const DENY_ROOTS = argsOf("--deny-root");
+const GUARD_HOOK = argOf("--guard-hook", "");
 const DRY = has("--dry-run");
 
 requireCredential();
@@ -132,7 +138,7 @@ function loadHooksSettings() {
       }
     }
   }
-  return JSON.stringify({ hooks: parsed.hooks });
+  return JSON.stringify(mergeAgentSettings({ hooks: parsed.hooks, denyRoots: DENY_ROOTS, guardHookCommand: GUARD_HOOK }));
 }
 const hooksSettings = loadHooksSettings();
 
@@ -463,9 +469,33 @@ const okN = results.filter((r) => r.judged?.verdict === "ok").length;
 const partN = results.filter((r) => r.judged?.verdict === "part").length;
 const missN = results.filter((r) => r.judged?.verdict === "miss").length;
 const errN = results.filter((r) => r.error).length;
+// 判题自己出错的那一档（verdict 缺席）此前**不落进任何桶**：跑了一条、ok/part/miss 全 0、
+// 失败也 0，摘要行上「共 1」与四个 0 对不上，看的人只会以为自己看花了。
+// 2026-09-11 实测撞上（trace a7d8cae2：诊断跑了 928s/388 次调用，内联判题挂了）。
+// 诊断本身是成功的，所以它不算失败，但必须**数得出来**。
+const judgeErrN = results.filter((r) => !r.error && !r.noTrace && !r.judged?.verdict).length;
 const noTraceN = results.filter((r) => r.noTrace).length;
+// --result-json：把每条的结果写成机器可读的一份，供调用方按 record 对账。
+// 之所以要它：本脚本的产出此前**只在 stderr 上**，调用方要拿「这条跑出 trace 没有」只能去
+// 解析日志，或者事后再查一次库——前者脆，后者分不清「这一轮的 trace」与「上一轮的」。
+// loop-diagnose 靠它决定每条诊断行是推进到「待判题」还是放回「待诊断」。
+const RESULT_JSON = argOf("--result-json", "");
+if (RESULT_JSON) {
+  try {
+    fs.writeFileSync(RESULT_JSON, JSON.stringify(results.map((r) => ({
+      // 结果对象带的是整条 record，id 在它上面（runOne 的返回形状）。
+      recordId: r.record?.id ?? null,
+      traceId: r.traceId || "",
+      ok: !r.error && !r.noTrace,
+      error: r.error ?? "",
+    })), null, 2));
+  } catch (e) {
+    console.error(`⚠ 写 --result-json 失败（${RESULT_JSON}）：${e.message || e}`);
+  }
+}
+
 console.error("");
-console.error(`== 结果：ok=${okN} part=${partN} miss=${missN} 失败=${errN} 无trace=${noTraceN}（共 ${results.length}）`);
+console.error(`== 结果：ok=${okN} part=${partN} miss=${missN} 判题出错=${judgeErrN} 失败=${errN} 无trace=${noTraceN}（共 ${results.length}）`);
 for (const r of results.filter((x) => x.error)) console.error(`  ✗ [${r.label}] ${r.error}`);
 for (const r of results.filter((x) => x.noTrace)) console.error(`  ✗ [${r.label}] 无 trace（分数不可信）`);
 try {

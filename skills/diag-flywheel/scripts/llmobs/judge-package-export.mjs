@@ -179,7 +179,11 @@ for (const summary of events) {
   if (hasGroundTruth(expected)) {
     fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID }));
   } else {
-    missing.push("ground-truth（无参照题：expected_output 整个缺）");
+    // 没有答案纸 = **题坏了**，不是「另一种可判的题」。每道用例都必须有根因，
+    // 取自 issue 正文或它对应的已合入的 PR；两处都取不到的题不该进用例集。
+    // 这里必须响——被当成「无参照题」按一套自洽性口径悄悄判掉的话，它会在页面上
+    // 混成正常分数，再也没人回去补根因。
+    missing.push("ground-truth（**题坏了**：expected_output 里没有根因，本例 verdict 只能填 unknown）");
   }
 
   const prior = priorJudgments(
@@ -277,3 +281,12 @@ console.error(`  label：${manifest.label_schema.length} 条${manifest.label_sch
 if (noTrace) console.error(`  ⚠ ${noTrace} 例没有 trace——这几例只有答案纸，判不了行为`);
 const noProbe = cases.filter((c) => c.missing.some((m) => m.startsWith("probe"))).length;
 if (noProbe) console.error(`  ⚠ ${noProbe} 例没有探针结果，「工具错」只能靠 trace 内两两对照抓（D2：探针是抓工具错最硬的证据）`);
+// 没有答案纸的要单独、响亮地报：这不是材料少一件，是这道题本身该回炉。
+const noGT = cases.filter((c) => c.missing.some((m) => m.startsWith("ground-truth")));
+if (noGT.length) {
+  console.error("");
+  console.error(`  ⚠⚠ ${noGT.length} 例没有答案纸——这几道题坏了，不是「无参照题」：`);
+  for (const c of noGT) console.error(`       ${c.event_id}（record ${c.record_id || "?"}）`);
+  console.error("       判题时只能判工具对错：verdict 填 unknown，改进点必记一条 case 类「这道题没有答案纸」。");
+  console.error("       修法：回建用例那一步，从 issue 正文或它对应的已合入的 PR 取根因；两处都没有就删题。");
+}
