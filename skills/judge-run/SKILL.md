@@ -61,9 +61,22 @@ CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用�
 |---|---|---|
 | 被诊断的 agent（`diag-run` 起的） | DeepSeek flash | `~/.claude/settings.json` 的 `env` 块 |
 | **判官（本 skill 起的）** | **claude-max 的 opus** | **`CLAUDE_CONFIG_DIR=~/.claude-max`** |
+| 重建链（判卷前 `loop-judge.mjs` 自动起的 `chain-rebuild.mjs`） | **跟考生同一个**（DeepSeek flash） | 脚本自己把子进程切到 `~/.claude`，**不跟判官的配置目录走**；`--chain-config-dir` 可改 |
 
 考生用便宜快的、判官用强的：诊断要跑很多轮很长，成本在那儿；判卷判错了整条 loop 的产出
 都不可信。
+
+### 重建链是判卷前的一步，不是判卷的一部分（owner 2026-09-11 定）
+
+账本是平铺的、报告里的因果链是多环的（三条线上 trace 实测 `parent_edges=0`），判官拿账本判会被带歪。
+所以 `loop-judge.mjs` 导包之后、起判题会话之前，先对这一例跑一次 `chain-rebuild.mjs`：一次模型调用，
+把 forward.md 那棵平铺账本读成语义因果链，写 `chain.json` / `chain.md` 进包里。判官按 `diag-judge`
+里「重建链怎么用」那节用它——它是评测方的猜，和 forward.md 并排看，不改声明侧。
+
+- 模型**跟诊断同一个**，脚本自己切 `CLAUDE_CONFIG_DIR=~/.claude`，你在外面套的 `~/.claude-max` 只管判官。
+- 失败不拦判卷：stderr 一行 `✗ 重建链失败`，包里少两份文件，判官按 forward.md 判并在 summary 写「无重建链」。
+- 不想跑加 `--no-chain`。本地单独调一例：`node $S/llmobs/chain-rebuild.mjs --case <pkg>/cases/<event_id> --strict`。
+- 看输出：`✓ 重建链：声明深度 1 → 重建深度 2，判定冲突 1 处`——冲突数不为零的那几例，判官的改进点多半就在那里。
 
 ### 光传 `--judge-model opus` 不够，会 401
 
