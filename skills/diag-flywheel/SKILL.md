@@ -11,7 +11,7 @@ description: 诊断飞轮的客户端脚本——把一次诊断沉淀成用例�
 
 **这些脚本是 dbdog-mcp 仓 `scripts/llmobs/` 的镜像**(由母版的 `sync-flywheel-kit.mjs` 同步,
 一致性有守门测试钉着)。之所以镜像进来,是因为 mcp 的发布产物只有一个 `index.js`,
-`scripts/` 不在里面——而你手上有的是这个插件。
+`scripts/` 不在里面——而你手上有的是这个插件。判卷口径(`diag-judge` skill)**只住在本插件**,mcp 不再下发。
 
 ## 先备两样
 
@@ -68,8 +68,9 @@ node $S/llmobs/judge-package-export.mjs --experiment <run 名或 uuid> --out ./p
 每例的 `trace.json` / `forward.md`(正向假设树)/ `reverse.md` / `ground-truth.md` / `probe.json` /
 `prior-judgments.json`(这道题之前几轮提过的改进点与修复标记——判这一轮要逐条复验还没关的)。
 
-把 `./pkg` 交给一个强模型会话,让它按包里 `skill/SKILL.md` 判,产出 `annotations.jsonl` +
-`summary.md`,然后:
+判卷口径在本插件的 **`diag-judge`** skill（`skills/diag-judge/SKILL.md`,导包时会拷一份进 `./pkg/skill/`）。
+能连上 server 就直接在会话里说「判一下这条 trace <trace_id>」——在线判是默认,判官会去活系统主动查证;
+连不上才把 `./pkg` 交给离线会话按包里那份判。两种都产出 `annotations.jsonl` + `summary.md`,然后:
 
 ```bash
 node $S/llmobs/judge-package-import.mjs --package ./pkg --annotator <判题模型名>
@@ -90,8 +91,7 @@ node $S/llmobs/fix-mark.mjs --trace <挖出它的 trace_id> --key <改进点 key
 导入后 server 自动把批注投影成三处:批注原件、experiment 的分数、trace root 上的
 `evaluation.*` 标签。**判题方只交一次**。
 
-> 能连上 server 时其实不必走包——直接让 agent 用 MCP 工具现取现判即可,判据与产物形状完全一样;
-> 之前几轮的待修用 `node $S/llmobs/case-history.mjs --record <record_id> --before <trace_id>` 拿。
+> 之前几轮的改进点用 `node $S/llmobs/case-history.mjs --record <record_id> --before <trace_id>` 拿。
 > 包是给「判题模型在连不上 dbdog 的环境里」准备的。
 
 ### ④ 去控制台看
