@@ -86,8 +86,10 @@ const CONCURRENCY = Math.max(1, Number(argOf("--concurrency", "3")) || 3);
 // diagnosing，之后再去列 pending 就看不见同题的兄弟行了。快照拿不到就不筛——宁可这一轮
 // 多跑一条重复的，也不要因为看板接口抽风而整轮不跑。
 let latestPerRecord = null;
+let pendingCount = 0;
 try {
   const pending = await listDiagnoses({ statuses: [DIAG_PENDING], limit: 1000 });
+  pendingCount = pending.length;
   latestPerRecord = new Map();
   for (const d of pending) {
     const k = String(d.record_id);
@@ -102,34 +104,47 @@ try {
   console.error(`⚠ 列不出待诊断队列，本轮不做「同题只跑最新」的筛选：${e.message || e}`);
 }
 
-// 抢到旧复现要**立刻放回**并接着抢下一条，不能占着配额：否则 pending 里堆着几条旧复现时，
-// 每轮抢到的全是它们，本轮就没题可跑了，队列永远消不掉。尝试次数要有上限，不然队列里
-// 全是该跳过的行时会一直空转。
+// ⚠️ 抢到旧复现**不能当场放回**：server 的 claim 是 `ORDER BY created_at, id LIMIT 1`——
+// 永远先给最旧的那条。放回去下一次抢到的还是它，五十次尝试全花在同几条上，最新那次一次
+// 也轮不到（2026-09-11 实测：跳过 50 条、领到 0 条，整轮空转）。
+// 所以改成**攥着翻页**：抢到的旧复现先扣在手里（它们此刻是 diagnosing，不会被别人再抢到），
+// 一直翻到该题最新那次为止，本轮凑够数了再把扣着的一次性放回待诊断。
+//
+// 代价是每轮都要把比「最新那次」旧的行重抢一遍，队列越长越费。根治要 server 那边让 claim
+// 能按行 id 领（现在只能按 created_at 拿最旧的），或者给作废的旧复现一个归档终态——
+// 四态里没有这一档，先不预支，靠日志里「扣了几条」暴露它涨没涨。
 let claimed = [];
-let skippedOlder = 0;
+const parked = [];          // 攥在手里的旧复现，本轮末尾统一放回
 const seenRecords = new Set();
-const MAX_ATTEMPTS = Math.max(MAX_PER_ROUND * 10, 50);
+// 上限按队列长度给：最坏情况要把比 latest 旧的行全翻一遍才够数。
+const MAX_ATTEMPTS = (latestPerRecord ? pendingCount : 0) + MAX_PER_ROUND * 2 + 10;
 try {
   for (let attempt = 0; claimed.length < MAX_PER_ROUND && attempt < MAX_ATTEMPTS; attempt++) {
     const row = await claimDiagnosis({ claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC });
     if (!row) break; // 没得抢了
     const key = String(row.record_id);
     const latest = latestPerRecord?.get(key);
-    const isOlder = latest && String(latest.id) !== String(row.id);
-    if (isOlder || seenRecords.has(key)) {
-      skippedOlder++;
-      try {
-        await advanceDiagnosis({ id: row.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING });
-      } catch { /* 放不回去也只是等租约，不阻断本轮 */ }
-      continue;
+    const isLatest = !latest || String(latest.id) === String(row.id);
+    if (isLatest && !seenRecords.has(key)) {
+      seenRecords.add(key);
+      claimed.push(row);
+    } else {
+      parked.push(row);
     }
-    seenRecords.add(key);
-    claimed.push(row);
   }
 } catch (e) {
   fail(`抢诊断任务失败：${e.message || e}`);
 }
-if (skippedOlder) console.error(`· 跳过 ${skippedOlder} 条同题的旧复现（一轮只跑每道题最新那次），已放回待诊断`);
+// 放回扣着的：留在 diagnosing 的话页面上它一直显示「诊断中」，是在骗人。
+let released0 = 0;
+for (const row of parked) {
+  try {
+    if (await advanceDiagnosis({ id: row.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING })) released0++;
+  } catch { /* 放不回去也只是等租约，不阻断本轮 */ }
+}
+if (parked.length) {
+  console.error(`· 翻过 ${parked.length} 条同题的旧复现（一轮只跑每道题最新那次），已放回 ${released0} 条`);
+}
 if (ONLY.size) claimed = claimed.filter((d) => ONLY.has(String(d.record_id)));
 
 // 抢占是**全局**的：诊断表上没有用例集这一维（一行只挂 record_id）。今天线上只有一个用例集，
