@@ -365,16 +365,141 @@ export function parseAnnotationsJsonl(text) {
       problems.push(`第 ${i + 1} 行（${traceId}）缺 labels 对象`);
       return;
     }
-    problems.push(...validateLabels(labels).map((p) => `第 ${i + 1} 行（${traceId}）${p}`));
+    const labelProblems = validateLabels(labels);
+    problems.push(...labelProblems.map((p) => `第 ${i + 1} 行（${traceId}）${p}`));
+    // 形状不合契约的行照样交回去（import 据此整包拒写，不是悄悄丢一行）
+    const row = { trace_id: traceId, labels, line: i + 1, ...(labelProblems.length ? { invalid: labelProblems } : {}) };
     if (seen.has(traceId)) {
       problems.push(`第 ${i + 1} 行：trace_id ${traceId} 重复，按后写赢覆盖第 ${seen.get(traceId)} 行`);
-      rows[rows.findIndex((r) => r.trace_id === traceId)] = { trace_id: traceId, labels, line: i + 1 };
+      rows[rows.findIndex((r) => r.trace_id === traceId)] = row;
     } else {
       seen.set(traceId, i + 1);
-      rows.push({ trace_id: traceId, labels, line: i + 1 });
+      rows.push(row);
     }
   });
   return { rows, problems };
+}
+
+/* ── 待修条目与复验（飞轮设计 §13.3：「每次改哪里拆成一条一条」「修没修好看实际效果，不依赖人的反馈」） ── */
+
+/** 复验结果：修好了 / 又撞上了 / 这一轮没走到那条路（不算数）。 */
+export const FIX_CHECK_STATUSES = ["fixed", "still_open", "not_exercised"];
+
+/**
+ * 条目 key：小写 ascii，`<层>.<模块>.<缺什么>`。它是跨轮次认「同一个缺口」的唯一依据——
+ * 换个说法再提一遍就数不清修没修，所以要短、要稳、要能 grep。
+ */
+export const FIX_KEY_RE = /^[a-z0-9][a-z0-9._-]{2,79}$/;
+
+function pointerProblems(where, pointers, required) {
+  const out = [];
+  const list = Array.isArray(pointers) ? pointers : [];
+  if (required && list.length === 0) out.push(`${where}.pointers 为空（归因必须指到 span_id 或探针行）`);
+  for (const pt of list) {
+    if (!pt || typeof pt !== "object" || (!pt.span_id && !pt.probe)) {
+      out.push(`${where}.pointers 里的 ${JSON.stringify(pt)} 既不是 {span_id} 也不是 {probe}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * `attribution` 的形状：`{ items: [{key, fix_where, suggestion, pointers}], checks: [{key, status, pointers, note}] }`。
+ * - items：这一轮新发现的待修，一条一个落点；
+ * - checks：这道题之前几轮提过、还没关的，逐条复验（`fixed` / `still_open` 必须带证据指针）。
+ * 旧形状（整段 `fix_where` 塞在顶层）直接拒：一段里塞五处改动，数不出哪处修了。
+ */
+export function validateAttribution(a, needsFix) {
+  const problems = [];
+  if (!a || typeof a !== "object" || Array.isArray(a)) return ["attribution 必须是对象"];
+  if ("fix_where" in a && !("items" in a)) {
+    return ["attribution 是旧形状（顶层一段 fix_where）——改成 items[] 一条一个落点、checks[] 复验之前几轮提过的（skill「待修条目」一节）"];
+  }
+  const items = a.items ?? [];
+  const checks = a.checks ?? [];
+  if (!Array.isArray(items)) problems.push("attribution.items 必须是数组");
+  if (!Array.isArray(checks)) problems.push("attribution.checks 必须是数组");
+  const keys = new Set();
+  (Array.isArray(items) ? items : []).forEach((it, i) => {
+    const w = `attribution.items[${i}]`;
+    if (!it || typeof it !== "object") return problems.push(`${w} 必须是对象`);
+    if (!FIX_KEY_RE.test(String(it.key ?? ""))) problems.push(`${w}.key ${JSON.stringify(it.key)} 不合规（小写 ascii，<层>.<模块>.<缺什么>）`);
+    else if (keys.has(it.key)) problems.push(`${w}.key ${it.key} 重复——一个缺口只提一条`);
+    else keys.add(it.key);
+    if (!String(it.fix_where ?? "").trim()) problems.push(`${w}.fix_where 缺失（建议必须说改哪里，且只写一处）`);
+    problems.push(...pointerProblems(w, it.pointers, true));
+  });
+  let stillOpen = 0;
+  (Array.isArray(checks) ? checks : []).forEach((c, i) => {
+    const w = `attribution.checks[${i}]`;
+    if (!c || typeof c !== "object") return problems.push(`${w} 必须是对象`);
+    if (!FIX_KEY_RE.test(String(c.key ?? ""))) problems.push(`${w}.key ${JSON.stringify(c.key)} 不合规`);
+    if (!FIX_CHECK_STATUSES.includes(c.status)) problems.push(`${w}.status 只能是 ${FIX_CHECK_STATUSES.join(" / ")}`);
+    if (c.status === "still_open") stillOpen += 1;
+    problems.push(...pointerProblems(w, c.pointers, c.status === "fixed" || c.status === "still_open"));
+    if (keys.has(c.key)) problems.push(`${w}.key ${c.key} 同时出现在 items 里——又撞上的只写 still_open 复验，不要再提一条`);
+  });
+  // 与 needs_fix 自洽：判了要修却一条待修都没有（也没有又撞上的），或判了不用修却提了待修——必有一项判错了
+  const hasWork = keys.size > 0 || stillOpen > 0;
+  if (needsFix === true && !hasWork) problems.push("needs_fix=true 却没有一条待修（items 为空，也没有 still_open 的复验）");
+  if (needsFix === false && keys.size > 0) problems.push("needs_fix=false 却提了待修条目");
+  return problems;
+}
+
+/**
+ * 读侧把一条批注里的 `attribution` 摊成 `{items, checks}`。旧形状（顶层一段 fix_where，09-10 之前的判题）
+ * 当成**一条**，key 记成 `legacy.<trace 前 8 位>`——web 读侧同一条规则（dbdog-web 的 llmobs-fix-items），
+ * 判下一轮时就能拿这个 key 复验它。
+ */
+export function normalizeAttribution(value, traceId) {
+  let v = value;
+  if (typeof v === "string") {
+    try { v = JSON.parse(v); } catch { return { items: [], checks: [] }; }
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { items: [], checks: [] };
+  if (Array.isArray(v.items) || Array.isArray(v.checks)) {
+    return { items: Array.isArray(v.items) ? v.items : [], checks: Array.isArray(v.checks) ? v.checks : [] };
+  }
+  if (typeof v.fix_where === "string" && v.fix_where.trim()) {
+    return {
+      items: [{ key: `legacy.${String(traceId).slice(0, 8)}`, fix_where: v.fix_where, suggestion: v.suggestion ?? "", pointers: v.pointers ?? [] }],
+      checks: [],
+    };
+  }
+  return { items: [], checks: [] };
+}
+
+/**
+ * 一道题之前几轮的判题，交给判下一轮的判题方做复验的材料（`prior-judgments.json` / `case-history.mjs`）。
+ *
+ * **只给原料，不替判题方算「哪些还没关」**：规则就一句（最后一次有效复验不是 fixed、或 fixed 之后又被提出来，
+ * 都算没关），写在 skill 里；web 读侧另有一份算状态的实现给人看。这里多算一遍就是第三份副本。
+ *
+ * @param {{ experiment: {id:string,name:string,created_at:string}, traceId: string }[]} runs 这道题**之前**的运行
+ * @param {Map<string, any[]>} interactionsByTrace `findAllAnnotationsByContent` 的返回
+ */
+export function priorJudgments(runs, interactionsByTrace) {
+  return [...runs]
+    .sort((a, b) => String(a.experiment.created_at).localeCompare(String(b.experiment.created_at)))
+    .map(({ experiment, traceId }) => {
+      const labels = new Map();
+      for (const it of interactionsByTrace.get(traceId) ?? []) {
+        for (const an of it.annotations ?? []) if (an.label && !labels.has(an.label)) labels.set(an.label, an.value);
+      }
+      if (!labels.size) return { round: experiment.name, round_id: experiment.id, created_at: experiment.created_at, trace_id: traceId, judged: false };
+      const { items, checks } = normalizeAttribution(labels.get("attribution"), traceId);
+      return {
+        round: experiment.name,
+        round_id: experiment.id,
+        created_at: experiment.created_at,
+        trace_id: traceId,
+        judged: true,
+        verdict: labels.get("verdict") ?? null,
+        needs_fix: labels.get("needs_fix") ?? null,
+        items,
+        checks,
+      };
+    });
 }
 
 /** label 值的形状校验（只判形状，不判判得对不对）。 */
@@ -394,21 +519,7 @@ export function validateLabels(labels) {
       }
     }
   }
-  if (labels.attribution !== undefined) {
-    const a = labels.attribution;
-    if (!a || typeof a !== "object" || Array.isArray(a)) problems.push("attribution 必须是对象");
-    else {
-      // D4 两条硬规则：建议必须说改哪里，归因必须指到 span 或探针行。
-      if (!a.fix_where) problems.push("attribution.fix_where 缺失（D4：建议必须说改哪里）");
-      const pointers = Array.isArray(a.pointers) ? a.pointers : [];
-      if (pointers.length === 0) problems.push("attribution.pointers 为空（D4：归因必须指到 span_id 或探针行）");
-      for (const p of pointers) {
-        if (!p || typeof p !== "object" || (!p.span_id && !p.probe)) {
-          problems.push(`attribution.pointers 里的 ${JSON.stringify(p)} 既不是 {span_id} 也不是 {probe}`);
-        }
-      }
-    }
-  }
+  if (labels.attribution !== undefined) problems.push(...validateAttribution(labels.attribution, labels.needs_fix));
   if (labels.summary !== undefined && typeof labels.summary !== "string") problems.push("summary 必须是字符串");
   const unknown = Object.keys(labels).filter((k) => !LABEL_SCHEMA.some((l) => l.label === k));
   if (unknown.length) problems.push(`未知 label：${unknown.join(", ")}（词表见 §7.1）`);

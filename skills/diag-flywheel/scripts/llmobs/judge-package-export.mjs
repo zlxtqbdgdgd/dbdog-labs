@@ -20,6 +20,8 @@
 //                        /reverse.md|.json  反向证据链（record.metadata.reverse_chain；缺则不产）
 //                        /ground-truth.md   答案纸（expected_output；缺则不产 = 无参照题）
 //                        /probe.json    探针结果（由 probe.mjs 写；已有则原样保留）
+//                        /prior-judgments.json  这道题**之前几轮**的判题（待修 items 与复验 checks，旧的在前）；
+//                                       判这一轮时逐条复验还没关的（飞轮设计 §13.3）。空数组 = 之前没判过
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,13 +29,14 @@ import {
   baseUrl, findProject, loadDataset,
   listAnnotationQueues, upsertAnnotationQueue, listAnnotationLabels, replaceAnnotationLabels,
   addAnnotationInteractions, listAllExperimentEvents, getExperimentEvent, getTrace,
-  resolveExperimentRef,
+  resolveExperimentRef, findAllAnnotationsByContent,
   requireCredential,
 } from "./lib/exp-client.mjs";
 import {
   LABEL_SCHEMA, QUEUE_NAME, renderForward, renderReverse, renderGroundTruth,
-  hasGroundTruth, rootSpanOf, stampOf,
+  hasGroundTruth, rootSpanOf, stampOf, priorJudgments,
 } from "./lib/judge-package.mjs";
+import { runsOfRecords } from "./lib/dataset-traces.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const argOf = (name, dflt) => {
@@ -127,6 +130,15 @@ if (recordsReason) console.error(`⚠ 反向证据链本轮全缺：${recordsRea
 
 const { queueID, labels } = await ensureQueue(project.id);
 
+// 之前几轮：这一包里每道题在**本轮之前**跑过的运行，连同它们的批注一次取齐。
+// 修没修好由后续轮次复验说了算（飞轮设计 §13.3），判题方得先看到之前提过哪些条目。
+const packRecordIDs = [...new Set(events.map((e) => e.dataset_record_id).filter(Boolean))];
+const priorRunsByRecord = new Map();
+for (const [rid, list] of await runsOfRecords({ projectID: project.id, recordIDs: packRecordIDs })) {
+  priorRunsByRecord.set(rid, list.filter((r) => r.traceId && r.experimentId !== run.id && r.experimentCreatedAt < (run.created_at ?? "")));
+}
+const priorInteractions = await findAllAnnotationsByContent([...priorRunsByRecord.values()].flat().map((r) => r.traceId));
+
 fs.mkdirSync(path.join(OUT, "cases"), { recursive: true });
 fs.mkdirSync(path.join(OUT, "skill"), { recursive: true });
 
@@ -168,11 +180,20 @@ for (const summary of events) {
     fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID }));
   } else {
     // 没有答案纸 = **题坏了**，不是「另一种可判的题」。每道用例都必须有根因，
-    // 取自 issue 正文或它对应的已合入 PR；两处都取不到的题不该进用例集。
+    // 取自 issue 正文或它对应的已合入的 PR；两处都取不到的题不该进用例集。
     // 这里必须响——被当成「无参照题」按一套自洽性口径悄悄判掉的话，它会在页面上
     // 混成正常分数，再也没人回去补根因。
     missing.push("ground-truth（**题坏了**：expected_output 里没有根因，本例只能判工具对错）");
   }
+
+  const prior = priorJudgments(
+    (priorRunsByRecord.get(recordID) ?? []).map((r) => ({
+      experiment: { id: r.experimentId, name: r.experimentName, created_at: r.experimentCreatedAt },
+      traceId: r.traceId,
+    })),
+    priorInteractions,
+  );
+  fs.writeFileSync(path.join(caseDir, "prior-judgments.json"), JSON.stringify(prior, null, 1));
 
   // 探针结果由 probe.mjs 写进本目录；重跑 export 不覆盖已有的那份。
   const probePath = path.join(caseDir, "probe.json");
@@ -183,6 +204,7 @@ for (const summary of events) {
     trace_id: traceID,
     record_id: recordID,
     status: event?.status ?? summary.status ?? "",
+    prior_rounds: prior.length,
     stamp: stampOf(rootSpanOf(spans)),
     span_count: spans.length,
     missing,
@@ -230,11 +252,12 @@ fs.writeFileSync(path.join(OUT, "skill", "README.md"), `# 在蓝区离线判这�
 2. 把 \`SKILL.md\`（本目录）当 rubric，逐例读 \`../cases/<event_id>/\` 下的四件套：
    \`forward.md\`（agent 实际走的路）、\`reverse.md\`（本该走的路 + 真取到的证据）、
    \`ground-truth.md\`（答案纸；不存在 = 无参照题，\`verdict\` 不许判 \`correct\`）、
-   \`probe.json\`（探针两条腿；不存在 = 没跑，\`trustworthy\` 只能按「没抓到撒谎」判 true）。
+   \`probe.json\`（探针两条腿；不存在 = 没跑，\`trustworthy\` 只能按「没抓到撒谎」判 true）、
+   \`prior-judgments.json\`（这道题之前几轮提过的待修与复验；还没关的每一条都要在 \`attribution.checks\` 里复验）。
    \`trace.json\` 是 server 导出的原样 span，需要抠细节时看它。
 3. 产两个文件写到**包根**（不是本目录）：
    - \`annotations.jsonl\`：每例一行 \`{"trace_id":"…","labels":{…}}\`，形状见 SKILL.md；
-   - \`summary.md\`：本轮总账（判了几例、四项分布、\`needs_fix\` 按 \`fix_where\` 聚合的清单、最该先修的三条、判不动的地方）。
+   - \`summary.md\`：本轮总账（判了几例、四项分布、待修按 \`key\` 聚合的清单、本轮复验几条修好 / 仍在、最该先修的三条、判不动的地方）。
    改了反向链就把修订写到 \`reverse-chain-revisions/<record_id>.md\`（和 \`.json\`）。
 
 ## 回黄区之后
@@ -242,8 +265,10 @@ fs.writeFileSync(path.join(OUT, "skill", "README.md"), `# 在蓝区离线判这�
 把整包搬回黄区，跑：
 
 \`\`\`sh
-node scripts/llmobs/judge-package-import.mjs --package <包目录> [--annotator <判题模型名>]
+node scripts/llmobs/judge-package-import.mjs --package <包目录> --annotator <判题模型名>
 \`\`\`
+
+\`--annotator\` 必填（或导出时带 \`--judge-model\`）：两轮结论不一样时，得分得清是 agent 变了还是判题换了。
 
 它按 manifest 里的 label id 回写批注、把总账挂到 run metadata、把反向链修订挂回用例。
 **幂等**：重跑就是覆盖，改判不用先删。
@@ -255,7 +280,7 @@ console.error(`✓ 判题包：${path.resolve(OUT)}（${cases.length} 例，队�
 console.error(`  label：${manifest.label_schema.length} 条${manifest.label_schema.length < LABEL_SCHEMA.length ? "（不全，见上面的警告）" : ""}`);
 if (noTrace) console.error(`  ⚠ ${noTrace} 例没有 trace——这几例只有答案纸，判不了行为`);
 const noProbe = cases.filter((c) => c.missing.some((m) => m.startsWith("probe"))).length;
-if (noProbe) console.error(`  ⚠ ${noProbe} 例没有探针结果——取数判题要自己按同工具同窗重放，别直接按「没抓到撒谎」判 true`);
+if (noProbe) console.error(`  ⚠ ${noProbe} 例没有探针结果，「可信」只能按「没抓到撒谎」判（D2：探针是判可信的唯一硬证据）`);
 // 没有答案纸的要单独、响亮地报：这不是材料少一件，是这道题本身该回炉。
 const noGT = cases.filter((c) => c.missing.some((m) => m.startsWith("ground-truth")));
 if (noGT.length) {
