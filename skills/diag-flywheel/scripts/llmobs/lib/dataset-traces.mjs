@@ -21,11 +21,27 @@ export async function resolveDatasetTraces({ project: projectName, dataset: data
   const dataset = await findDataset(project.id, datasetName);
   if (!dataset?.id) throw new Error(`dataset 不存在：${datasetName}（project ${projectName}）`);
   const records = await listRecords(project.id, dataset.id);
-  const recordIds = new Set(records.map((r) => r.id));
-
-  const runsByRecord = new Map();
+  const runsByRecord = await runsOfRecords({ projectID: project.id, recordIDs: records.map((r) => r.id) });
   const traceIds = new Set();
-  for (const exp of await listCPExperiments({ projectID: project.id })) {
+  for (const list of runsByRecord.values()) for (const run of list) if (run.traceId) traceIds.add(run.traceId);
+  for (const r of records) {
+    const st = r.attributes?.metadata?.source_trace ?? r.metadata?.source_trace;
+    if (typeof st === "string" && st) traceIds.add(st);
+  }
+  return { project, dataset, records, runsByRecord, traceIds };
+}
+
+/**
+ * 一批题在各轮的运行：翻 project 下全部轮次的 events，按 dataset_record_id 归到题上。
+ * 带上轮次的建行时刻——**判题跟着轮次走**（飞轮设计 §13），「之前几轮」得按它排。
+ *
+ * @param {{ projectID: string, recordIDs: Iterable<string> }} q
+ * @returns {Promise<Map<string, {experimentId:string,experimentName:string,experimentCreatedAt:string,traceId:string,eventId:string}[]>>}
+ */
+export async function runsOfRecords({ projectID, recordIDs }) {
+  const wanted = new Set(recordIDs);
+  const runsByRecord = new Map();
+  for (const exp of await listCPExperiments({ projectID })) {
     let events = [];
     try {
       events = await listAllExperimentEvents(exp.id);
@@ -34,16 +50,11 @@ export async function resolveDatasetTraces({ project: projectName, dataset: data
     }
     for (const ev of events) {
       const rid = ev.dataset_record_id;
-      if (!rid || !recordIds.has(rid)) continue; // 别的集合的题、或已删的题
+      if (!rid || !wanted.has(rid)) continue; // 别的集合的题、或已删的题
       const list = runsByRecord.get(rid) ?? [];
-      list.push({ experimentId: exp.id, experimentName: exp.name, traceId: ev.trace_id ?? "", eventId: ev.id });
+      list.push({ experimentId: exp.id, experimentName: exp.name, experimentCreatedAt: exp.created_at ?? "", traceId: ev.trace_id ?? "", eventId: ev.id });
       runsByRecord.set(rid, list);
-      if (ev.trace_id) traceIds.add(ev.trace_id);
     }
   }
-  for (const r of records) {
-    const st = r.attributes?.metadata?.source_trace ?? r.metadata?.source_trace;
-    if (typeof st === "string" && st) traceIds.add(st);
-  }
-  return { project, dataset, records, runsByRecord, traceIds };
+  return runsByRecord;
 }

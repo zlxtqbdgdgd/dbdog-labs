@@ -45,6 +45,7 @@ const ENTRIES = [
   "scripts/llmobs/judge-package-import.mjs",
   "scripts/llmobs/training-corpus-export.mjs",
   "scripts/llmobs/loop-pending.mjs",
+  "scripts/llmobs/case-history.mjs",
 ];
 
 function closure() {

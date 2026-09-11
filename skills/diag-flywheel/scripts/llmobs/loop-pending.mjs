@@ -74,7 +74,9 @@ for (const rec of records) {
   }
   for (const r of runs) {
     if (r.traceId && !judged.has(r.traceId)) {
-      needJudge.push({ recordId: rec.id, prompt, traceId: r.traceId, experiment: r.experimentName });
+      // eventId 一并给出：判题包按 event id 挑子集（judge-package-export --cases），
+      //  一例一个包一个会话，材料量和失败影响面都只算这一例。
+      needJudge.push({ recordId: rec.id, prompt, traceId: r.traceId, experiment: r.experimentName, eventId: r.eventId });
     }
   }
 }

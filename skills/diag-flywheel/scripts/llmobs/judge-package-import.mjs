@@ -6,7 +6,8 @@
 //   reverse-chain-revisions/*    → dataset record 的 `metadata.reverse_chain`（反向链也在飞轮里进化，D3）
 //
 // 用法：
-//   node scripts/llmobs/judge-package-import.mjs --package <dir> [--annotator <判题模型名>] [--dry-run]
+//   node scripts/llmobs/judge-package-import.mjs --package <dir> --annotator <判题模型名> [--dry-run]
+//   （--annotator 必填，除非导出时带了 --judge-model、manifest 里已记）
 //
 // 幂等：重跑就是覆盖。annotation 的 `(interaction_id,label_id)` 唯一，改判不留历史（D5）——
 // 所以「重判」= 改 annotations.jsonl 再跑一次，不要追加第二行同 trace_id 的记录。
@@ -51,7 +52,9 @@ const expIsObj = expRef !== null && typeof expRef === "object";
 const EXPERIMENT_ID = expIsObj ? String(expRef.id ?? "") : "";
 const EXPERIMENT_NAME = expIsObj ? String(expRef.name ?? "") : String(expRef ?? "");
 const annotator = ANNOTATOR_ARG || manifest.judge_model || "";
-if (!annotator) console.error("⚠ 没有 --annotator，manifest 里也没记判题模型——annotator 留空，事后分不清是谁判的");
+// 判题模型必须记下来（飞轮设计 §13.2 #6）：此前只警告照写，线上 5 条判过的 trace 里 3 条批注是
+// annotator=default——同一道题两轮结论不一样时，分不清是 agent 变了还是判题换了。
+if (!annotator) fail("没有 --annotator，manifest 里也没记判题模型——判题模型不记下来，两轮结论不一样时分不清是谁变了");
 
 const gaps = [];   // 与 server 契约不符 / 写口缺失，最后一起报，不静默吞
 let wrote = 0;
@@ -64,6 +67,12 @@ if (!jsonl) {
   const { rows, problems } = parseAnnotationsJsonl(jsonl);
   for (const p of problems) console.error(`⚠ ${p}`);
   if (!rows.length) fail("annotations.jsonl 里没有一行可用记录");
+  // 形状不合契约就整包不写：写进去的旧形状（一段 fix_where 塞五处改动）数不出哪处修了，
+  // 而写了一半的包比一行没写更难收拾（飞轮设计 §13.3）。
+  const invalid = rows.filter((r) => r.invalid?.length);
+  if (invalid.length) {
+    fail(`判题产物有 ${invalid.length} 行不合契约（上面的 ⚠ 逐条列了）——改完重跑 import，这一次一行都没写`);
+  }
 
   const known = new Set((manifest.cases ?? []).map((c) => c.trace_id).filter(Boolean));
   const stray = rows.filter((r) => !known.has(r.trace_id));
