@@ -130,7 +130,7 @@ if (KIND !== "run") {
   console.log(`\n跑过但没判：${needJudge.length} 条` + (needJudge.length ? "" : "（都判过了）"));
   for (const r of needJudge) console.log(`  ${r.traceId}  ${one(r.prompt)}`);
   if (needJudge.length) {
-    console.log(`\n  ↳ 判它们：把每条 trace 交给 agent 按 dbdog/llm-obs-diag-judge 判，`);
+    console.log(`\n  ↳ 判它们：把每条 trace 交给 agent 按 dbdog/diag-judge（插件 dbdog-agent-obs） 判，`);
     console.log(`     判完用 judge-package-import.mjs 回流（或让 agent 直接写回）。`);
   }
 }
