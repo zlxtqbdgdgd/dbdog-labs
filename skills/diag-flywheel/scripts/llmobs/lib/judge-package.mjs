@@ -38,14 +38,15 @@ export const VERDICTS = ["correct", "partial", "wrong", "unknown"];
 export const EVIDENCE_VALUES = ["solid", "weak"];
 
 /**
- * 改进点六类（§7.1）：按「是谁的锅、怎么复现、谁来修」分，互斥。顺序就是 finding_kinds 的输出顺序。
- * tool 是确定性的（固定代码重放同一调用必现）；skill 是非确定性的（改完要多跑几轮）；model 不改代码；
- * scaffold 改编排；case 改用例；unsure 要人看。
+ * 改进点五类（§7.1）：分类的唯一标准是「下一步谁去干什么、怎么验」，互斥。顺序就是 finding_kinds 的输出顺序。
+ * tool 确定性（代码 / 配置，含 hooks 与跑批脚本；重放必现，改代码，复验一次即关）；skill 非确定性（给模型的话：
+ * skill 正文 / 工作目录模板 / 派单提示词；改一段话，连续两轮 fixed 才关）；model 不改代码只计次；case 改用例；unsure 要人看。
+ * 2026-09-11 晚撤掉 scaffold（编排错）：按话题分、不按下一步分，一条提出来分不清改代码还是改话；原归它的拆进 tool / skill。
  */
-export const FINDING_KINDS = ["tool", "skill", "model", "scaffold", "case", "unsure"];
+export const FINDING_KINDS = ["tool", "skill", "model", "case", "unsure"];
 
-/** 这几类是 dbdog 侧能动手修的（web「有 dbdog 要修的」筛的就是它们）。 */
-export const FIXABLE_KINDS = ["tool", "skill", "scaffold", "case"];
+/** 这几类是能动手修的（web「有 dbdog 要修的」筛的是 tool / skill；case 改用例）。 */
+export const FIXABLE_KINDS = ["tool", "skill", "case"];
 
 /** 修复标记三值（§13.3）：改了等复验 / 要人协助 / 不修。 */
 export const FIX_MARK_STATUSES = ["claimed_fixed", "needs_human", "wont_fix"];
@@ -449,6 +450,11 @@ export function validateFindings(a) {
       if (!nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（${it.kind} 类必须说怎么改）`);
     }
     if (it.kind === "unsure" && !nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（unsure 要写清要人核什么、看哪里）`);
+    // skill 类的下一步是「改一段话」：不写出原句，改的人还得自己再想一遍——那就不算能走下去的条目
+    if (it.kind === "skill" && nonEmpty(it.suggestion) && !/[「“"]/.test(it.suggestion)) {
+      problems.push(`${w}.suggestion 没写出要加或要改的原句（skill 类要用「」把那句话引出来）`);
+    }
+    if (it.kind === "scaffold") problems.push(`${w}.kind scaffold 已撤（2026-09-11）：hooks / 跑批脚本的代码错归 tool，模板 / 提示词的话归 skill`);
     problems.push(...pointerProblems(w, it.pointers, true));
   });
   (Array.isArray(checks) ? checks : []).forEach((c, i) => {
