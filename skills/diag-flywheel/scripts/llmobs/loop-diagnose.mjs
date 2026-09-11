@@ -20,15 +20,23 @@
 // 没复现过的题根本不会出现在这张表里——现场不存在，发题只会让模型查一段空数据。
 //
 //   node scripts/llmobs/loop-diagnose.mjs --dataset <用例集> [--project default-project]
-//     [--limit N] [--only <record id,...>] [--model M] [--timeout-sec 900]
+//     [--limit N] [--only <record id,...>] [--model M] [--timeout-sec 900] [--concurrency 3]
 //     [--experiment <本轮名字>] [--dry-run]
 //     # 盲测评测那条路再加四个（真实用户用不上，见 run-experiment.mjs 用法段）：
 //     [--workdir <被诊断系统源码树>] [--deny-root <禁读根>]... [--guard-hook <命令行>]
 //
 // env 同 run-experiment（DBDOG_BASE_URL + DBDOG_API_KEY）。
 //
-// 串行是硬要求，不是保守：本机多个 claude 进程并发会抢登录态，且判题也是 claude 进程
-// （`run-experiment.mjs` 的 --concurrency 注释记着实测）。这里固定传 --concurrency 1。
+// 并发默认 3（owner 2026-09-11 定）。原来固定传 1，理由是「本机多个 claude 进程会抢登录态」
+// ——那条实测记在 `run-experiment.mjs` 的 --concurrency 注释里。放到 3 是在这个风险与一轮的
+// 墙钟之间取的折中：一条诊断动辄二三十分钟，五条串起来就是两小时，队列根本消不掉。
+// 那次实测撞的是本机共享的 OAuth 登录态；考生现在走 DeepSeek 的 API token
+// （`ANTHROPIC_AUTH_TOKEN`，见 use_candidate_env），没有这份共享状态可抢。真撞上了
+// （表现是某条一开跑就报鉴权失败、exit=1 且 stderr 是空的），传 --concurrency 1 退回串行。
+//
+// 同一道题（record）在诊断表里可能有多次复现，各自一行。**一轮只跑最新那次**（owner 同日定）：
+// 同题在一轮里诊断两遍，除了烧两份 agent 预算，还会在判题队列里留下两条几乎一样的轨迹；
+// 而旧那次复现的现场早被新那次盖过去了，遥测窗口指向的东西已经不是它。
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -40,7 +48,7 @@ import {
   DIAG_PENDING,
   DIAG_PENDING_JUDGEMENT,
   advanceDiagnosis,
-  claimBatch,
+  claimDiagnosis,
   operator,
   listDiagnoses,
 } from "./lib/case-diag-client.mjs";
@@ -71,13 +79,57 @@ const CLAIMED_BY = argOf("--claimed-by", `loop-diagnose@${os.hostname()}`);
 const TIMEOUT_SEC = Number(argOf("--timeout-sec", "900")) || 900;
 const STALE_AFTER_SEC = Number(argOf("--stale-after-sec", String(TIMEOUT_SEC * 2)));
 const MAX_PER_ROUND = LIMIT > 0 ? LIMIT : Number(argOf("--max-per-round", "5"));
+// 并发默认 3（见文件头）。给 0 或负数没有意义，兜回 1。
+const CONCURRENCY = Math.max(1, Number(argOf("--concurrency", "3")) || 3);
 
-let claimed = [];
+// 「同题只跑最新那次复现」要在**抢之前**先有一张快照才判得出来：抢的动作会把行改成
+// diagnosing，之后再去列 pending 就看不见同题的兄弟行了。快照拿不到就不筛——宁可这一轮
+// 多跑一条重复的，也不要因为看板接口抽风而整轮不跑。
+let latestPerRecord = null;
 try {
-  claimed = await claimBatch({ claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC, max: MAX_PER_ROUND });
+  const pending = await listDiagnoses({ statuses: [DIAG_PENDING], limit: 1000 });
+  latestPerRecord = new Map();
+  for (const d of pending) {
+    const k = String(d.record_id);
+    const cur = latestPerRecord.get(k);
+    // 「最新」按复现窗口的结束时间排，同刻再用行 id 兜底（要的是一个稳定的选法，不是并列）。
+    if (!cur || String(d.window_end) > String(cur.window_end) ||
+        (String(d.window_end) === String(cur.window_end) && String(d.id) > String(cur.id))) {
+      latestPerRecord.set(k, d);
+    }
+  }
+} catch (e) {
+  console.error(`⚠ 列不出待诊断队列，本轮不做「同题只跑最新」的筛选：${e.message || e}`);
+}
+
+// 抢到旧复现要**立刻放回**并接着抢下一条，不能占着配额：否则 pending 里堆着几条旧复现时，
+// 每轮抢到的全是它们，本轮就没题可跑了，队列永远消不掉。尝试次数要有上限，不然队列里
+// 全是该跳过的行时会一直空转。
+let claimed = [];
+let skippedOlder = 0;
+const seenRecords = new Set();
+const MAX_ATTEMPTS = Math.max(MAX_PER_ROUND * 10, 50);
+try {
+  for (let attempt = 0; claimed.length < MAX_PER_ROUND && attempt < MAX_ATTEMPTS; attempt++) {
+    const row = await claimDiagnosis({ claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC });
+    if (!row) break; // 没得抢了
+    const key = String(row.record_id);
+    const latest = latestPerRecord?.get(key);
+    const isOlder = latest && String(latest.id) !== String(row.id);
+    if (isOlder || seenRecords.has(key)) {
+      skippedOlder++;
+      try {
+        await advanceDiagnosis({ id: row.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING });
+      } catch { /* 放不回去也只是等租约，不阻断本轮 */ }
+      continue;
+    }
+    seenRecords.add(key);
+    claimed.push(row);
+  }
 } catch (e) {
   fail(`抢诊断任务失败：${e.message || e}`);
 }
+if (skippedOlder) console.error(`· 跳过 ${skippedOlder} 条同题的旧复现（一轮只跑每道题最新那次），已放回待诊断`);
 if (ONLY.size) claimed = claimed.filter((d) => ONLY.has(String(d.record_id)));
 
 // 抢占是**全局**的：诊断表上没有用例集这一维（一行只挂 record_id）。今天线上只有一个用例集，
@@ -119,8 +171,11 @@ if (claimed.length === 0) {
   process.exit(0);
 }
 
-// record → 它这次的诊断行。跑完按它推进状态。
-const diagByRecord = new Map(claimed.map((d) => [String(d.record_id), d]));
+// 按**行**记，不按 record 记。原来这里是 `new Map(claimed.map(d => [record_id, d]))`，
+// 同一道题抢到两行时后一行会把前一行挤掉——被挤掉的那行既不推进也不放回，只能干等租约
+// 回收，而页面上它一直显示「诊断中」。现在同题只会抢到一行，这个索引照样按行建：
+// 不靠「上游保证唯一」来维持下游的正确性。
+const claimedRows = claimed.slice();
 const picked = claimed.map((d) => ({ recordId: String(d.record_id), prompt: d.case_source }));
 console.error(`本轮领到 ${picked.length} 条：`);
 for (const d of claimed) {
@@ -144,10 +199,10 @@ const args = [
   "--project", PROJECT, "--dataset", DATASET,
   "--experiment", EXPERIMENT,
   "--scenarios", picked.map((r) => r.recordId).join(","),
-  "--concurrency", "1",
+  "--concurrency", String(CONCURRENCY),
   ...passthrough,
 ];
-console.error(`\n▶ 本轮 experiment：${EXPERIMENT}（串行 ${picked.length} 条）\n`);
+console.error(`\n▶ 本轮 experiment：${EXPERIMENT}（${picked.length} 条 · 并发 ${CONCURRENCY}）\n`);
 const resultFile = path.join(os.tmpdir(), `diag-loop-result-${process.pid}.json`);
 args.push("--result-json", resultFile);
 const ran = await spawnScript(HERE, "run-experiment.mjs", args);
@@ -168,8 +223,8 @@ fs.rmSync(resultFile, { force: true });
 
 const traceOf = new Map(results.map((r) => [String(r.recordId), r.traceId || ""]));
 let advanced = 0, released = 0;
-for (const [recordId, diag] of diagByRecord) {
-  const traceId = traceOf.get(recordId) || "";
+for (const diag of claimedRows) {
+  const traceId = traceOf.get(String(diag.record_id)) || "";
   const to = traceId ? DIAG_PENDING_JUDGEMENT : DIAG_PENDING;
   try {
     const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId });
