@@ -55,7 +55,8 @@ import {
 import { judgeOne, judgeMetrics } from "./lib/judge.mjs";
 import { promptWithWindow } from "./lib/case-window.mjs";
 import { runArtifactsDir } from "./lib/run-artifacts.mjs";
-import { installGuardCopy, mergeAgentSettings } from "./lib/blind-guard.mjs";   // 本地评测专用，不进产品仓
+import { installGuardCopy, mergeAgentSettings } from "./lib/blind-guard.mjs";
+import { resolveAgentIdentity } from "./lib/agent-identity.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -98,6 +99,8 @@ const SCENARIOS = argOf("--scenarios", "").split(",").map((s) => s.trim()).filte
 const LIMIT = Number(argOf("--limit", "0"));
 const PROMPT_SOURCE = argOf("--prompt-source", "auto");
 const MODEL = argOf("--model", "");
+// 被测模型的真身（见 lib/agent-identity.mjs）：显式 --model > ANTHROPIC_MODEL > 拿不到记 unknown。
+const SUT = resolveAgentIdentity({ model: MODEL });
 const JUDGE_MODEL = argOf("--judge-model", "");
 // 并发默认 1：本机多个 claude 进程并发会抢登录态（2026-07-12 实测 exit=1 空 stderr），
 // 且 judge 也是 claude 进程。要提并发先在你机器上验证 --concurrency 2 稳定。
@@ -397,6 +400,12 @@ if (PARENT) {
 
 const ctx = await resolvePrompts(records);
 console.error(`experiment=${EXPERIMENT} dataset=${dataset.name}(${all.length} 条,选 ${records.length}) prompts=${ctx.source} server=${baseUrl()}`);
+// 被测模型印在开跑那一行：事后翻 metadata 才知道跑的是谁，等于当时没人看得见。
+// source=cli-default 时额外警告——那一档本进程看不见真值，评测记录里会是 unknown。
+console.error(`被测模型=${SUT.model}（来源 ${SUT.source}，端点 ${SUT.endpoint}）`);
+if (SUT.source === "cli-default") {
+  console.error("⚠ 没有 --model 也没有 ANTHROPIC_MODEL：跑的是 CLI 默认，本轮记录里被测模型会是 unknown");
+}
 if (DRY) {
   for (const r of records) console.error(`  - ${r.metadata?.num} ${r.metadata?.slug} prompt=${ctx.promptOf(r) ? "有" : "无"}`);
   process.exit(0);
@@ -413,7 +422,14 @@ const run = await createExperimentRun({
   metadata: {
     ...(NOTES ? { notes: NOTES } : {}),
     agent: "claude-cli",
-    model: MODEL || "default",
+    // **被测模型要记真的**：不传 --model 时子进程走 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL
+    // 两个环境变量（本机实测落到 DeepSeek），而这里此前记的是字面量 "default" ——那是假的，
+    // 换台机器或改那两行，被测模型悄悄换了而跑批照跑、分数照记，事后一点痕迹都没有。
+    model: SUT.model,
+    // source: flag（显式指定）/ env（环境变量）/ cli-default（两样都没有，本进程看不见真值）。
+    // 记下来是为了事后能分辨「这一轮为什么是这个模型」。
+    model_source: SUT.source,
+    model_endpoint: SUT.endpoint,
     prompt_source: ctx.source,
     dataset: DATASET,
     workdir_guidance: WORKDIR_TEMPLATE === "none" ? "off" : "on",

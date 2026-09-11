@@ -45,13 +45,44 @@ description: 判一轮诊断——捞出「跑过但没判过」的诊断，一�
 
 ```bash
 S=<diag-flywheel/scripts 目录>
-node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
+CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
 ```
+
+`CLAUDE_CONFIG_DIR` **不能省**，省了会 401，理由见下一节。
 
 一例一个会话，不是一轮一个。早前按轮导过，三例材料叠起来 11 MB 塞进一个会话，
 40 分钟没判完，而且一例失败整轮都不回流。
 
 用户说「判 N 条」就把 N 传给 `--limit`。
+
+## 判官用 opus，**而且必须切配置目录**（owner 2026-09-11 定）
+
+| 角色 | 模型 | 怎么来 |
+|---|---|---|
+| 被诊断的 agent（`diag-run` 起的） | DeepSeek flash | `~/.claude/settings.json` 的 `env` 块 |
+| **判官（本 skill 起的）** | **claude-max 的 opus** | **`CLAUDE_CONFIG_DIR=~/.claude-max`** |
+
+考生用便宜快的、判官用强的：诊断要跑很多轮很长，成本在那儿；判卷判错了整条 loop 的产出
+都不可信。
+
+### 光传 `--judge-model opus` 不够，会 401
+
+`~/.claude` 那份配置的 `env.ANTHROPIC_BASE_URL` 指着 DeepSeek 网关、key 也是 DeepSeek 的。
+模型名传 opus 只会拿**DeepSeek 的 key 去那个端点要 opus**，2026-09-11 实测报：
+
+```
+Failed to authenticate. API Error: 401 Authentication Fails, Your api key: ****hgAA is invalid
+```
+
+claude-max 是**另一份配置目录**（`~/.claude-max`，走订阅登录态，没有 env 覆盖）。
+切过去实测秒回。所以起判题会话时：
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-max node $S/llmobs/loop-judge.mjs --dataset <用例集名> ...
+```
+
+跑之前确认 `~/.claude-max` 在、登录态没过期。**别用 flash 判**——判出来的结论不可信，
+而且这个错是静默的：判题照跑、分数照记。
 
 ## 看输出
 
