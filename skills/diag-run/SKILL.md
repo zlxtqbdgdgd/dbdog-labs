@@ -37,11 +37,22 @@ N 缺省是 5。用户说「dbdog test loop 3」就是 `--max-per-round 3`。
 | 变量 | 是什么 |
 |---|---|
 | `DBDOG_BASE_URL` | dbdog server 地址 |
+| `DBDOG_OPERATOR` | **跑这一轮的人是谁**（如 `qinqiang`）。没有就问用户要，别自己编——见下 |
 | `DBDOG_API_KEY` | 控制台 `/settings/api-keys` 签发；已配 `DBDOG_OBS_API_KEY` 就复用那个值 |
 | `DBDOG_MCP_URL` | 诊断会话连的 MCP 地址，带 toolsets/skillsets 查询串 |
 | `DBDOG_MCP_BEARER` | 连 MCP 的 bearer。**用 bearer 不走 OAuth，所以远端 http 地址可以直连**，不用回环反代 |
 | `DIAG_WORKDIR` | **被诊断的那棵源码树**，会话的 cwd，要对得上被复现的那个版本 |
 | `DENY_ROOT`（可多个） | **禁读根**，见下 |
+
+### `DBDOG_OPERATOR` 是谁在跑，问用户要
+
+它落进诊断表的 `status_changed_by`，控制台用例表「状态」列底下那行显的就是这个串。
+**缺了 loop 会当场拒跑**，而且是在抢任何一条待办**之前**就拒——抢到手的行会被占住租约，
+跑到推状态那一步才发现缺变量，那批行得等租约超时才捞得回来。
+
+别拿别的东西顶：`--claimed-by` 那个 `loop-diagnose@主机名` 记的是**哪条 loop 占着租约**
+（卡住时去哪台机器看），`$USER` 在共用机器上人人都是 `dbdog`。这一列是拿去问
+「这步谁推的」的，一个看着像答案的假答案比报错更坏。
 
 ### 禁读根是什么，为什么不能省
 

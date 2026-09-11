@@ -41,6 +41,7 @@ import {
   DIAG_PENDING_JUDGEMENT,
   advanceDiagnosis,
   claimBatch,
+  operator,
   listDiagnoses,
 } from "./lib/case-diag-client.mjs";
 
@@ -58,6 +59,9 @@ const LIMIT = Number(argOf("--limit", "0"));
 const ONLY = new Set(argOf("--only", "").split(",").map((s) => s.trim()).filter(Boolean));
 const DRY = has("--dry-run");
 if (!DATASET) fail("--dataset 必填");
+// 报上跑的人是谁（DBDOG_OPERATOR）。**在抢任何东西之前就查**：抢到手的行会被改成 diagnosing
+// 占住租约，等跑到推状态那一步才发现缺这个变量，那批行就得等租约超时才被捞回来。
+try { operator(); } catch (e) { fail(e.message); }
 
 // ---- ① 领：抢一批待诊断的复现 ----
 // 抢到手即改成 diagnosing 并占住租约，于是下一轮（以及任何并发的一轮）都看不见它们了。
@@ -92,7 +96,7 @@ if (claimed.length) {
       foreign++;
       // 放回去，别攥着别的集合的活。放不回去也只是等租约，不阻断本轮。
       try {
-        await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING, by: CLAIMED_BY });
+        await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING });
       } catch { /* 等租约回收 */ }
     }
     claimed = keep;
@@ -168,7 +172,7 @@ for (const [recordId, diag] of diagByRecord) {
   const traceId = traceOf.get(recordId) || "";
   const to = traceId ? DIAG_PENDING_JUDGEMENT : DIAG_PENDING;
   try {
-    const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId, by: CLAIMED_BY });
+    const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId });
     if (!row) {
       // 409：这条已经不在 diagnosing 了（租约被回收后别人重跑过）。本轮放弃它，不是错。
       console.error(`· ${diag.case_source} 的租约已易主，本轮不改它的状态`);

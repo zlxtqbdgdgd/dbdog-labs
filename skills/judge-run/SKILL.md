@@ -52,10 +52,15 @@ description: 判一轮诊断——捞出「跑过但没判过」的诊断，一�
 
 ```bash
 S=<diag-flywheel/scripts 目录>
-CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
+DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
 ```
 
 `CLAUDE_CONFIG_DIR` **不能省**，省了会 401，理由见下一节。
+
+`DBDOG_OPERATOR` 也**不能省**（如 `qinqiang`）：它落进诊断表的 `status_changed_by`，
+控制台「状态」列底下那行显的就是它。没有就问用户要，别自己编——loop 在导包起会话**之前**
+就查这一条，因为判一例要几十分钟，跑完才发现缺变量的话，批注回流了而状态推不动，
+页面上那行会一直停在「判题中」。
 
 一例一个会话，不是一轮一个。早前按轮导过，三例材料叠起来 11 MB 塞进一个会话，
 40 分钟没判完，而且一例失败整轮都不回流。

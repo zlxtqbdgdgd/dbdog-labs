@@ -21,6 +21,29 @@
 // 自己再拼一份就是第二个真相源，key 的取法一改就会漏掉这里（军规 3）。
 import { baseUrl, authHeaders } from "./exp-client.mjs";
 
+/**
+ * 跑这条 loop 的**人**是谁（owner 2026-09-11：「这个环境变量在跑 loop 的时候要求用户给出，
+ * 自己的身份是谁，比如我的就是 qinqiang」）。落进诊断表的 status_changed_by，
+ * 页面「状态」列底下那行显的就是它。
+ *
+ * **缺了就拒跑，不给默认值**。能想到的三种默认值都答错了问题：
+ *   · loop 实例名 / 机器名 → 那是 claimed_by 已经在记的东西（哪条 loop 占着租约）；
+ *   · $USER → 机器上的账户名，跑在共用机器上时人人都是 dbdog；
+ *   · 空串 → 页面上显成「—」，与 0026 之前的老行混在一起分不出来。
+ * 状态是会被人拿去问「这步谁推的」的东西，宁可当场报错，也不要一个看着像答案的假答案。
+ */
+export function operator() {
+  const v = (process.env.DBDOG_OPERATOR || "").trim();
+  if (!v) {
+    throw new Error(
+      "缺 DBDOG_OPERATOR：跑 loop 要报上自己是谁（如 DBDOG_OPERATOR=qinqiang）。\n" +
+      "  它落进诊断表的 status_changed_by，控制台用例表「状态」列显的就是这个串——\n" +
+      "  没有它，页面上那一步是谁推的就再也查不出来了。",
+    );
+  }
+  return v;
+}
+
 /** 五态，与 server 的 domain 常量同一份口径（值是线缆原文）。 */
 export const DIAG_PENDING = "pending_diagnosis";
 export const DIAG_DIAGNOSING = "diagnosing";
@@ -56,7 +79,8 @@ async function call(url, init) {
  * **诊断超时 × 2** 取，留一倍余量给收尾与上报。
  */
 export async function claimDiagnosis({ claimedBy, staleAfterSec, from, to }) {
-  const body = { claimed_by: claimedBy };
+  // claimed_by 记**哪条 loop** 占着租约（卡住时去哪台机器看），by 记**谁在跑**（出了事问谁）。
+  const body = { claimed_by: claimedBy, by: operator() };
   if (staleAfterSec > 0) body.stale_after_sec = staleAfterSec;
   // from/to 留空 = 诊断那一档（pending_diagnosis → diagnosing）。判题那条 loop 传
   // pending_judgement → judging 走同一条抢占；租约回收捞的也是 to 态，两边对称。
@@ -74,11 +98,11 @@ export async function claimDiagnosis({ claimedBy, staleAfterSec, from, to }) {
  * ——一次没跑完的诊断就这样被当成跑完了。所以**吞掉 409 不算错**，它正是断言在生效：
  * 本轮放弃这一条就好，下轮重抢。
  *
- * `by` 是经手人，**server 侧必填**（蓝图 0026）：落进 status_changed_by，页面上「这一步被谁
- * 推的」显的就是它。传 loop 实例名（与 claimed_by 同一个串），不传会被 400 挡回来。
+ * 经手人（status_changed_by）由 DBDOG_OPERATOR 给出，不用调用方传——它是**人**，
+ * 整条 loop 从头到尾同一个值，让每个调用点各传一次只会漏掉某一处。server 侧必填。
  */
-export async function advanceDiagnosis({ id, from, to, traceId, by }) {
-  const body = { from, to, by };
+export async function advanceDiagnosis({ id, from, to, traceId }) {
+  const body = { from, to, by: operator() };
   if (traceId) body.trace_id = traceId;
   try {
     const out = await call(path(`/${encodeURIComponent(id)}/advance`), { method: "POST", body: JSON.stringify(body) });

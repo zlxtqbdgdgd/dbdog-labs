@@ -31,7 +31,7 @@ import { spawnScript } from "./lib/spawn-script.mjs";
 import { runAgentCli } from "../e2e/lib/agent-cli.mjs";
 import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { judgeSessionArgs, judgeMcpUrl } from "./lib/judge-session.mjs";
-import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, listDiagnoses } from "./lib/case-diag-client.mjs";
+import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, listDiagnoses, operator } from "./lib/case-diag-client.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -44,11 +44,11 @@ const LIMIT = Number(argOf("--limit", "0"));
 const MODEL = argOf("--model", "");
 const TIMEOUT_MS = Number(argOf("--timeout-sec", "1800")) * 1000;
 const KEEP = has("--keep-package");
-// 推诊断表状态时报上的经手人（落进 status_changed_by，页面上「被谁改的」显的就是它）。
-// 与诊断那条 loop 的 --claimed-by 同一个形状：机器名带上，一台机器跑多条时看得出是哪条。
-const JUDGED_BY = argOf("--judged-by", `loop-judge@${os.hostname()}`);
 const DRY = has("--dry-run");
 if (!DATASET) fail("--dataset 必填");
+// 报上跑的人是谁（DBDOG_OPERATOR）。在导包起会话之前就查——判一例要几十分钟，
+// 跑完才发现缺这个变量，批注回流了而状态推不动，页面上那行会一直停在「判题中」。
+try { operator(); } catch (e) { fail(e.message); }
 
 // ---- ① 捞：哪些诊断还没判过（单源在 loop-pending.mjs） ----
 const pending = await spawnScript(HERE, "loop-pending.mjs", ["--project", PROJECT, "--dataset", DATASET, "--kind", "judge", "--json"], { capture: true });
@@ -138,7 +138,7 @@ for (const c of groups) {
     const diag = diagByTrace.get(c.traceId);
     if (diag && diag.status === DIAG_PENDING_JUDGEMENT) {
       try {
-        const row = await advanceDiagnosis({ id: diag.id, from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING, by: JUDGED_BY });
+        const row = await advanceDiagnosis({ id: diag.id, from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING });
         if (row) diag.status = DIAG_JUDGING;
         else console.error(`· ${diag.case_source} 已不在待判题（多半另一轮先领走了），本轮照判但不改它的状态`);
       } catch (e) {
@@ -177,7 +177,7 @@ for (const c of groups) {
     // 页面上那一行停在「判题中」只是显示滞后，下一轮还会再推一次。
     if (diag) {
       try {
-        const row = await advanceDiagnosis({ id: diag.id, from: diag.status, to: DIAG_JUDGED, by: JUDGED_BY });
+        const row = await advanceDiagnosis({ id: diag.id, from: diag.status, to: DIAG_JUDGED });
         if (!row) console.error(`· ${diag.case_source} 已不在 ${diag.status}（多半是重判），不改它的状态`);
       } catch (e) {
         console.error(`⚠ ${diag.case_source} 推进度失败（批注已回流，不影响判题结果）：${e.message || e}`);
