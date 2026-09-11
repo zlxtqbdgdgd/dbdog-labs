@@ -58,6 +58,7 @@ import { runArtifactsDir } from "./lib/run-artifacts.mjs";
 import { installGuardCopy, mergeAgentSettings } from "./lib/blind-guard.mjs";
 import { resolveAgentIdentity } from "./lib/agent-identity.mjs";   // 本地评测专用，不进产品仓
 import { orchestrationMetrics } from "./lib/orchestration-metrics.mjs";
+import { advanceDiagnosis, parseDiagnosisMap, DIAG_DIAGNOSING, DIAG_PENDING_JUDGEMENT } from "./lib/case-diag-client.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 // hooks 母版 2026-07-14 迁到公开仓 dbdog-labs（本仓 clients/claude-code-hooks 只剩指路 README）。
@@ -119,6 +120,9 @@ const WORKDIR = argOf("--workdir", "");
 if (WORKDIR && !fs.existsSync(WORKDIR)) fail(`--workdir 不存在：${WORKDIR}`);
 // 盲测护栏（本地评测专用，不进产品仓）
 const DENY_ROOTS = argsOf("--deny-root");
+// `--diagnosis rec=diagId,...`：这一批 record 各自跑的是**哪一行诊断**（诊断表 pg/0025）。
+// 只有 loop 会传；不传（人手直接跑一轮）就整段不生效，与从前一字不差。
+const DIAGNOSIS_OF = parseDiagnosisMap(argsOf("--diagnosis"));
 // --guard-hook 仍收（调用方要用自己的钩子时给），但**默认不再要求给**：
 // 本仓自带 lib/diag-guard.py，有禁读根就自动装一份注入了根的临时副本。
 // 此前每个调用方各自带一份钩子，有的干脆把禁读根硬编码进源码，换台机器必须改文件。
@@ -364,6 +368,28 @@ async function runOne(record, idx, ctx) {
     await postExperimentEvent(ctx.runID, event);
   } catch (e) {
     return { record, label, error: `event 写入失败：${e.message || e}`, judged, durationMs };
+  }
+
+  // 事件落了就**当场**把 trace 写回诊断行，不等整轮结束（owner 2026-09-11 定）。
+  //
+  // 此前是 loop 跑完一整轮才逐条回填，于是：① 一轮 40 分钟，这期间诊断行没有 trace，
+  // 控制台里它跟自己那次运行认不了亲，同一次复现显成两行；② 轮次被掐（Ctrl-C / /loop 那一格
+  // 结束），linkage 永久丢失——跑过的那次从此没人认领，2026-09-11 实测 19 行诊断 trace 全空。
+  //
+  // 这一刻是**唯一**同时握着 record 与 trace 的地方，所以写在这儿。推到「待判题」而不是只补
+  // trace：这条诊断确实跑完了，把它当场登记成「等判题」，后面 loop 死不死都不影响。
+  // loop 收尾时那次 advance 会撞上 from 断言回 409，那是预期的（它那边按「已提前登记」处理）。
+  //
+  // 失败不阻断本轮：诊断结果已经落进 experiment_event 了，回填只是 linkage。
+  // loop 收尾那条路照旧是兜底。
+  const diagID = DIAGNOSIS_OF.get(String(record.id));
+  if (diagID && traceId) {
+    try {
+      const row = await advanceDiagnosis({ id: diagID, from: DIAG_DIAGNOSING, to: DIAG_PENDING_JUDGEMENT, traceId });
+      if (!row) console.error(`· [${label}] 诊断行已不在诊断中（租约被回收？），trace 没写回去`);
+    } catch (e) {
+      console.error(`⚠ [${label}] 回填 trace 到诊断行失败（不影响本次诊断结果）：${e.message || e}`);
+    }
   }
   const orchLine = orch
     ? ` · 子代理 ${orch.subagent_count}（峰值 ${orch.subagent_peak_concurrent}，深 ${orch.subagent_depth_max}${orch.subagent_limit_hits ? `，撞上限 ${orch.subagent_limit_hits} 次` : ""}）· 假设 ${orch.hypothesis_count}/收口 ${orch.hypothesis_resolved}${orch.hypothesis_dangling_refs ? `/悬空引用 ${orch.hypothesis_dangling_refs}` : ""}`

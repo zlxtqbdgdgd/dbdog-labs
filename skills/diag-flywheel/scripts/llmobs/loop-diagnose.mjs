@@ -210,10 +210,17 @@ for (const n of ["--notes", "--model", "--timeout-sec", "--ml-app", "--prompt-so
 for (const v of argsOf("--deny-root")) passthrough.push("--deny-root", v);
 if (DRY) passthrough.push("--dry-run");
 
+// `--diagnosis rec=diagId`：告诉 run-experiment 每条 record 跑的是**哪一行诊断**，好让它
+// 一落完实验事件就当场把 trace 写回去，不必等这一轮跑完（owner 2026-09-11）。
+// 显式传而不是让它自己查：同一道题可能有多行复现，现查只能猜一个，猜错就把 trace 记到
+// 另一次复现头上，而页面上看不出来。
+const diagPairs = claimedRows.map((d) => `${String(d.record_id)}=${d.id}`).join(",");
+
 const args = [
   "--project", PROJECT, "--dataset", DATASET,
   "--experiment", EXPERIMENT,
   "--scenarios", picked.map((r) => r.recordId).join(","),
+  ...(diagPairs ? ["--diagnosis", diagPairs] : []),
   "--concurrency", String(CONCURRENCY),
   ...passthrough,
 ];
@@ -236,16 +243,23 @@ try {
 }
 fs.rmSync(resultFile, { force: true });
 
+// **这一段现在是兜底，不是主路**：跑出 trace 的那些，run-experiment 落事件时就已经当场
+// 推到「待判题」了（它那一刻同时握着 record 与 trace，写在那儿才不怕本进程被掐）。
+// 这里还留着，是为了两种它没覆盖到的情况：
+//   · 一条都没跑出 trace ⇒ 要放回待诊断，那是本段独有的活；
+//   · run-experiment 那次回填没打通（网络抖、server 500）⇒ 再补一次。
+// 于是 409 从此变成**常态**：多半是「已经提前登记过了」，不再是「租约易主」。两者对本轮是
+// 同一个动作（什么都不用做），但日志不能只写后者——那会让人以为出了竞争。
 const traceOf = new Map(results.map((r) => [String(r.recordId), r.traceId || ""]));
-let advanced = 0, released = 0;
+let advanced = 0, released = 0, already = 0;
 for (const diag of claimedRows) {
   const traceId = traceOf.get(String(diag.record_id)) || "";
   const to = traceId ? DIAG_PENDING_JUDGEMENT : DIAG_PENDING;
   try {
     const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId });
     if (!row) {
-      // 409：这条已经不在 diagnosing 了（租约被回收后别人重跑过）。本轮放弃它，不是错。
-      console.error(`· ${diag.case_source} 的租约已易主，本轮不改它的状态`);
+      if (traceId) already++;   // 几乎总是 run-experiment 已经登记过了
+      else console.error(`· ${diag.case_source} 的租约已易主，本轮不改它的状态`);
       continue;
     }
     if (traceId) advanced++; else released++;
@@ -253,5 +267,6 @@ for (const diag of claimedRows) {
     console.error(`⚠ ${diag.case_source} 推进状态失败（下轮靠租约回收）：${e.message || e}`);
   }
 }
-console.error(`· 状态推进：${advanced} 条 → 待判题，${released} 条没拿到 trace 已放回待诊断`);
+if (already) console.error(`· ${already} 条在跑完时就已登记为待判题（run-experiment 当场回填），本段不用再推`);
+console.error(`· 状态推进：${advanced + already} 条 → 待判题（其中 ${already} 条跑完时已登记），${released} 条没拿到 trace 已放回待诊断`);
 process.exit(ran.code ?? 0);

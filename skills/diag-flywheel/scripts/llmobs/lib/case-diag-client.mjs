@@ -71,6 +71,30 @@ async function call(url, init) {
 }
 
 /**
+ * 解析 `--diagnosis rec=diagId,...` 这组参数，回 record → 诊断行 id 的表。
+ *
+ * 为什么要 loop **显式传**，不让 run-experiment 自己去查「这个 record 当前 diagnosing 的是哪行」：
+ * 同一道题可以有多行复现（一次复现一行），现查只能猜一个，猜错就把 trace 记到另一次复现头上，
+ * 而页面上看不出来——那正是 2026-09-11 那次「四行」里最难查的一半。
+ *
+ * 畸形项一律丢掉，不许变成 key 为空串或 value 为 undefined 的条目：那种条目会让
+ * `map.get(record.id)` 拿到一个假 id，往 server 发一条改不动任何行的请求，然后静静地什么也没发生。
+ */
+export function parseDiagnosisMap(values) {
+  const out = new Map();
+  for (const raw of values ?? []) {
+    for (const pair of String(raw).split(",")) {
+      const i = pair.indexOf("=");
+      if (i <= 0) continue;
+      const rec = pair.slice(0, i).trim();
+      const id = pair.slice(i + 1).trim();
+      if (rec && id) out.set(rec, id);
+    }
+  }
+  return out;
+}
+
+/**
  * 抢一条待诊断的复现，原子改成诊断中并占住租约。没有可抢的回 null。
  *
  * `staleAfterSec` 是**租约时长**：claimed_at 早于「现在减去它」的 diagnosing 行一并算作候选。
