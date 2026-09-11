@@ -21,6 +21,7 @@
 // 用法：
 //   node scripts/llmobs/loop-judge.mjs --dataset <用例集> [--project default-project]
 //     [--limit N] [--model M] [--timeout-sec 1800] [--keep-package] [--dry-run]
+//     [--no-chain] [--chain-config-dir ~/.claude]   重建链（判卷前用诊断同款模型把账本读成语义链，见 chain-rebuild.mjs）
 //
 // env 同 run-experiment（DBDOG_BASE_URL + DBDOG_API_KEY）。
 import fs from "node:fs";
@@ -42,6 +43,9 @@ const PROJECT = argOf("--project", "default-project");
 const DATASET = argOf("--dataset", "");
 const LIMIT = Number(argOf("--limit", "0"));
 const MODEL = argOf("--model", "");
+// 重建链：默认开；--no-chain 关。模型跟诊断同一份配置目录（judge-run/SKILL.md 模型分工表：诊断 = ~/.claude）。
+const NO_CHAIN = has("--no-chain");
+const CHAIN_CONFIG_DIR = argOf("--chain-config-dir", path.join(os.homedir(), ".claude"));
 const TIMEOUT_MS = Number(argOf("--timeout-sec", "1800")) * 1000;
 const KEEP = has("--keep-package");
 const DRY = has("--dry-run");
@@ -85,6 +89,9 @@ const JUDGE_PROMPT = `本目录是一个**自包含判题包**。请：
 1. 先读 \`skill/SKILL.md\`，那是判题口径的正文，严格按它判。
 2. 逐个读 \`cases/<event_id>/\` 下的材料判分。每例的材料可能有：
    - \`forward.md\`  正向假设树（agent 实际提了哪些假设、各拿什么证据、怎么收口）
+   - \`chain.md\`    重建链（**评测方**用模型把上面那棵平铺的账本读成语义因果链：谁解释谁、报告的机制落在哪个编号、
+     父子判定打不打架）。**可能没有**。它是猜出来的，不是 agent 的声明——判「证据撑不撑得住」时用它定位证据在链的哪一环，
+     与 forward.md 冲突时两边都写进 evidence，不拿它去改 forward.md 里的判定
    - \`reverse.md\`  反向证据链（从答案倒推「本该留下哪些痕迹」）
    - \`ground-truth.md\` 答案纸（**可能没有**——没有就是无参照题，按 skill 里的无参照口径判）
    - \`probe.json\`  探针结果（同样的工具、同样的参数由固定代码重放一遍的存否）
@@ -122,6 +129,12 @@ for (const c of groups) {
   try {
     const exp = await spawnScript(HERE, "judge-package-export.mjs", ["--project", PROJECT, "--dataset", DATASET, "--experiment", c.experiment, "--cases", c.eventId, "--out", pkg]);
     if (exp.code !== 0) { console.error(`✗ 导包失败：${c.eventId}`); failN++; continue; }
+
+    // 判卷前先重建链（owner 2026-09-11）：账本是平铺的，报告里的因果链却是多环的，判卷方拿账本判会被带歪。
+    // 用**诊断同一个模型**（CLAUDE_CONFIG_DIR 指向诊断那份配置），一条 case 一次调用；失败只少两份材料，不拦判卷。
+    if (!NO_CHAIN) {
+      await spawnScript(HERE, "chain-rebuild.mjs", ["--case", path.join(pkg, "cases", c.eventId), "--config-dir", CHAIN_CONFIG_DIR]);
+    }
 
     if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); okN++; continue; }   // dry-run 的包一律留着看
 

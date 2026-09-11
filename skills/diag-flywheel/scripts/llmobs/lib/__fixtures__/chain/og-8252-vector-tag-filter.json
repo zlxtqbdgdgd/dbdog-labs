@@ -1,0 +1,3199 @@
+{
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"case_source": "og-8252-vector-tag-filter",
+"note": "server 导出裁剪：只留 dbdog 调用（intent≤600）与含 Propose/收口/五段式标题的 agent/llm 正文",
+"spans": [
+{
+"span_id": "1092ec4f17c9ae88",
+"parent_id": "",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "agent",
+"name": "claude-code.task",
+"ts_ms": 1789075768568,
+"status": "ok",
+"output": "核对无误：`hnswscan.cpp:214/184-197/246-276`（ef = count + hnsw_ef_search、候选耗尽翻倍重跑、返回候选时 `xs_recheck=false` 不做谓词判定）、`costsize.cpp:1095-1130`（`annCount = limit/total_sel`，仅超表行数时加 disable_cost）、`nodeAnnIndexscan.cpp:81`（`scandesc->count = annCount`）、`execScan.cpp:217-282`（qpqual 不匹配则丢弃并继续）均与子代理结论一致。\n\n## What happened\n\n2026-09-10 23:49–23:53 (UTC+8)（= 15:49–15:53Z），`database_instance:host109-vm203-5432`（openGauss `opengauss_version:7.0.0-rc1`，build `12c995f`）上 `db:bench` 的 `query_signature:c3d9458a4daab9e1`：\n\n```sql\nSELECT id FROM public.ca93af6_hybrid WHERE tag = ? ORDER BY val1 <-> ? LIMIT ?\n```\n\n`user:opengauss`、`application:gsql`，41 次执行、`4.28 s/exec`、每次 `shared_blks_hit ≈ 1,678,259`（41 次共 68,808,612）、每次返回 1 行、缓存命中 ~100%、`shared_blks_read ≈ 1`。窗口内基线（23:39–23:43、22:49–22:53）**没有任何向量查询**，且本签名 41 次执行全部慢（无快慢混合）——用户所说的\"大部分快\"应是无过滤的同类 ANN 查询，DBM 窗口内未采集到。窗口内另有 `CREATE INDEX ca93af6_idx ... USING hnsw (val1 vector_l2_ops)`（`query_signature:5ec80aab1a15a692`，267 s），属建索引开销，与查询慢无因果关系。\n\n## Why that broke things\n\n1. HNSW 是**只支持排序操作符**的索引：`source_location:src/gausskernel/storage/access/datavec/hnsw.cpp:126-131`（`amcanorderbyop=true`、`amcanorder=false`）、`:49-56`（无 `indexorderbys` 时成本 `DBL_MAX`）。因此 `tag = ?` 永远不可能成为索引条件，只进 qpqual，但 planner 仍按 `ORDER BY val1 <-> ?` 生成 AnnIndexScan（`src/gausskernel/optimizer/path/indxpath.cpp:1020-1039`）——这就是\"用上了向量索引却仍然慢\"的关键。\n2. 候选预算由**过滤选择率反推**且不封顶：`annCount = limitValue / total_sel`（`source_location:src/gausskernel/optimizer/path/costsize.cpp:1095-1130`），tag 越稀有预算越大；超过表行数只加 `disable_cost`，不裁剪。预算写入扫描描述符（`src/gausskernel/runtime/executor/nodeAnnIndexscan.cpp:81`）。\n3. HNSW 扫描以 `ef = count + hnsw_ef_search` 跑图（`source_location:src/gausskernel/storage/access/datavec/hnswscan.cpp:214`），AM 不评估 `scan->keyData`（`hnswscan.cpp:246-276` 只吐 heaptid、`xs_recheck=false`），tag 过滤只能由执行器逐候选回表判定、不合格就继续（`src/gausskernel/runtime/executor/execScan.cpp:217-282`）。候选耗尽仍未凑够 LIMIT 时，`check_length` 把 ef **×2 并从头重跑搜索**（`hnswscan.cpp:184-197`）；终止条件是\"最近候选距离超过 top-ef 最远者\"（`src/gausskernel/storage/access/datavec/hnswutils.cpp:1057-1063`），ef 一旦达到索引规模即整图遍历。稀有 tag 的匹配行在全局距离序中靠后 → 每次执行近似整图遍历，逐节点一次 buffer 访问（`hnswutils.cpp:963-1001`）再回表，形成 �.68M 次页访问/4.28 s 的纯 CPU 成本（`wait_event:none`、`temp_files=0`）。无 tag 条件时 `total_sel≈1`、`annCount=limit`，首批候选即命中，所以快。\n4. 内存放大：候选/visited 结构随 ef 几何增长、只在 rescan/endscan 释放（`hnswscan.cpp:171,292`），visited 哈希按 `ef*m*2` 建桶（`hnswutils.cpp:885-894`）并以 HUGE 单块分配（`src/include/lib/simplehash.h:390-397`）；整条路径**没有 spill 落盘机制**。生产数据量更大时所需 ef/visits 更大 → 单块大分配失败，即\"内存申请失败\"（该生产库不在本 DBM 清单内，此环节为源码外推 + 本库 0 temp 佐证）。\n\n## How do we know\n\n- **量级观测**：窗口内 `shared_blks_hit` `1,678,259/exec`、`rows_returned` 1/exec、100% 缓存命中、`shared_blks_read≈1`；16 条该签名的活动采样全部 `@db.wait_event:none`（CPU 连续，118 ms–4.28 s），`opengauss.activity.waits` 内 `wait seq scan`/`wait index scan` 均为 0；实例级 `temp_files`/`temp_bytes` 在整个保有区间（10:35–16:10Z）为 0。这与\"无剪枝候选遍历 + 全内存\"的预测一致。\n- **源码链**：`costsize.cpp:1095-1130` → `nodeAnnIndexscan.cpp:81` → `hnswscan.cpp:184-197,214,246-276` → `execScan.cpp:217-282` → `hnswutils.cpp:963-1001,1057-1063`，版本为本地 7.0.0-RC1 检出（运行时 build `12c995f`，未做 commit 级对齐）。\n- **反证**：H1 的\"没有可用 ANN 路径\"被源码否定（过滤不参与路径生成）；且 `db:bench` 总大小 26.0 GB（`rownum_stat_tc` 15.94 GB 含 8.37 GB 索引、`test_yj` 1.30 GB 含 0.77 GB 索引），不存在能支撑单次全堆扫描 1.68M 页的 ~13.7 GB 目标表，顺序扫描也不会重访页。窗口内 `invalid memory alloc request size 1718269184 in a_compat.cpp:391`（03:34Z）是 LOB INSERT，与本案无关。\n- **证据边界**：无 plan/completion 事件（`statement_history` 关闭），该表/索引的 `seq_scans`、`heap_blocks_*`、`index_blocks_*`、`relation.pages`、`pg_buffercache` 系列在本实例**无采集**（非 0）；因此\"索引块 vs 堆块\"的拆分与实际计划节点（AnnIndexScan）是推断而非直接观测；生产实例在 DBM 中不可见。\n\n### Hypothesis ledger\n- H0 refuted — 窗口内不存在\"快/慢两组\"向量签名：仅 `c3d9458a4daab9e1` 一个，41/41 次约 4 s；比较窗口零向量查询。\n- H1 refuted — 源码证明过滤条件不参与 HNSW 路径生成（谓词进 qpqual），且 26 GB 的 bench 库装不下支撑单次全堆扫描 1.68M 页的大表。\n- H2 supported — 源码链完整（见上）；窗口量级（1.68M hits/exec、1 行/exec、CPU 无等待、0 temp）与无剪枝候选遍历一致；计划节点身份为推断。\n- H3 supported — 候选/visited 随 refill 几何增长、无 spill 原语、HUGE 单块分配；0 temp 佐证全内存路径，生产更大数据量下走向分配失败而非优雅降级。\n\n## The root cause\n\n主机制：openGauss HNSW 索引扫描**不支持把 `tag` 谓词下推进图遍历**（AM 不评估 keyData），过滤只能对 ANN 候选逐行回表后判定；为凑齐 LIMIT k，候选预算被选择率放大（`annCount = limit/total_sel`，不封顶），候选耗尽即 ef 翻倍并从头重跑，稀有 tag 下退化为近整图遍历——实测 `observed_at:2026-09-10 23:49–23:53+08` 的 `shared_blks_hit=1,678,259/exec`、`4.28 s/exec`、`wait_event:none`、`temp_files=0`，`source_location:src/gausskernel/storage/access/datavec/hnswscan.cpp:184-197,214,246-276`。生产故障放大环节：候选/visited 结构几何增长且无落盘路径，经 HUGE 单块分配（`simplehash.h:390-397`），数据量更大时内存申请失败；该生产实例不可观测，此环节标注为**源码外推**。触发/暴露条件：带高选择性 tag 的 hybrid ANN 查询形状，本窗口内 `index:ca93af6_idx` 刚建好即被该形状使用。残留不确定：实际计划节点与索引/堆块拆分无直接观测（证据边界），但不影响机制判定。\n\n## What to do to fix\n\nImmediate mitigation: 避免让高选择性 tag 走\"单条 ANN + 后过滤\"：把过滤与 ANN 排序拆开（先对 `tag = ?` 的结果集做距离排序取前 k，或在应用侧两步执行；CTE 物化写法需在你的版本上先验证计划，本仓库版本较老、CTE 默认物化）。不要用调大 `hnsw_ef_search` 救火——它只会加大每次搜索的遍历量（`hnswscan.cpp:214`）。\nFollow-up hardening: 代码侧在 HNSW 扫描中支持谓词评估/过滤感知的候选扩展，或对 `annCount`/`so->length` 封顶并改为增量迭代（避免 ×2 重跑与 HUGE 单块分配）；planner 侧用真实选择性（含 MCV）估计 `annCount`；部署侧按 tag 分区/拆分部分 HNSW 索引（需验证该版本对 hnsw 部分索引的支持），使每次查询只在小索引内做 ANN。以上加固项基于已定位的代码点，非基准验证结论。",
+"tags": {}
+},
+{
+"span_id": "387a58da253f07bc",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075796277,
+"status": "ok",
+"tags": {
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "Load openGauss investigation skill to structure the vector-index slowness diagnosis"
+},
+{
+"span_id": "1e8eacf645d30135",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075796883,
+"status": "ok",
+"tags": {
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "Load openGauss DBM telemetry reference for metric/tag semantics"
+},
+{
+"span_id": "b198c4a75398ec9c",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075796916,
+"status": "ok",
+"tags": {
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "Load log query skill to investigate openGauss memory allocation errors"
+},
+{
+"span_id": "b26219afb2b81c94",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075796954,
+"status": "ok",
+"tags": {
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "Load metrics skill to check instance CPU/memory during the slow-query window"
+},
+{
+"span_id": "8573628a4db344eb",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "llm",
+"name": "anthropic.messages",
+"ts_ms": 1789075843867,
+"status": "ok",
+"output": "**Propose [H0] type=symptom; claim=bench 库上 2026-09-10 23:49–23:53(UTC+8) 窗口内，带业务标签谓词的向量相似度查询存在一小撮比同类查询慢数千倍的 query_signature，生产同形态查询有内存申请失败记录；expect=DBM 证据定位实例并给出慢/快两组 signature 的延迟与行数差异。**",
+"tags": {
+"sidechain": "0"
+}
+},
+{
+"span_id": "93c2afa0ad8b400a",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075853111,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load OpenGauss DBM skill before querying opengauss.* metrics for vector-similarity latency investigation"
+},
+{
+"span_id": "70dc83297ab3cd56",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075853375,
+"status": "error",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Resolve the openGauss bench instance hosting the vector-similarity workload in the regression window"
+},
+{
+"span_id": "cd7c9a386575543a",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075865822,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Resolve the openGauss bench instance hosting the vector-similarity workload by instance-name tag"
+},
+{
+"span_id": "fc00711bfbd8b22c",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075866167,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Resolve the openGauss bench instance hosting the vector-similarity workload by service tag"
+},
+{
+"span_id": "2edd890941cbbbc1",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075866494,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Resolve the openGauss bench instance hosting the vector-similarity workload by cluster tag"
+},
+{
+"span_id": "552b8566b9b36c5d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075870579,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Enumerate openGauss instances via product tag to locate the bench vector-workload instance"
+},
+{
+"span_id": "c0b9441adfbdb4fd",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075870902,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Probe openGauss deployment tag for bench instance"
+},
+{
+"span_id": "58c85922371461b6",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075871212,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Probe openGauss cluster-name tag for bench instance"
+},
+{
+"span_id": "6d0ff05b177d57fa",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_entities",
+"ts_ms": 1789075871450,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Find services whose names contain bench for instance/attribution mapping"
+},
+{
+"span_id": "f0c5fb2074cb1fc0",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075875895,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load per-query-signature metric templates before opengauss.queries.* queries"
+},
+{
+"span_id": "a39853824b77d081",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075876165,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load openGauss activity/wait-status reference for window health checks"
+},
+{
+"span_id": "0b6bf973438f4d1d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075876445,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load completed-statement DDSQL reference for per-signature latency/rows/blocks"
+},
+{
+"span_id": "7e1c8572a0c8d92d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075876672,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load logs skill before searching openGauss memory-allocation failure lines"
+},
+{
+"span_id": "961cdb0932b7ea44",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789075876847,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Load DDSQL skill before querying dd.database_queries completions"
+},
+{
+"span_id": "3eb1c9a19ee7f978",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789075883918,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Confirm openGauss instance identity tags (engine_version, cluster, env, host) for host109-vm203-5432"
+},
+{
+"span_id": "04421cccdae74925",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_health_signals",
+"ts_ms": 1789075884438,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] DBM health triage for the 23:49-23:53 +08 regression window vs 23:39-23:43 baseline"
+},
+{
+"span_id": "0a80c277be595189",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789075899227,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-query_signature window totals (time, count, rows, blocks read/hit) in the 23:49-23:53 +08 regression window to separate slow vs fast vector-query groups"
+},
+{
+"span_id": "3b068fa22b70392e",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075899737,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Retrieve SQL text for dominant slow signature 5ec80aab1a15a692 in the regression window"
+},
+{
+"span_id": "aa1d5caf2495aac1",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075900264,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Retrieve SQL text for dominanted slow signature c3d9458a4daab9e1 in the regression window"
+},
+{
+"span_id": "d2c665fbb9fd5da5",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_calling_services",
+"ts_ms": 1789075900610,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify caller services/resources for the vector workload during the regression window"
+},
+{
+"span_id": "fb681448497c2df7",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "ddsql_run_query",
+"ts_ms": 1789075917361,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-signature completed-statement durations/rows/blocks in the regression window to contrast slow filtered vs fast sibling vector queries"
+},
+{
+"span_id": "a43256836a58cebc",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075917831,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of high-count low-latency candidate sibling signature"
+},
+{
+"span_id": "2479b4531b77bf37",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075918253,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "8c4ded626f75c1f4",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075918692,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "2929ff9cf4b0d4fe",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075919095,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "1b67d76f4ea220cd",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075919536,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "78e77e89ecfb330c",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075919962,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "caed8ad620649fe1",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_performance",
+"ts_ms": 1789075920435,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-query performance profile for the slow filtered signature in the regression window"
+},
+{
+"span_id": "9a2c9afb47b9a215",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_performance",
+"ts_ms": 1789075920858,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-query performance profile for candidate fast sibling signature in the regression window"
+},
+{
+"span_id": "8a4d679f3e765c93",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789075936859,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Find activity samples touching the vector table to identify fast sibling signatures alongside the slow filtered query"
+},
+{
+"span_id": "a2f4b8d943747a6b",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789075937329,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-session detail (app, user, db, waits) for the slow filtered signature in the regression window"
+},
+{
+"span_id": "47d4de47393d0d0d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_schemas",
+"ts_ms": 1789075937631,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Retrieve columns and indexes for the vector table used by the slow filtered query"
+},
+{
+"span_id": "c0e6f68886524aaa",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "find_dbdog_database_instances",
+"ts_ms": 1789075937919,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Enumerate all openGauss instances to locate the production sibling instance"
+},
+{
+"span_id": "7096d1da1fbf7700",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789075956831,
+"status": "error",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Enumerate all activity samples touching the vector table to find fast sibling signatures"
+},
+{
+"span_id": "5b13781eab6bfb50",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075957262,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate fast sibling signature"
+},
+{
+"span_id": "65a02550308a9287",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075957690,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "d820469afb890ee4",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075958132,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "e4adfeadd9650045",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075958548,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "e15eb31ac704e34b",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075959001,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "48bf5b75b811ba5c",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075959432,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate sibling signature"
+},
+{
+"span_id": "17f2e84d8af6c1fc",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075960111,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of high-count signature (may be workload fast group)"
+},
+{
+"span_id": "12a9d6c526e126d2",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789075960333,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL shape of candidate workload signature"
+},
+{
+"span_id": "21f738367662e715",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789075960859,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Search openGauss/GaussDB logs for memory-allocation failures identifying the production sibling database"
+},
+{
+"span_id": "a3695f6736b8354d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789075983102,
+"status": "error",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Enumerate activity samples touching the vector table to identify fast sibling query signatures"
+},
+{
+"span_id": "b31b7360503a6fb0",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789075983672,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Determine all hosts/receivers reporting memory-allocation failures to identify the production sibling"
+},
+{
+"span_id": "25f36d85f1f62dbf",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789075983926,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Search alternate memory-allocation failure phrasings across instances"
+},
+{
+"span_id": "27e24b12d66fdbb1",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789075984804,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Window health: wait-status mix, connection states and blocked-connection counts in the regression window"
+},
+{
+"span_id": "11feab4d7dd079f3",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076009196,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Isolate workload signatures in database bench to expose fast vs slow vector-query groups"
+},
+{
+"span_id": "c845113d791e4d26",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789076009619,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Enumerate table-touching activity samples to find the fast sibling signature"
+},
+{
+"span_id": "6baf4e6a01ff778e",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076010089,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Inspect attributes (db/user/query context) of the memory-allocation failure log line"
+},
+{
+"span_id": "57a6e3d880734038",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076027973,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL for single-execution signature that may be the fast vector sibling"
+},
+{
+"span_id": "59e4fd7f0b198e05",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076028442,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL for unknown high-count signature in db bench"
+},
+{
+"span_id": "ebe97b67026c22f4",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076028867,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify SQL for unidentified signature with 848 rows"
+},
+{
+"span_id": "f5c35214d1de907a",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076029305,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Find logged statements against the vector table (slow-query log) including fast variants"
+},
+{
+"span_id": "63af0f49dd330c33",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076029670,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Check whether openGauss logs exist on other hosts (production sibling candidate)"
+},
+{
+"span_id": "4dd1f7895cb2b6e3",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076045354,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Wider-window signature inventory by db to find any fast vector-query sibling signature"
+},
+{
+"span_id": "da1749bb9739d7f3",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076046087,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Per-minute average latency of the slow filtered signature to test for a fast/slow mix"
+},
+{
+"span_id": "d8b158cfd6c76fa4",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789076046540,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Wider-window table-touching activity samples for other statement variants"
+},
+{
+"span_id": "cc2141f258c32276",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_plans",
+"ts_ms": 1789076046926,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Retrieve recorded plans for the slow filtered vector query"
+},
+{
+"span_id": "2f702763c379df18",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_hosts",
+"ts_ms": 1789076107647,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Check host inventory for additional openGauss hosts that could be the production sibling"
+},
+{
+"span_id": "b6574c5c98d29ffd",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076108074,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "39089cb8b5166d18",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076108499,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "144f1f1adcd389a4",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076108948,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "b4e499a887f2dc39",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076109398,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "96b190372d2d41ba",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076109826,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "f949929625931570",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076110280,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "ec18fe2971e7e034",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076110691,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "b0690c1233ccad7d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076111154,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "8592cc10a15a2d82",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076111583,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "2981a67773d4583d",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076112022,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "3265da66f67990e0",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076112461,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "fb78052152294946",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076112905,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "b6777734777769f5",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076113328,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "188dd6bffc1ca8de",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076113764,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "ae963df5925d597f",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076114177,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "dcb538e545079491",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076114612,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Identify remaining in-window signature to rule out a fast vector sibling"
+},
+{
+"span_id": "977654492ff86bb8",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076129456,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Baseline window 23:39-23:43 +08: look for fast vector-query signatures in db bench"
+},
+{
+"span_id": "de424783051b852f",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076130275,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Alternative baseline window 22:49-22:53 +08: look for fast vector-query signatures in db bench"
+},
+{
+"span_id": "ec8ac59f2b95c125",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076130676,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Context around the memory-allocation failures (any statement/query shape logged nearby)"
+},
+{
+"span_id": "99a9b1eee7bbd25f",
+"parent_id": "2c339ebe3ef19a2e",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076131141,
+"status": "ok",
+"tags": {
+"agent_id": "ac2abb1c3a08803fb",
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H0] Check for openGauss log sources on hosts other than vm203 (production sibling candidate)"
+},
+{
+"span_id": "da89a8e62282da5b",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076220979,
+"status": "ok",
+"tags": {
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "[H0] scope; load per-table/index metric shapes to discriminate heap-scan vs index-traversal evidence"
+},
+{
+"span_id": "6f9bea0b9faa96cd",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076221259,
+"status": "ok",
+"tags": {
+"hypothesis_id": "H0",
+"mcp_server": "dbdog",
+"sidechain": "0"
+},
+"intent": "[H0] scope; load instance metric shapes (temp files/bytes) for the memory-materialization hypothesis"
+},
+{
+"span_id": "1bc2fae6ad9166c4",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "llm",
+"name": "anthropic.messages",
+"ts_ms": 1789076251858,
+"status": "ok",
+"output": "**Propose [H1] type=cause; claim=带 tag 过滤的查询无法走 HNSW 的 ANN top-k 路径，退化为对整表的顺序/全量扫描，LIMIT 提前终止失效（每次读约 1.68M 块）。**\n**Propose [H2] type=cause; claim=planner 仍走 HNSW 索引，但过滤条件禁用 ANN 剪枝，执行退化为全索引遍历+回表过滤（每次约 1.68M 块）。**\n**Propose [H3] type=cause; claim=该执行路径在内存中累积与扫描/匹配行数成比例的中间结果而非受 LIMIT 约束，这是生产更大数据量下同形态查询内存申请失败的机制。**",
+"tags": {
+"sidechain": "0"
+}
+},
+{
+"span_id": "737f5433bb931d16",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076263017,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Load dbm-opengauss skill before metric queries"
+},
+{
+"span_id": "739d3928a6bb5758",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076263181,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Load logs skill before log/sample queries"
+},
+{
+"span_id": "3a42c05689d2e63b",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076266177,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Load metrics-query reference before metric queries"
+},
+{
+"span_id": "a903aa4d459c3603",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076266384,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Load metrics-table reference before metric queries"
+},
+{
+"span_id": "b15223fbf29596be",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076266592,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Load metrics-activity reference before wait/sample queries"
+},
+{
+"span_id": "bc0dac7f16e1741d",
+"parent_id": "e94a3c12a3b86b00",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076272253,
+"status": "ok",
+"tags": {
+"agent_id": "aa970ba710d74f9da",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load dbm-opengauss skill header to discover reference docs before metric queries"
+},
+{
+"span_id": "6bf23cf8cad2abed",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076273274,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Confirm seq_scans metric semantics (rate vs monotonic counter)"
+},
+{
+"span_id": "a8b48557b3e253fc",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076273304,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Confirm heap_blocks_hit metric semantics"
+},
+{
+"span_id": "9894aeaea9a54d37",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076273440,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Confirm index_blocks_hit metric semantics"
+},
+{
+"span_id": "309ea8815de3a891",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076273596,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Confirm relation.pages gauge semantics"
+},
+{
+"span_id": "455ba503d0103697",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076274069,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] load dbm-opengauss skill before metric queries for temp/spill evidence"
+},
+{
+"span_id": "1c29ff43ce0a179a",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076274206,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] load logs skill before log search for memory warnings"
+},
+{
+"span_id": "646818ff7dbbb029",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076278023,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] read metrics-query reference for per-signature temp/spill fields"
+},
+{
+"span_id": "0ccbd6eb3413444c",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076278267,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] read metrics-instance reference for temp_files/temp_bytes semantics"
+},
+{
+"span_id": "b9a66aa3ad3977a2",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076278489,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] read metrics-table reference for relation pages/buffercache fields"
+},
+{
+"span_id": "fafeb26207eeef8c",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076283606,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Fetch per-table scan and block counter timeseries for ca93af6_hybrid in incident window to diff cumulative gauges"
+},
+{
+"span_id": "c0bdd7a1a6b5d7ad",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076289361,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Confirm opengauss.seq_scans exists and is reporting for the instance"
+},
+{
+"span_id": "a5fd06b5dabe2acb",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076290003,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Check instance-wide seq_scans reporting without table filter in incident window"
+},
+{
+"span_id": "19e6e16d97098193",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076294825,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check temp_files semantics (rate vs counter) before window comparison"
+},
+{
+"span_id": "6ada89783ae58d05",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076294986,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check temp_bytes semantics (rate vs counter) before window comparison"
+},
+{
+"span_id": "29370275ab78ca32",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076295926,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load dbm-opengauss skill to get correct facet names for wait_status/state when reading DBM samples"
+},
+{
+"span_id": "61bdc8043966f606",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076295947,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Discover actual table tag values for seq_scans on the instance"
+},
+{
+"span_id": "576888d93e738039",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076296234,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish whether opengauss.activity.waits is a rate or cumulative counter before computing wait shares"
+},
+{
+"span_id": "8897394feb59f777",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076296329,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Discover actual table tag values for relation.pages on the instance"
+},
+{
+"span_id": "82c0d20bbbda997c",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076296350,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load required dbm-opengauss skill before running evidence queries"
+},
+{
+"span_id": "cfce2bf0f3020d40",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076298473,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load metrics-query reference for openGauss metric semantics"
+},
+{
+"span_id": "0ce5f56b8d256a41",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076298659,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load metrics-table reference for openGauss table/index metrics"
+},
+{
+"span_id": "5fccd4f03efa9608",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076298891,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load metrics-activity reference for openGauss activity metrics"
+},
+{
+"span_id": "70260ba3e365c5c6",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076299408,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Load metrics-activity reference to use correct wait_status/state facet names when reading openGauss DBM samples"
+},
+{
+"span_id": "e270de788bb6d63e",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076301905,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] temp_files/temp_bytes over regression 23:40-00:00+08 vs baseline 22:40-23:00+08"
+},
+{
+"span_id": "26e9ede49cbb252c",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076302152,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check per-signature temp block metric semantics before querying signature c3d9458a4daab9e1"
+},
+{
+"span_id": "b9f9e070a46f97ae",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076302392,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check buffercache used_buffers tags/unit for relation residency comparison"
+},
+{
+"span_id": "ab8826baf23b7ff2",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076302597,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check relation.pages tags/unit for table+index page comparison"
+},
+{
+"span_id": "208c23537f3366f6",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076304574,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wait evidence: opengauss.activity.waits grouped by wait_event and wait_event_type for the slow window 15:49-15:53Z to see if index-related waits dominate"
+},
+{
+"span_id": "3a368d186366c2fe",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076305062,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Discover whether per-table relation metrics exist at all on this instance"
+},
+{
+"span_id": "532948d89a143deb",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076305584,
+"status": "error",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Attempt to read raw skill content for a freshly spawned subagent"
+},
+{
+"span_id": "514c57c5148f84d3",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076305829,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics (counter vs gauge) before querying index block metrics"
+},
+{
+"span_id": "a51b3496544c5ef9",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076305998,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of index blocks read metric"
+},
+{
+"span_id": "418cd8913a278c36",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076306193,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics and tag set of index_scans metric"
+},
+{
+"span_id": "6c8b6299053f8ea5",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076306378,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of index_rows_read metric"
+},
+{
+"span_id": "66857a60f661cdff",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076306542,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of index_rows_fetched metric"
+},
+{
+"span_id": "bd9590863d27016e",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076308965,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of seq_scans metric (H1 alternative source check)"
+},
+{
+"span_id": "641a75ee22aa579c",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076309163,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of heap_blocks_hit metric (H1 alternative source check)"
+},
+{
+"span_id": "62bbd5e5cf4e6ed3",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076309349,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish semantics of heap_blocks_read metric (H1 alternative source check)"
+},
+{
+"span_id": "8caf52b3bce38d01",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076309624,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish size metric semantics and unit for ca93af6_idx"
+},
+{
+"span_id": "1b00d76730968b1f",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076309812,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish heap relation size semantics and unit"
+},
+{
+"span_id": "ceda6e280e1d433f",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076309977,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish relation page-count metric semantics"
+},
+{
+"span_id": "0793da829b4c5820",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076311020,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] distinguish counter vs rate for temp_files/temp_bytes and confirm zero spill over 25h"
+},
+{
+"span_id": "92651362aad8d6e1",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076312037,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] per-signature temp block spill totals for c3d9458a4daab9e1 in incident window"
+},
+{
+"span_id": "e99059f242f65c1d",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076314552,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Query per-table metrics by exact table tag, no db filter, to test tag value"
+},
+{
+"span_id": "86eaa5226553642e",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076314912,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wait evidence: opengauss.activity.waits grouped by wait_event across baseline (15:39-15:43Z) and incident (15:49-15:53Z) for contrast"
+},
+{
+"span_id": "0901c2c0efec5f66",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076315329,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Enumerate bench-db table series to locate ca93af6_hybrid tag value"
+},
+{
+"span_id": "6040a623188fa160",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789076315408,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wait evidence: raw activity samples for query_signature c3d9458a4daab9e1 in the slow window to read wait_status and state"
+},
+{
+"span_id": "8a47498f03f655d3",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076317636,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish tuple-count metric semantics for the target table"
+},
+{
+"span_id": "a48dda2ec35daedb",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076317888,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish aggregate index size metric semantics as fallback"
+},
+{
+"span_id": "5d71d3815e789d4b",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076318110,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Establish table-level index scan metric semantics"
+},
+{
+"span_id": "d02de8a667457c80",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076323811,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Index/heap/seq table counters over incident window to test exhaustive index traversal vs heap-dominant source"
+},
+{
+"span_id": "2b132044e7f29778",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076324518,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Per-index scan/rows counters for ca93af6_idx to check ANN pruning failure"
+},
+{
+"span_id": "dc279acb4f3652d6",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076325544,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Size/page/tuple gauges for ca93af6_hybrid and its index to relate 1.68M blocks/exec to physical size"
+},
+{
+"span_id": "4054fb39f5e710a1",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076328767,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] timeseries shape for per-signature temp blocks to test counter vs window sum"
+},
+{
+"span_id": "3ab52852ce89c6de",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076328852,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Resolve exact table tag form for ca93af6_hybrid series"
+},
+{
+"span_id": "0d003bb8e111b793",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076334027,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Baseline wait evidence: opengauss.activity.waits by wait_event for 15:39-15:43Z to contrast with the slow window"
+},
+{
+"span_id": "4a57c684d32a0b9d",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076334391,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Inventory whether wait index scan / wait seq scan wait_event values exist on this instance in the last 24h"
+},
+{
+"span_id": "b8ed4e4a0b57c4e1",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076337128,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Table-scoped index/heap/seq counters for ca93af6_hybrid across incident window"
+},
+{
+"span_id": "303cc4df64a854c0",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076337903,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Per-index counters for ca93af6_idx to check ANN pruning and full traversal"
+},
+{
+"span_id": "3c112222971ee88c",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076339105,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Physical size/page/tuple gauges for ca93af6_hybrid and ca93af6_idx"
+},
+{
+"span_id": "fa42fa6459d8eae2",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076339769,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Rank tables by heap blocks hit to identify actual tag value for the target table"
+},
+{
+"span_id": "7e83135b74d80150",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789076340278,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Inspect activity samples for the slow filtered HNSW query to read wait status and table facets"
+},
+{
+"span_id": "98f62d00540b0e9b",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076345137,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] test whether per-signature temp block metrics exist at all on this instance"
+},
+{
+"span_id": "8a15399be032a40c",
+"parent_id": "83526d675cdc0965",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076346215,
+"status": "ok",
+"tags": {
+"agent_id": "a3afc2c17fe640096",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Inventory of all wait_event values on the instance over the 3h preceding the slow window to confirm scan waits never appear"
+},
+{
+"span_id": "f2109b135c5cef43",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076346437,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] table pages/tuples/sizes and cached buffers for public.ca93af6_hybrid"
+},
+{
+"span_id": "b54f2e0748770803",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076356279,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Validate tag wildcard support and locate target table series"
+},
+{
+"span_id": "b745fdee76a95a3e",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076356890,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] check whether temp_blks/relation.pages/buffercache series are actively reporting"
+},
+{
+"span_id": "e5b1410b610d11e8",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076356895,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Enumerate active-session wait events during the slow-query window"
+},
+{
+"span_id": "d6417f65fe0a4e2e",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076357802,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] discover live tag values for relation.pages, buffercache, index size on this instance"
+},
+{
+"span_id": "ad2ac0b2d3054570",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076358305,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] search openGauss logs 23:40-00:10+08 for memory/alloc/temp warnings tied to query shape"
+},
+{
+"span_id": "76f9be08d0cb28be",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076361174,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wider window to test whether relation/index metric series for ca93af6_hybrid exist at all"
+},
+{
+"span_id": "260c8ff12d746eae",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076361629,
+"status": "error",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Confirm whether any opengauss metric carries tag table:ca93af6_hybrid or index:ca93af6_idx"
+},
+{
+"span_id": "121849e07d6044c5",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076362145,
+"status": "error",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wildcard search for any hybrid-named table tag in opengauss metrics"
+},
+{
+"span_id": "26dfb7058b6b34d4",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076373896,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Wildcard probe for any opengauss metric carrying tags ca93af6_hybrid or ca93af6_idx"
+},
+{
+"span_id": "9564c70b3a7ef093",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076374627,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Retry target table tags scoped to db bench"
+},
+{
+"span_id": "c137aa69e10b4691",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076384427,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Identify which tag key carries ca93af6 in query-level metrics"
+},
+{
+"span_id": "0cf3d467758dbbe2",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076384771,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Exact table-tag probe for ca93af6_hybrid across opengauss metrics"
+},
+{
+"span_id": "369d3c9ddbca65df",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_metrics",
+"ts_ms": 1789076385076,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Exact index-tag probe for ca93af6_idx across opengauss metrics"
+},
+{
+"span_id": "a9d03b2310a9a6a0",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076395717,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Control test of tag-filter syntax on known tables and check locks series for target table"
+},
+{
+"span_id": "1693958d3cc5c698",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_database_query_statement",
+"ts_ms": 1789076401249,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] exact statement text and tables for signature c3d9458a4daab9e1"
+},
+{
+"span_id": "7671eed234549914",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076402075,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] table/index size for ca93af6_hybrid to test full-residency vs full-scan"
+},
+{
+"span_id": "0dbf7676793b6dae",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076405015,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Check alternate per-index block counter metric family"
+},
+{
+"span_id": "8f94dbb8091f3ab9",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076405208,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Check alternate per-index block read metric family"
+},
+{
+"span_id": "f003cb47cd2824f3",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric_context",
+"ts_ms": 1789076405566,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Check collector async job failure metric semantics as explanation for missing series"
+},
+{
+"span_id": "c2a953b6c41cacd7",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076409413,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Per-index block counters for ca93af6_idx (with control index) to test exhaustive traversal claim"
+},
+{
+"span_id": "561188cb0732d5e5",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076410683,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] attribute 68.8M shared hits to heap vs index scan for ca93af6_hybrid"
+},
+{
+"span_id": "9f1d3db74d93b8dc",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076422618,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Instance-wide block/scan counter deltas to bound index-vs-heap composition of 68.8M shared_blks_hit"
+},
+{
+"span_id": "5df96681051fda28",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076423187,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Confirm db of target table and check relations collector activity in window"
+},
+{
+"span_id": "19fe3f5b96af1507",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "load_dbdog_skill",
+"ts_ms": 1789076428802,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] read completion-event reference to recover executed plan for signature c3d9458a4daab9e1"
+},
+{
+"span_id": "8666c63256ced588",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076439818,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Day-long check whether table scan/block counter families ever report non-zero (functional test)"
+},
+{
+"span_id": "4b1fff55ef4cfe84",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076440124,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Bound physical size of bench DB around table creation to test 13.4GB-per-exec plausibility"
+},
+{
+"span_id": "7fa69efc650b441f",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "ddsql_run_query",
+"ts_ms": 1789076453741,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] per-execution completion volume (tuples_fetched/blocks) for signature c3d9458a4daab9e1"
+},
+{
+"span_id": "ed3def04db3b8f30",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_database_samples",
+"ts_ms": 1789076454099,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] activity samples for signature to read wait_event during the slow executions"
+},
+{
+"span_id": "71d069048ae274de",
+"parent_id": "569d382dd668b75c",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076465248,
+"status": "ok",
+"tags": {
+"agent_id": "aa5a4409eebbcdfb1",
+"hypothesis_id": "H2",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H2] Final probe for schema-qualified table tag variant of target relation metrics"
+},
+{
+"span_id": "15a959f6dc21ef25",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076476065,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] per-index scan counters for ca93af6_idx to prove whether hnsw path executed"
+},
+{
+"span_id": "df50d40b618504be",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076485789,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] find ca93af6_hybrid row count/size among bench tables to bound scan path"
+},
+{
+"span_id": "9e3c21d845f7d40f",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_events",
+"ts_ms": 1789076486176,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] find event timestamp of ca93af6_idx CREATE INDEX relative to 41 executions"
+},
+{
+"span_id": "cab544522104e2b0",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076524543,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Test whether index-level series exist for the HNSW index in the incident window"
+},
+{
+"span_id": "22078c3bf915d7c4",
+"parent_id": "e4fc4788e9f7db22",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076571503,
+"status": "ok",
+"tags": {
+"agent_id": "aad64d4b007c21582",
+"hypothesis_id": "H3",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H3] confirm per-signature temp block metrics return no data (not collected vs zero)"
+},
+{
+"span_id": "15ab905c839ee653",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076612295,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Final attempt to locate any per-table series for the target table"
+},
+{
+"span_id": "70f01d24b59c60f9",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "ddsql_schema_search_tables",
+"ts_ms": 1789076612654,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Look for a DDSQL data table exposing per-relation pg_stat counters"
+},
+{
+"span_id": "e1e5f76e4f31d5e3",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "get_dbdog_metric",
+"ts_ms": 1789076672190,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Get per-snapshot wait-event counts (raw) for the slow-query window"
+},
+{
+"span_id": "041fb158de623325",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076690049,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Look for slow-query plan logs mentioning the target table in the window"
+},
+{
+"span_id": "9459618217fed9c0",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076690471,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Search logs for plan text indicating scan type in the incident window"
+},
+{
+"span_id": "dfce0b57f9d38526",
+"parent_id": "b41ca3a081206e46",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "tool",
+"name": "search_dbdog_logs",
+"ts_ms": 1789076701661,
+"status": "ok",
+"tags": {
+"agent_id": "ac5da3c9b03612743",
+"hypothesis_id": "H1",
+"mcp_server": "dbdog",
+"sidechain": "1"
+},
+"intent": "[H1] Last check for any logged plan or error text about the HNSW index"
+},
+{
+"span_id": "441163c9a53813db",
+"parent_id": "1092ec4f17c9ae88",
+"trace_id": "1092ec4f17c9ae882feca072095f5bb0",
+"kind": "llm",
+"name": "anthropic.messages",
+"ts_ms": 1789076840638,
+"status": "ok",
+"output": "核对无误：`hnswscan.cpp:214/184-197/246-276`（ef = count + hnsw_ef_search、候选耗尽翻倍重跑、返回候选时 `xs_recheck=false` 不做谓词判定）、`costsize.cpp:1095-1130`（`annCount = limit/total_sel`，仅超表行数时加 disable_cost）、`nodeAnnIndexscan.cpp:81`（`scandesc->count = annCount`）、`execScan.cpp:217-282`（qpqual 不匹配则丢弃并继续）均与子代理结论一致。\n\n## What happened\n\n2026-09-10 23:49–23:53 (UTC+8)（= 15:49–15:53Z），`database_instance:host109-vm203-5432`（openGauss `opengauss_version:7.0.0-rc1`，build `12c995f`）上 `db:bench` 的 `query_signature:c3d9458a4daab9e1`：\n\n```sql\nSELECT id FROM public.ca93af6_hybrid WHERE tag = ? ORDER BY val1 <-> ? LIMIT ?\n```\n\n`user:opengauss`、`application:gsql`，41 次执行、`4.28 s/exec`、每次 `shared_blks_hit ≈ 1,678,259`（41 次共 68,808,612）、每次返回 1 行、缓存命中 ~100%、`shared_blks_read ≈ 1`。窗口内基线（23:39–23:43、22:49–22:53）**没有任何向量查询**，且本签名 41 次执行全部慢（无快慢混合）——用户所说的\"大部分快\"应是无过滤的同类 ANN 查询，DBM 窗口内未采集到。窗口内另有 `CREATE INDEX ca93af6_idx ... USING hnsw (val1 vector_l2_ops)`（`query_signature:5ec80aab1a15a692`，267 s），属建索引开销，与查询慢无因果关系。\n\n## Why that broke things\n\n1. HNSW 是**只支持排序操作符**的索引：`source_location:src/gausskernel/storage/access/datavec/hnsw.cpp:126-131`（`amcanorderbyop=true`、`amcanorder=false`）、`:49-56`（无 `indexorderbys` 时成本 `DBL_MAX`）。因此 `tag = ?` 永远不可能成为索引条件，只进 qpqual，但 planner 仍按 `ORDER BY val1 <-> ?` 生成 AnnIndexScan（`src/gausskernel/optimizer/path/indxpath.cpp:1020-1039`）——这就是\"用上了向量索引却仍然慢\"的关键。\n2. 候选预算由**过滤选择率反推**且不封顶：`annCount = limitValue / total_sel`（`source_location:src/gausskernel/optimizer/path/costsize.cpp:1095-1130`），tag 越稀有预算越大；超过表行数只加 `disable_cost`，不裁剪。预算写入扫描描述符（`src/gausskernel/runtime/executor/nodeAnnIndexscan.cpp:81`）。\n3. HNSW 扫描以 `ef = count + hnsw_ef_search` 跑图（`source_location:src/gausskernel/storage/access/datavec/hnswscan.cpp:214`），AM 不评估 `scan->keyData`（`hnswscan.cpp:246-276` 只吐 heaptid、`xs_recheck=false`），tag 过滤只能由执行器逐候选回表判定、不合格就继续（`src/gausskernel/runtime/executor/execScan.cpp:217-282`）。候选耗尽仍未凑够 LIMIT 时，`check_length` 把 ef **×2 并从头重跑搜索**（`hnswscan.cpp:184-197`）；终止条件是\"最近候选距离超过 top-ef 最远者\"（`src/gausskernel/storage/access/datavec/hnswutils.cpp:1057-1063`），ef 一旦达到索引规模即整图遍历。稀有 tag 的匹配行在全局距离序中靠后 → 每次执行近似整图遍历，逐节点一次 buffer 访问（`hnswutils.cpp:963-1001`）再回表，形成 �.68M 次页访问/4.28 s 的纯 CPU 成本（`wait_event:none`、`temp_files=0`）。无 tag 条件时 `total_sel≈1`、`annCount=limit`，首批候选即命中，所以快。\n4. 内存放大：候选/visited 结构随 ef 几何增长、只在 rescan/endscan 释放（`hnswscan.cpp:171,292`），visited 哈希按 `ef*m*2` 建桶（`hnswutils.cpp:885-894`）并以 HUGE 单块分配（`src/include/lib/simplehash.h:390-397`）；整条路径**没有 spill 落盘机制**。生产数据量更大时所需 ef/visits 更大 → 单块大分配失败，即\"内存申请失败\"（该生产库不在本 DBM 清单内，此环节为源码外推 + 本库 0 temp 佐证）。\n\n## How do we know\n\n- **量级观测**：窗口内 `shared_blks_hit` `1,678,259/exec`、`rows_returned` 1/exec、100% 缓存命中、`shared_blks_read≈1`；16 条该签名的活动采样全部 `@db.wait_event:none`（CPU 连续，118 ms–4.28 s），`opengauss.activity.waits` 内 `wait seq scan`/`wait index scan` 均为 0；实例级 `temp_files`/`temp_bytes` 在整个保有区间（10:35–16:10Z）为 0。这与\"无剪枝候选遍历 + 全内存\"的预测一致。\n- **源码链**：`costsize.cpp:1095-1130` → `nodeAnnIndexscan.cpp:81` → `hnswscan.cpp:184-197,214,246-276` → `execScan.cpp:217-282` → `hnswutils.cpp:963-1001,1057-1063`，版本为本地 7.0.0-RC1 检出（运行时 build `12c995f`，未做 commit 级对齐）。\n- **反证**：H1 的\"没有可用 ANN 路径\"被源码否定（过滤不参与路径生成）；且 `db:bench` 总大小 26.0 GB（`rownum_stat_tc` 15.94 GB 含 8.37 GB 索引、`test_yj` 1.30 GB 含 0.77 GB 索引），不存在能支撑单次全堆扫描 1.68M 页的 ~13.7 GB 目标表，顺序扫描也不会重访页。窗口内 `invalid memory alloc request size 1718269184 in a_compat.cpp:391`（03:34Z）是 LOB INSERT，与本案无关。\n- **证据边界**：无 plan/completion 事件（`statement_history` 关闭），该表/索引的 `seq_scans`、`heap_blocks_*`、`index_blocks_*`、`relation.pages`、`pg_buffercache` 系列在本实例**无采集**（非 0）；因此\"索引块 vs 堆块\"的拆分与实际计划节点（AnnIndexScan）是推断而非直接观测；生产实例在 DBM 中不可见。\n\n### Hypothesis ledger\n- H0 refuted — 窗口内不存在\"快/慢两组\"向量签名：仅 `c3d9458a4daab9e1` 一个，41/41 次约 4 s；比较窗口零向量查询。\n- H1 refuted — 源码证明过滤条件不参与 HNSW 路径生成（谓词进 qpqual），且 26 GB 的 bench 库装不下支撑单次全堆扫描 1.68M 页的大表。\n- H2 supported — 源码链完整（见上）；窗口量级（1.68M hits/exec、1 行/exec、CPU 无等待、0 temp）与无剪枝候选遍历一致；计划节点身份为推断。\n- H3 supported — 候选/visited 随 refill 几何增长、无 spill 原语、HUGE 单块分配；0 temp 佐证全内存路径，生产更大数据量下走向分配失败而非优雅降级。\n\n## The root cause\n\n主机制：openGauss HNSW 索引扫描**不支持把 `tag` 谓词下推进图遍历**（AM 不评估 keyData），过滤只能对 ANN 候选逐行回表后判定；为凑齐 LIMIT k，候选预算被选择率放大（`annCount = limit/total_sel`，不封顶），候选耗尽即 ef 翻倍并从头重跑，稀有 tag 下退化为近整图遍历——实测 `observed_at:2026-09-10 23:49–23:53+08` 的 `shared_blks_hit=1,678,259/exec`、`4.28 s/exec`、`wait_event:none`、`temp_files=0`，`source_location:src/gausskernel/storage/access/datavec/hnswscan.cpp:184-197,214,246-276`。生产故障放大环节：候选/visited 结构几何增长且无落盘路径，经 HUGE 单块分配（`simplehash.h:390-397`），数据量更大时内存申请失败；该生产实例不可观测，此环节标注为**源码外推**。触发/暴露条件：带高选择性 tag 的 hybrid ANN 查询形状，本窗口内 `index:ca93af6_idx` 刚建好即被该形状使用。残留不确定：实际计划节点与索引/堆块拆分无直接观测（证据边界），但不影响机制判定。\n\n## What to do to fix\n\nImmediate mitigation: 避免让高选择性 tag 走\"单条 ANN + 后过滤\"：把过滤与 ANN 排序拆开（先对 `tag = ?` 的结果集做距离排序取前 k，或在应用侧两步执行；CTE 物化写法需在你的版本上先验证计划，本仓库版本较老、CTE 默认物化）。不要用调大 `hnsw_ef_search` 救火——它只会加大每次搜索的遍历量（`hnswscan.cpp:214`）。\nFollow-up hardening: 代码侧在 HNSW 扫描中支持谓词评估/过滤感知的候选扩展，或对 `annCount`/`so->length` 封顶并改为增量迭代（避免 ×2 重跑与 HUGE 单块分配）；planner 侧用真实选择性（含 MCV）估计 `annCount`；部署侧按 tag 分区/拆分部分 HNSW 索引（需验证该版本对 hnsw 部分索引的支持），使每次查询只在小索引内做 ANN。以上加固项基于已定位的代码点，非基准验证结论。",
+"tags": {
+"sidechain": "0"
+}
+}
+]
+}

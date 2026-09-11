@@ -20,6 +20,8 @@
 //                        /reverse.md|.json  反向证据链（record.metadata.reverse_chain；缺则不产）
 //                        /ground-truth.md   答案纸（expected_output；缺则不产 = 无参照题）
 //                        /probe.json    探针结果（由 probe.mjs 写；已有则原样保留）
+//                        /chain.json + chain.md  重建链：评测方用诊断同款模型把 forward.md 那棵平铺账本读成语义因果链
+//                                       （由 chain-rebuild.mjs 在导包后另写；本脚本零模型，不产它；可缺）
 //                        /prior-judgments.json  这道题**之前几轮**的判题（改进点 items、复验 checks、修复标记，旧的在前）；
 //                                       判这一轮时逐条复验还没关的（飞轮设计 §13.3）。空数组 = 之前没判过
 import fs from "node:fs";

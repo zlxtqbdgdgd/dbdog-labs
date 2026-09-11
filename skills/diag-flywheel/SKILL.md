@@ -66,7 +66,10 @@ node $S/llmobs/judge-package-export.mjs --experiment <run 名或 uuid> --out ./p
 
 包是自包含的(判题方不能回头追问,所以材料一次给全):`manifest.json` + 判题 skill 正文 +
 每例的 `trace.json` / `forward.md`(正向假设树)/ `reverse.md` / `ground-truth.md` / `probe.json` /
-`prior-judgments.json`(这道题之前几轮提过的改进点与修复标记——判这一轮要逐条复验还没关的)。
+`prior-judgments.json`(这道题之前几轮提过的改进点与修复标记——判这一轮要逐条复验还没关的)/
+`chain.md` + `chain.json`(重建链:导包后 `$S/llmobs/chain-rebuild.mjs --case ./pkg/cases/<event_id>` 用**诊断同款模型**
+把平铺的账本读成语义因果链——谁解释谁、谁是谁的细化、报告的机制落在哪个编号、父子判定打不打架;`loop-judge.mjs` 默认自动跑,
+`--no-chain` 关;它是评测方的猜,不改 forward.md)。
 
 判卷口径在本插件的 **`diag-judge`** skill（`skills/diag-judge/SKILL.md`,导包时会拷一份进 `./pkg/skill/`）。
 能连上 server 就直接在会话里说「判一下这条 trace <trace_id>」——在线判是默认,判官会去活系统主动查证;

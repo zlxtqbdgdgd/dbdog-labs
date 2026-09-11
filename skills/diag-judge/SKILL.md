@@ -35,6 +35,12 @@ description: 给一次数据库诊断（一条 trace）判卷：结论对不对�
 | 这条 trace 已有的批注 | `get_llmobs_annotations_by_content_ids` |
 | 这道题之前几轮的判题 | `$S/llmobs/case-history.mjs` |
 | 正向假设树 | 包里的 `forward.md`（本地渲染，MCP 取不到，只能随包走） |
+| 重建链 | 包里的 `chain.md` / `chain.json`（**评测方**用诊断同款模型把 forward.md 那棵平铺账本读成语义因果链；`chain-rebuild.mjs` 在导包后另写，**可缺**） |
+
+**重建链怎么用**（owner 2026-09-11）：forward.md 是 agent 的**声明**，chain.md 是评测方的**猜**——两者并排看，不用后者改前者。
+账本平铺而报告多环是常态（父桶证伪、桶里的具体机制另开一级并判证实），所以：判「结论对不对」看报告认定的机制落在 chain.md 的哪个编号；
+判「证据撑不撑得住」用 chain.md 定位证据挂在链的哪一环；chain.md 的「判定冲突」一节里的每条都是一个现成的 `model` 或 `skill` 改进点候选
+（模型读到了「编号即谱系」的约定却没照做）。chain.md 缺席就按 forward.md 判，并在 summary 里写一句「无重建链」。
 
 判题包在这条路上只是**省一次取数**。包里没有的，自己去取——**不要把「包里没有」当成「不存在」**。
 
@@ -64,6 +70,7 @@ cases/<event_id>/
   prior-judgments.json  这道题之前几轮的 items / checks（复验要用）
   reverse.md/.json      反向证据链（来自 record.metadata.reverse_chain）—— 条件产出
   probe.json            探针结果（由 probe.mjs 另跑写入）—— 条件产出
+  chain.md/.json        重建链（评测方用模型把 forward.md 读成语义因果链；chain-rebuild.mjs 另写）—— 条件产出
 ```
 
 **后两样当前链路上都不产出**（用例没有 `reverse_chain`、探针没接直查腿），所以别把
