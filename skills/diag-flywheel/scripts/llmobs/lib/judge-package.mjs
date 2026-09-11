@@ -397,8 +397,35 @@ export function validateLabels(labels) {
   if (labels.attribution !== undefined) {
     const a = labels.attribution;
     if (!a || typeof a !== "object" || Array.isArray(a)) problems.push("attribution 必须是对象");
-    else {
-      // D4 两条硬规则：建议必须说改哪里，归因必须指到 span 或探针行。
+    else if (Array.isArray(a.defects)) {
+      // 新结构：**一条缺陷一个对象**，三要素必须在同一个对象里——从哪看出来（evidence）、
+      // 是什么问题（problem）、改到哪里（fix）。摊进三个平行长字段的旧写法人读得懂、机器
+      // 一条都聚合不了：实测一例的 fix_where 里塞了 6 条缺陷、pointers 有 9 条，谁对应谁无从得知，
+      // 而「这个缺陷有几例撞到」正是这条 loop 唯一要交的东西。
+      a.defects.forEach((d, i) => {
+        const at = `defects[${i}]`;
+        if (!d || typeof d !== "object" || Array.isArray(d)) { problems.push(`${at} 必须是对象`); return; }
+        const ev = Array.isArray(d.evidence) ? d.evidence : [];
+        if (ev.length === 0) problems.push(`${at}.evidence 为空（说不出从哪看出来的）`);
+        for (const e of ev) {
+          // code 是核对答案纸时引的源码行（file:line）——它是「结论对不对」的直接证据，
+          // 此前无处安放只能塞进散文里，机器读不出来。
+          if (!e || typeof e !== "object" || (!e.span_id && !e.probe && !e.code)) {
+            problems.push(`${at}.evidence 里的 ${JSON.stringify(e)} 不是 {span_id} / {probe} / {code}`);
+          }
+        }
+        if (!d.problem) problems.push(`${at}.problem 缺失（说不出是什么问题）`);
+        const fix = d.fix && typeof d.fix === "object" ? d.fix : {};
+        for (const k of ["repo", "path", "change"]) {
+          if (!fix[k]) problems.push(`${at}.fix.${k} 缺失（说不清改到哪里）`);
+        }
+        for (const t of Array.isArray(d.tags) ? d.tags : []) {
+          if (!ATTRIBUTION_TAGS.includes(t)) problems.push(`${at}.tags 里的 ${JSON.stringify(t)} 不在词表`);
+        }
+      });
+    } else {
+      // 旧结构（pointers + fix_where + suggestion 三个平行字段）仍收，按旧规则校验；
+      // skill 已不再产出它，等存量判完就删这一支。
       if (!a.fix_where) problems.push("attribution.fix_where 缺失（D4：建议必须说改哪里）");
       const pointers = Array.isArray(a.pointers) ? a.pointers : [];
       if (pointers.length === 0) problems.push("attribution.pointers 为空（D4：归因必须指到 span_id 或探针行）");

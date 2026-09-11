@@ -124,9 +124,24 @@ if (!summary) {
   } else if (DRY) {
     console.error(`[dry-run] 会把 summary.md（${summary.length} 字符）写进 experiment ${target.id} 的 metadata.judge_summary`);
   } else {
-    const metadata = { ...(target.metadata ?? {}), judge_summary: summary, judge_summary_at: new Date().toISOString(), ...(annotator ? { judge_model: annotator } : {}) };
+    // **按例累积，不是整体覆盖**。判题是一例一个会话（judge-package-export --cases），
+    // 同一个 run 下的每一例都会走到这里；直接写 `judge_summary` 的话，后一例把前一例盖掉，
+    // 一轮跑完只剩最后那份（2026-09-10 实测：三例跑完，前两例的总账没了）。
+    // 落成以 event id 为键的字典，每例一格；轮级总账由聚合步骤另算，不在这里拼。
+    const prev = target.metadata ?? {};
+    const bucket = { ...(prev.judge_summaries && typeof prev.judge_summaries === "object" ? prev.judge_summaries : {}) };
+    // 一个包里可能不止一例（整轮导的老形态），每例各占一格。键取 manifest 里的 event id
+    // ——`rows` 是上面那个块的局部变量，这里取不到；manifest.cases 才是本包覆盖面的权威。
+    const keys = (manifest.cases ?? []).map((c) => c.event_id || c.trace_id).filter(Boolean);
+    for (const k of (keys.length ? keys : [path.basename(PKG)])) bucket[k] = summary;
+    const metadata = {
+      ...prev,
+      judge_summaries: bucket,
+      judge_summary_at: new Date().toISOString(),
+      ...(annotator ? { judge_model: annotator } : {}),
+    };
     await patchCPExperiment(target.id, { metadata });
-    console.error(`✓ 本轮总账 → experiment ${target.id} 的 metadata.judge_summary`);
+    console.error(`✓ 本例总账 → experiment ${target.id} 的 metadata.judge_summaries（${Object.keys(bucket).length} 例在册）`);
   }
 }
 
