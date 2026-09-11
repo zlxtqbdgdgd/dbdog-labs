@@ -47,6 +47,26 @@ const ENTRIES = [
   "scripts/llmobs/loop-pending.mjs",
   "scripts/llmobs/case-history.mjs",
   "scripts/llmobs/fix-mark.mjs",
+  // 2026-09-11 加两条 loop 的入口：它们此前只在源码仓里，于是别人要跑就得 clone 整个 mcp
+  // 仓只为拿两个文件（那台机器上的 runner 靠一个 MCP_REPO 变量指过去）。进了镜像之后，
+  // 装了插件就有脚本，MCP_REPO 这个变量整个消失。
+  // 闭包会自动带上它们独有的三个依赖：spawn-script / judge-session / case-diag-client。
+  "scripts/llmobs/loop-diagnose.mjs",
+  "scripts/llmobs/loop-judge.mjs",
+];
+
+/**
+ * 闭包扫不到的**附带资产**：不是被 import 的，是运行时按路径读的。
+ *
+ * `diag-guard.py` 由 blind-guard.mjs 的 installGuardCopy 按同目录相对路径读出来、注入禁读根、
+ * 拷成临时副本。闭包靠扫 import 语句算依赖，这种读法一个字都扫不到——**漏了不会有编译错，
+ * 会在用户第一次装护栏时 ENOENT**，而那正是盲测护栏该生效的时刻。
+ *
+ * 加东西到这里之前先想：它是不是本来就该改成 import？能 import 的一律走闭包，
+ * 这张表只收真的没法 import 的（非 JS 资产）。
+ */
+const EXTRA_ASSETS = [
+  "scripts/llmobs/lib/diag-guard.py",
 ];
 
 function closure() {
@@ -70,7 +90,7 @@ function closure() {
   return [...seen].sort();
 }
 
-const files = closure();
+const files = [...closure(), ...EXTRA_ASSETS];
 // 自身也要进镜像：用户拿到的那份要能自证「我是从哪同步来的」，也方便他 --check 自己那份没被改花
 files.push(path.relative(MCP_ROOT, fileURLToPath(import.meta.url)));
 

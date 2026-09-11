@@ -238,17 +238,10 @@ const manifest = {
 fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
 
 // 判题 skill 正文随包走（蓝区没有 MCP，读不到 Resource）。
-// 判卷口径只住在插件 dbdog-agent-obs 的 diag-judge skill（2026-09-11 起，mcp 不再下发）。
-// 本脚本有两种落点：插件里（`<plugin>/skills/diag-flywheel/scripts/llmobs/` → rubric 在 `../../../diag-judge/SKILL.md`）
-// 和 mcp 源码检出（母版 → 兄弟检出 `../dbdog-labs/skills/diag-judge/SKILL.md`）。两处都没有就停：没有 rubric 的包是死包。
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const RUBRIC_CANDIDATES = [
-  path.resolve(HERE, "..", "..", "..", "diag-judge", "SKILL.md"),
-  path.resolve(ROOT, "..", "dbdog-labs", "skills", "diag-judge", "SKILL.md"),
-];
-const rubric = RUBRIC_CANDIDATES.find((p) => fs.existsSync(p));
-if (!rubric) fail(`找不到判卷口径 diag-judge/SKILL.md（找过：${RUBRIC_CANDIDATES.join(" / ")}）——它住在插件 dbdog-agent-obs 的 skills/diag-judge/`);
-fs.copyFileSync(rubric, path.join(OUT, "skill", "SKILL.md"));
+fs.copyFileSync(
+  path.join(ROOT, "src", "skillsets", "llmobs", "llm-obs-diag-judge", "SKILL.md"),
+  path.join(OUT, "skill", "SKILL.md"),
+);
 fs.writeFileSync(path.join(OUT, "skill", "README.md"), `# 在蓝区离线判这一包
 
 蓝区没有 dbdog、连不上 server，判题模型**不能回头追问**——材料就这一包，缺什么如实写进 \`summary.md\`。
