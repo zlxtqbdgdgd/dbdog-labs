@@ -20,7 +20,7 @@
 //                        /reverse.md|.json  反向证据链（record.metadata.reverse_chain；缺则不产）
 //                        /ground-truth.md   答案纸（expected_output；缺则不产 = 无参照题）
 //                        /probe.json    探针结果（由 probe.mjs 写；已有则原样保留）
-//                        /prior-judgments.json  这道题**之前几轮**的判题（待修 items 与复验 checks，旧的在前）；
+//                        /prior-judgments.json  这道题**之前几轮**的判题（改进点 items、复验 checks、修复标记，旧的在前）；
 //                                       判这一轮时逐条复验还没关的（飞轮设计 §13.3）。空数组 = 之前没判过
 import fs from "node:fs";
 import path from "node:path";
@@ -247,13 +247,13 @@ fs.writeFileSync(path.join(OUT, "skill", "README.md"), `# 在蓝区离线判这�
 1. 读 \`../manifest.json\`：有几例、label schema 是哪一版（\`id\` 一栏回写时要用，别改）。
 2. 把 \`SKILL.md\`（本目录）当 rubric，逐例读 \`../cases/<event_id>/\` 下的四件套：
    \`forward.md\`（agent 实际走的路）、\`reverse.md\`（本该走的路 + 真取到的证据）、
-   \`ground-truth.md\`（答案纸；不存在 = 无参照题，\`verdict\` 不许判 \`correct\`）、
-   \`probe.json\`（探针两条腿；不存在 = 没跑，\`trustworthy\` 只能按「没抓到撒谎」判 true）、
-   \`prior-judgments.json\`（这道题之前几轮提过的待修与复验；还没关的每一条都要在 \`attribution.checks\` 里复验）。
+   \`ground-truth.md\`（答案纸；不存在 = 无参照题，\`verdict\` 填 \`unknown\`）、
+   \`probe.json\`（探针结果；不存在 = 没跑，「工具错」只能靠 trace 内两两对照抓）、
+   \`prior-judgments.json\`（这道题之前几轮提过的改进点、复验与修复标记；还没关的每一条都要在 \`findings.checks\` 里复验）。
    \`trace.json\` 是 server 导出的原样 span，需要抠细节时看它。
 3. 产两个文件写到**包根**（不是本目录）：
    - \`annotations.jsonl\`：每例一行 \`{"trace_id":"…","labels":{…}}\`，形状见 SKILL.md；
-   - \`summary.md\`：本轮总账（判了几例、四项分布、待修按 \`key\` 聚合的清单、本轮复验几条修好 / 仍在、最该先修的三条、判不动的地方）。
+   - \`summary.md\`：本轮总账（判了几例、结论与证据的分布、改进点按 \`key\` 聚合的清单（带类别）、本轮复验几条修好 / 仍在、最该先修的三条、判不动的地方）。
    改了反向链就把修订写到 \`reverse-chain-revisions/<record_id>.md\`（和 \`.json\`）。
 
 ## 回黄区之后
@@ -276,4 +276,4 @@ console.error(`✓ 判题包：${path.resolve(OUT)}（${cases.length} 例，队�
 console.error(`  label：${manifest.label_schema.length} 条${manifest.label_schema.length < LABEL_SCHEMA.length ? "（不全，见上面的警告）" : ""}`);
 if (noTrace) console.error(`  ⚠ ${noTrace} 例没有 trace——这几例只有答案纸，判不了行为`);
 const noProbe = cases.filter((c) => c.missing.some((m) => m.startsWith("probe"))).length;
-if (noProbe) console.error(`  ⚠ ${noProbe} 例没有探针结果，「可信」只能按「没抓到撒谎」判（D2：探针是判可信的唯一硬证据）`);
+if (noProbe) console.error(`  ⚠ ${noProbe} 例没有探针结果，「工具错」只能靠 trace 内两两对照抓（D2：探针是抓工具错最硬的证据）`);

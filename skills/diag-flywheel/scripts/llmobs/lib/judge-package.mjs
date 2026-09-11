@@ -1,7 +1,7 @@
 // judge-package.mjs — 判题包的**纯函数**层（形状、渲染、解析），零 I/O、零 fetch。
 //
 // 单源关系（军规 3）：
-//   · label 词表与取值形状 = dbdog-web `docs/design/llmobs-diag-flywheel.md` §7.1（D4 落形）；
+//   · label 词表与取值形状 = dbdog-web `docs/design/llmobs-diag-flywheel.md` §7.1（2026-09-11 改版：结论 / 证据 / 改进点）；
 //     export 写进 manifest、import 按 manifest 的 id 回写、判题 skill 正文按同一张表判——三处共用本文件。
 //   · 探针 outcome 四值与同事 skill `evidence-chain` 同口径（`../dbdog-labs/skills/evidence-chain/scripts/check_chain.py` 是它的守门）。
 //   · 假设树**只认 span tags**（`hypothesis_id` / `parent_hypothesis_id` / `hypothesis` / `expect` /
@@ -16,28 +16,39 @@ export const STAMP_KEYS = ["hooks_version", "mcp_version", "skills_digest", "too
 export const QUEUE_NAME = "diag-judge";
 
 /**
- * label schema（§7.1 七条，逐字）。`value_type` 走 server 的枚举
- * （boolean / categorical / string / score / json），投影时直接映射成 experiment metric 的 metric_type。
- * `options` 只有枚举型才发：nil = 不是枚举，`[]` = 是枚举但没配选项——两档不同，别混。
+ * label schema（§7.1，2026-09-11 改版）。每个 label 回答一个不用图例就看得懂的问题；
+ * `value_type` 走 server 的枚举（boolean / categorical / string / score / json），投影按 value_type 与值的形状算，
+ * 不认 label 名（server ADR-0051 附注）。`options` 只有枚举型才发：nil = 不是枚举，`[]` = 是枚举但没配选项——两档不同，别混。
+ *
+ * 判题方写前三个 + summary；`finding_kinds` 由 import 从 findings 算出（同一件事不写两遍）；`fix_marks` 由修的人用 fix-mark.mjs 写。
  */
 export const LABEL_SCHEMA = [
-  { label: "trustworthy", value_type: "boolean", display: "可信（这条 trace 能不能当参考/训练）" },
-  { label: "needs_fix", value_type: "boolean", display: "要修 dbdog" },
-  { label: "verdict", value_type: "categorical", options: ["correct", "partial", "wrong"], display: "结论 对/部分/错" },
-  { label: "lucky_guess", value_type: "boolean", display: "蒙对" },
-  { label: "attribution_tags", value_type: "json", display: "归因标签（扁平，用来过滤）" },
-  { label: "attribution", value_type: "json", display: "归因与建议" },
-  { label: "summary", value_type: "string", display: "总评" },
+  { label: "verdict", value_type: "categorical", options: ["correct", "partial", "wrong", "unknown"], display: "结论对不对：对 / 部分对 / 错 / 判不了（没答案纸）" },
+  { label: "evidence", value_type: "categorical", options: ["solid", "weak"], display: "证据撑不撑得住结论" },
+  { label: "findings", value_type: "json", display: "改进点（一条一个）+ 对之前几轮条目的复验" },
+  { label: "finding_kinds", value_type: "json", display: "改进点类别（由 import 从 findings 算出，筛选用）" },
+  { label: "summary", value_type: "string", display: "总评（≤ 300 字大白话）" },
+  { label: "fix_marks", value_type: "json", display: "修复标记（改了等复验 / 要人协助 / 不修；fix-mark.mjs 写）" },
 ];
 
-/** `attribution_tags` 的词表（前三 = dbdog 侧，中三 = agent 侧，末二 = 脚手架 / 题本身）。 */
-export const ATTRIBUTION_TAGS = [
-  "no_tool", "empty_or_error", "obtained_mismatch",
-  "hypothesis_missing", "tool_misuse", "reasoning_error",
-  "scaffold", "case_issue",
-];
+/** 判题方要写的 label（其余两个由脚本写）。 */
+export const JUDGE_WRITTEN_LABELS = ["verdict", "evidence", "findings", "summary"];
 
-export const VERDICTS = ["correct", "partial", "wrong"];
+export const VERDICTS = ["correct", "partial", "wrong", "unknown"];
+export const EVIDENCE_VALUES = ["solid", "weak"];
+
+/**
+ * 改进点六类（§7.1）：按「是谁的锅、怎么复现、谁来修」分，互斥。顺序就是 finding_kinds 的输出顺序。
+ * tool 是确定性的（固定代码重放同一调用必现）；skill 是非确定性的（改完要多跑几轮）；model 不改代码；
+ * scaffold 改编排；case 改用例；unsure 要人看。
+ */
+export const FINDING_KINDS = ["tool", "skill", "model", "scaffold", "case", "unsure"];
+
+/** 这几类是 dbdog 侧能动手修的（web「有 dbdog 要修的」筛的就是它们）。 */
+export const FIXABLE_KINDS = ["tool", "skill", "scaffold", "case"];
+
+/** 修复标记三值（§13.3）：改了等复验 / 要人协助 / 不修。 */
+export const FIX_MARK_STATUSES = ["claimed_fixed", "needs_human", "wont_fix"];
 
 /** 探针 outcome 四值（与 evidence-chain 同口径）。 */
 export const PROBE_OUTCOMES = ["obtained_match", "obtained_mismatch", "empty_or_error", "no_tool"];
@@ -380,7 +391,7 @@ export function parseAnnotationsJsonl(text) {
   return { rows, problems };
 }
 
-/* ── 待修条目与复验（飞轮设计 §13.3：「每次改哪里拆成一条一条」「修没修好看实际效果，不依赖人的反馈」） ── */
+/* ── 改进点与复验（飞轮设计 §13.3：「每次改哪里拆成一条一条」「修没修好看实际效果，不依赖人的反馈」） ── */
 
 /** 复验结果：修好了 / 又撞上了 / 这一轮没走到那条路（不算数）。 */
 export const FIX_CHECK_STATUSES = ["fixed", "still_open", "not_exercised"];
@@ -394,7 +405,7 @@ export const FIX_KEY_RE = /^[a-z0-9][a-z0-9._-]{2,79}$/;
 function pointerProblems(where, pointers, required) {
   const out = [];
   const list = Array.isArray(pointers) ? pointers : [];
-  if (required && list.length === 0) out.push(`${where}.pointers 为空（归因必须指到 span_id 或探针行）`);
+  if (required && list.length === 0) out.push(`${where}.pointers 为空（每条改进点都得指到 span_id 或探针行）`);
   for (const pt of list) {
     if (!pt || typeof pt !== "object" || (!pt.span_id && !pt.probe)) {
       out.push(`${where}.pointers 里的 ${JSON.stringify(pt)} 既不是 {span_id} 也不是 {probe}`);
@@ -403,70 +414,78 @@ function pointerProblems(where, pointers, required) {
   return out;
 }
 
+const nonEmpty = (v) => typeof v === "string" && v.trim().length > 0;
+
 /**
- * `attribution` 的形状：`{ items: [{key, fix_where, suggestion, pointers}], checks: [{key, status, pointers, note}] }`。
- * - items：这一轮新发现的待修，一条一个落点；
+ * `findings` 的形状：
+ * `{ items: [{key, kind, title, evidence, fix_where, suggestion, repro?, pointers}], checks: [{key, status, kind?, pointers, note}] }`。
+ * - items：这一轮新发现的改进点，一条一个落点；`kind` 六类之一；`title` / `evidence` 必填（读的人靠它们，不靠 key）；
+ *   `fix_where` 与 `suggestion` 在 tool / skill / scaffold / case 四类必填（能动手修的必须说改哪里）；`unsure` 的 `suggestion` 写要人核什么。
  * - checks：这道题之前几轮提过、还没关的，逐条复验（`fixed` / `still_open` 必须带证据指针）。
- * 旧形状（整段 `fix_where` 塞在顶层）直接拒：一段里塞五处改动，数不出哪处修了。
+ * 旧形状（`attribution`、顶层一段 `fix_where`）直接拒：一段里塞五处改动，数不出哪处修了。
  */
-export function validateAttribution(a, needsFix) {
+export function validateFindings(a) {
   const problems = [];
-  if (!a || typeof a !== "object" || Array.isArray(a)) return ["attribution 必须是对象"];
+  if (!a || typeof a !== "object" || Array.isArray(a)) return ["findings 必须是对象"];
   if ("fix_where" in a && !("items" in a)) {
-    return ["attribution 是旧形状（顶层一段 fix_where）——改成 items[] 一条一个落点、checks[] 复验之前几轮提过的（skill「待修条目」一节）"];
+    return ["findings 是旧形状（顶层一段 fix_where）——改成 items[] 一条一个落点、checks[] 复验之前几轮提过的（skill「改进点」一节）"];
   }
   const items = a.items ?? [];
   const checks = a.checks ?? [];
-  if (!Array.isArray(items)) problems.push("attribution.items 必须是数组");
-  if (!Array.isArray(checks)) problems.push("attribution.checks 必须是数组");
+  if (!Array.isArray(items)) problems.push("findings.items 必须是数组");
+  if (!Array.isArray(checks)) problems.push("findings.checks 必须是数组");
   const keys = new Set();
   (Array.isArray(items) ? items : []).forEach((it, i) => {
-    const w = `attribution.items[${i}]`;
+    const w = `findings.items[${i}]`;
     if (!it || typeof it !== "object") return problems.push(`${w} 必须是对象`);
     if (!FIX_KEY_RE.test(String(it.key ?? ""))) problems.push(`${w}.key ${JSON.stringify(it.key)} 不合规（小写 ascii，<层>.<模块>.<缺什么>）`);
     else if (keys.has(it.key)) problems.push(`${w}.key ${it.key} 重复——一个缺口只提一条`);
     else keys.add(it.key);
-    if (!String(it.fix_where ?? "").trim()) problems.push(`${w}.fix_where 缺失（建议必须说改哪里，且只写一处）`);
+    if (!FINDING_KINDS.includes(it.kind)) problems.push(`${w}.kind ${JSON.stringify(it.kind)} 只能是 ${FINDING_KINDS.join(" / ")}`);
+    if (!nonEmpty(it.title)) problems.push(`${w}.title 缺失（一句话说谁在哪出了什么事）`);
+    if (!nonEmpty(it.evidence)) problems.push(`${w}.evidence 缺失（看到了什么 / 本该是什么 / 为什么是问题）`);
+    if (FIXABLE_KINDS.includes(it.kind)) {
+      if (!nonEmpty(it.fix_where)) problems.push(`${w}.fix_where 缺失（${it.kind} 类必须说改哪里，且只写一处）`);
+      if (!nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（${it.kind} 类必须说怎么改）`);
+    }
+    if (it.kind === "unsure" && !nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（unsure 要写清要人核什么、看哪里）`);
     problems.push(...pointerProblems(w, it.pointers, true));
   });
-  let stillOpen = 0;
   (Array.isArray(checks) ? checks : []).forEach((c, i) => {
-    const w = `attribution.checks[${i}]`;
+    const w = `findings.checks[${i}]`;
     if (!c || typeof c !== "object") return problems.push(`${w} 必须是对象`);
     if (!FIX_KEY_RE.test(String(c.key ?? ""))) problems.push(`${w}.key ${JSON.stringify(c.key)} 不合规`);
     if (!FIX_CHECK_STATUSES.includes(c.status)) problems.push(`${w}.status 只能是 ${FIX_CHECK_STATUSES.join(" / ")}`);
-    if (c.status === "still_open") stillOpen += 1;
+    if (c.kind !== undefined && !FINDING_KINDS.includes(c.kind)) problems.push(`${w}.kind ${JSON.stringify(c.kind)} 不在六类里`);
     problems.push(...pointerProblems(w, c.pointers, c.status === "fixed" || c.status === "still_open"));
     if (keys.has(c.key)) problems.push(`${w}.key ${c.key} 同时出现在 items 里——又撞上的只写 still_open 复验，不要再提一条`);
   });
-  // 与 needs_fix 自洽：判了要修却一条待修都没有（也没有又撞上的），或判了不用修却提了待修——必有一项判错了
-  const hasWork = keys.size > 0 || stillOpen > 0;
-  if (needsFix === true && !hasWork) problems.push("needs_fix=true 却没有一条待修（items 为空，也没有 still_open 的复验）");
-  if (needsFix === false && keys.size > 0) problems.push("needs_fix=false 却提了待修条目");
   return problems;
 }
 
 /**
- * 读侧把一条批注里的 `attribution` 摊成 `{items, checks}`。旧形状（顶层一段 fix_where，09-10 之前的判题）
- * 当成**一条**，key 记成 `legacy.<trace 前 8 位>`——web 读侧同一条规则（dbdog-web 的 llmobs-fix-items），
- * 判下一轮时就能拿这个 key 复验它。
+ * `finding_kinds` = items 的 kind ∪ still_open 复验的 kind，去重、按词表顺序。
+ * **算出来的，判题方不写**——写了也被这个覆盖（军规 3：能推导的值不许再钉一份）。
  */
-export function normalizeAttribution(value, traceId) {
+export function deriveFindingKinds(findings) {
+  const f = normalizeFindings(findings);
+  const present = new Set();
+  for (const it of f.items) if (FINDING_KINDS.includes(it?.kind)) present.add(it.kind);
+  for (const c of f.checks) if (c?.status === "still_open" && FINDING_KINDS.includes(c?.kind)) present.add(c.kind);
+  return FINDING_KINDS.filter((k) => present.has(k));
+}
+
+/**
+ * 读侧把一条批注里的 `findings` 摊成 `{items, checks}`（双重编码也认）。只认新形状：
+ * 2026-09-11 改版时活栈的旧判题已按新口径重判，库里不再有旧形状（web `llmobs-fix-items` 同一条规则）。
+ */
+export function normalizeFindings(value) {
   let v = value;
   if (typeof v === "string") {
     try { v = JSON.parse(v); } catch { return { items: [], checks: [] }; }
   }
   if (!v || typeof v !== "object" || Array.isArray(v)) return { items: [], checks: [] };
-  if (Array.isArray(v.items) || Array.isArray(v.checks)) {
-    return { items: Array.isArray(v.items) ? v.items : [], checks: Array.isArray(v.checks) ? v.checks : [] };
-  }
-  if (typeof v.fix_where === "string" && v.fix_where.trim()) {
-    return {
-      items: [{ key: `legacy.${String(traceId).slice(0, 8)}`, fix_where: v.fix_where, suggestion: v.suggestion ?? "", pointers: v.pointers ?? [] }],
-      checks: [],
-    };
-  }
-  return { items: [], checks: [] };
+  return { items: Array.isArray(v.items) ? v.items : [], checks: Array.isArray(v.checks) ? v.checks : [] };
 }
 
 /**
@@ -474,6 +493,7 @@ export function normalizeAttribution(value, traceId) {
  *
  * **只给原料，不替判题方算「哪些还没关」**：规则就一句（最后一次有效复验不是 fixed、或 fixed 之后又被提出来，
  * 都算没关），写在 skill 里；web 读侧另有一份算状态的实现给人看。这里多算一遍就是第三份副本。
+ * 修复标记（`fix_marks`）也原样带上：修的人说「改了」，判题方复验时该走到那条路去验。
  *
  * @param {{ experiment: {id:string,name:string,created_at:string}, traceId: string }[]} runs 这道题**之前**的运行
  * @param {Map<string, any[]>} interactionsByTrace `findAllAnnotationsByContent` 的返回
@@ -487,7 +507,9 @@ export function priorJudgments(runs, interactionsByTrace) {
         for (const an of it.annotations ?? []) if (an.label && !labels.has(an.label)) labels.set(an.label, an.value);
       }
       if (!labels.size) return { round: experiment.name, round_id: experiment.id, created_at: experiment.created_at, trace_id: traceId, judged: false };
-      const { items, checks } = normalizeAttribution(labels.get("attribution"), traceId);
+      const { items, checks } = normalizeFindings(labels.get("findings"));
+      let marks = labels.get("fix_marks") ?? {};
+      if (typeof marks === "string") { try { marks = JSON.parse(marks); } catch { marks = {}; } }
       return {
         round: experiment.name,
         round_id: experiment.id,
@@ -495,9 +517,10 @@ export function priorJudgments(runs, interactionsByTrace) {
         trace_id: traceId,
         judged: true,
         verdict: labels.get("verdict") ?? null,
-        needs_fix: labels.get("needs_fix") ?? null,
+        evidence: labels.get("evidence") ?? null,
         items,
         checks,
+        fix_marks: marks && typeof marks === "object" && !Array.isArray(marks) ? marks : {},
       };
     });
 }
@@ -505,23 +528,24 @@ export function priorJudgments(runs, interactionsByTrace) {
 /** label 值的形状校验（只判形状，不判判得对不对）。 */
 export function validateLabels(labels) {
   const problems = [];
-  for (const key of ["trustworthy", "needs_fix", "lucky_guess"]) {
-    if (labels[key] !== undefined && typeof labels[key] !== "boolean") problems.push(`${key} 必须是布尔`);
-  }
   if (labels.verdict !== undefined && !VERDICTS.includes(labels.verdict)) {
     problems.push(`verdict 只能是 ${VERDICTS.join(" / ")}`);
   }
-  if (labels.attribution_tags !== undefined) {
-    if (!Array.isArray(labels.attribution_tags)) problems.push("attribution_tags 必须是字符串数组");
-    else {
-      for (const t of labels.attribution_tags) {
-        if (!ATTRIBUTION_TAGS.includes(t)) problems.push(`attribution_tags 里的 ${JSON.stringify(t)} 不在词表`);
-      }
-    }
+  if (labels.evidence !== undefined && !EVIDENCE_VALUES.includes(labels.evidence)) {
+    problems.push(`evidence 只能是 ${EVIDENCE_VALUES.join(" / ")}`);
   }
-  if (labels.attribution !== undefined) problems.push(...validateAttribution(labels.attribution, labels.needs_fix));
+  if (labels.findings !== undefined) problems.push(...validateFindings(labels.findings));
   if (labels.summary !== undefined && typeof labels.summary !== "string") problems.push("summary 必须是字符串");
-  const unknown = Object.keys(labels).filter((k) => !LABEL_SCHEMA.some((l) => l.label === k));
+  if (labels.summary !== undefined && typeof labels.summary === "string" && labels.summary.length > 600) {
+    problems.push(`summary 太长（${labels.summary.length} 字，上限 600）——总评三句以内，细节写进各条改进点`);
+  }
+  for (const k of ["finding_kinds", "fix_marks"]) {
+    if (labels[k] !== undefined) problems.push(`${k} 不由判题方写（finding_kinds 由 import 从 findings 算出；fix_marks 由 fix-mark.mjs 写）`);
+  }
+  for (const k of ["trustworthy", "needs_fix", "lucky_guess", "attribution_tags", "attribution"]) {
+    if (labels[k] !== undefined) problems.push(`${k} 是 2026-09-11 之前的旧词表——结论看 verdict，证据看 evidence，其余都是 findings 里一条条的改进点`);
+  }
+  const unknown = Object.keys(labels).filter((k) => !LABEL_SCHEMA.some((l) => l.label === k) && !["trustworthy", "needs_fix", "lucky_guess", "attribution_tags", "attribution"].includes(k));
   if (unknown.length) problems.push(`未知 label：${unknown.join(", ")}（词表见 §7.1）`);
   return problems;
 }
@@ -529,17 +553,19 @@ export function validateLabels(labels) {
 /**
  * 一行 labels → POST annotations 的条目。label id **只从 manifest 取**（PUT labels 不带原 id
  * 重发会把该队列已有的 annotation 级联删光——这是取证到的坑，所以 id 是包的一等资产）。
+ * `finding_kinds` 在这里从 findings 算出来一起发：判题方写的那份（如果有）被覆盖。
  */
 export function annotationPayload({ interactionId, labels, labelIds, annotator }) {
+  const withKinds = labels.findings !== undefined ? { ...labels, finding_kinds: deriveFindingKinds(labels.findings) } : labels;
   const out = [];
   for (const { label } of LABEL_SCHEMA) {
-    if (labels[label] === undefined) continue;
+    if (withKinds[label] === undefined) continue;
     const labelId = labelIds[label];
     if (!labelId) throw new Error(`manifest 里没有 label ${label} 的 id——包过期了，重跑 export`);
     out.push({
       interaction_id: interactionId,
       label_id: labelId,
-      value: labels[label],
+      value: withKinds[label],
       ...(annotator ? { annotator } : {}),
     });
   }

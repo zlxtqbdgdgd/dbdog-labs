@@ -213,5 +213,5 @@ console.error(`✓ probe.json → ${path.join(path.resolve(CASE), "probe.json")}
 console.error(`  腿一：符合 ${s.obtained_match} · 不符 ${s.obtained_mismatch} · 空/报错 ${s.empty_or_error} · 无工具 ${s.no_tool} · 未探 ${s.not_probed}`);
 if (WITH_DIRECT) {
   console.error(`  两腿：一致 ${s.consistent} · 疑似工具 bug ${s.tool_bug_suspect} · 都没有 ${s.data_absent} · 没跑腿二 ${s.total - s.consistent - s.tool_bug_suspect - s.data_absent}`);
-  if (s.tool_bug_suspect > 0) console.error("  ⚠ 有两腿不一致的证据——判题时 trustworthy 判 false 的硬证据就在这里");
+  if (s.tool_bug_suspect > 0) console.error("  ⚠ 有两腿不一致的证据——判题时「工具错」这一类改进点的硬证据就在这里");
 }

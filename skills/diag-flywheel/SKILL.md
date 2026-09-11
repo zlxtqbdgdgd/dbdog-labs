@@ -66,7 +66,7 @@ node $S/llmobs/judge-package-export.mjs --experiment <run 名或 uuid> --out ./p
 
 包是自包含的(判题方不能回头追问,所以材料一次给全):`manifest.json` + 判题 skill 正文 +
 每例的 `trace.json` / `forward.md`(正向假设树)/ `reverse.md` / `ground-truth.md` / `probe.json` /
-`prior-judgments.json`(这道题之前几轮提过的待修——判这一轮要逐条复验还没关的)。
+`prior-judgments.json`(这道题之前几轮提过的改进点与修复标记——判这一轮要逐条复验还没关的)。
 
 把 `./pkg` 交给一个强模型会话,让它按包里 `skill/SKILL.md` 判,产出 `annotations.jsonl` +
 `summary.md`,然后:
@@ -76,8 +76,16 @@ node $S/llmobs/judge-package-import.mjs --package ./pkg --annotator <判题模�
 ```
 
 `--annotator` 必填:两轮结论不一样时,得分得清是 agent 变了还是判题换了。
-待修要**一条一个落点**(`attribution.items`,带稳定 key),之前几轮提过的写复验(`attribution.checks`);
-一段话塞好几处改动的旧写法 import 会整包拒。
+判卷回答三件事:**结论对不对**(对 / 部分对 / 错 / 判不了)、**证据撑不撑得住**、**改进点一条一条**
+(`findings.items`,每条带稳定 key 与类别:工具错 / skill 错 / 模型抽风 / 编排错 / 题有问题 / 判不出要人看),
+之前几轮提过的写复验(`findings.checks`);一段话塞好几处改动、或 2026-09-11 之前的「可信 / 要修 / 蒙对」词表,import 会整包拒。
+
+修完一条改进点,先打标记再重跑验证(标记是声明,复验才是判决):
+
+```bash
+node $S/llmobs/fix-mark.mjs --trace <挖出它的 trace_id> --key <改进点 key> --status claimed_fixed --note "改了什么" --by <谁>
+# 改不动:--status needs_human --note "要人做什么";决定不修:--status wont_fix --note "为什么"
+```
 
 导入后 server 自动把批注投影成三处:批注原件、experiment 的分数、trace root 上的
 `evaluation.*` 标签。**判题方只交一次**。
@@ -88,9 +96,9 @@ node $S/llmobs/judge-package-import.mjs --package ./pkg --annotator <判题模�
 
 ### ④ 去控制台看
 
-- **用例集**:表头选轮次,「判题」列是那一轮判成什么、「历次」列一轮一格看走势;点开看这道题的**待修条目**——
-  修没修好只看后续轮次的复验,每条带「修这一条,重跑验证」的指令
-- **用例诊断日志**:每行带判题结果 chip 与所属轮次,可筛「只看未判 / 只看要修」
+- **用例集**:「历次」一次运行一行,「判题」同一行写那一次判成什么;点开看这道题的**改进点**——
+  每条带类别、状态(没修好 / 改了等复验 / 要人协助 / 不修 / 修好了),修没修好只看后续轮次的复验,能修的带「修这一条,重跑验证」的指令
+- **用例诊断日志**:每行带判题结果 chip 与所属轮次,可筛「只看未判 / 只看有 dbdog 要修的 / 只看要人看的」
 - **跑批页**:run 列表与对比
 
 ### ⑤ 改完重测,看变好还是变坏
@@ -112,8 +120,8 @@ node $S/llmobs/run-experiment.mjs --experiment blocking-b --parent blocking-a \
 node $S/llmobs/training-corpus-export.mjs --out ./corpus [--from ... --to ...]
 ```
 
-只收「可信 ✅ 且非蒙对」的 trace——不论结论对错,那都是模型 + prompt 行为的样本。
-被排除的理由会写进 manifest。
+只收「判过、证据撑得住、且没有工具错」的 trace——不论结论对错,那都是模型 + prompt 行为的样本。
+有工具错的要收就加 `--include-tool-errors`(打成 dbdog_gap)。被排除的理由会写进 manifest。
 
 ## 几个会踩的点
 

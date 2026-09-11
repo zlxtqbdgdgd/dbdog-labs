@@ -77,7 +77,7 @@ export function toolOutcome({ known, result, expect }) {
 
 /**
  * 两腿一致性。腿二没跑（没有 direct_query / 直查口不在 / 直查自己报错）一律 `not_probed`——
- * 「没查过」不许伪装成「一致」，否则 trustworthy 会被一堆没验过的证据顶成 true。
+ * 「没查过」不许伪装成「一致」，否则「没有工具错」会被一堆没验过的证据顶出来。
  */
 export function consistencyOf(toolLeg, directLeg) {
   if (!directLeg || directLeg.status !== "ok") return "not_probed";
