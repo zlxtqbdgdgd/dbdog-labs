@@ -1,6 +1,6 @@
 ---
 name: judge-run
-description: 判一轮诊断——捞出「跑过但没判过」的诊断，一例一个会话按 llm-obs-diag-judge 的口径判：结论对不对、证据撑不撑得住、改进点一条一条分六类；判完回流批注并把诊断表那行推到「待修」。在线是默认：有答案纸就从根因倒推该有哪些证据，逐条去活系统取到手。触发词：judge-run / 判题 / 判一轮 / 判诊断 / dbdog test loop N 的后半程。
+description: 判一轮诊断——捞出「跑过但没判过」的诊断，一例一个会话按 llm-obs-diag-judge 的口径判：结论对不对、证据撑不撑得住、改进点一条一条分六类；判完回流批注并把诊断表那行推到「待修」。在线是默认：有答案纸就从根因倒推该有哪些证据，逐条去活系统取到手。触发词：judge-run / 判题 / 判一轮 / 判诊断 / 判这批诊断。
 ---
 
 # judge-run —— 判「这次诊断做得对不对」，并挖出 dbdog 该修什么
@@ -48,7 +48,7 @@ node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--lim
 一例一个会话，不是一轮一个。早前按轮导过，三例材料叠起来 11 MB 塞进一个会话，
 40 分钟没判完，而且一例失败整轮都不回流。
 
-「dbdog test loop N」里的 N 传给 `--limit`。
+用户说「判 N 条」就把 N 传给 `--limit`。
 
 ## 看输出
 
@@ -66,4 +66,9 @@ node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--lim
 
 ## 定时
 
-`/loop 30m /judge-run`。跟 `diag-run` 错开跑：诊断在跑的时候判题捞不到东西，白起一个会话。
+`/loop 30m /judge-run`，在**自己的会话**里跑，跟 `diag-run` 那个会话各是各的
+（owner 2026-09-11 定：两条 loop 两个 session 分别触发）。
+
+⚠️ **把起跑时刻错开**——比如诊断整点、判题半点。两条同时跑有两个问题：
+本机多个 headless claude 进程并发会抢登录态（判题也是 claude 进程），
+而且诊断还没跑完时判题捞不到东西，白起一个会话。
