@@ -31,7 +31,7 @@ import { spawnScript } from "./lib/spawn-script.mjs";
 import { runAgentCli } from "../e2e/lib/agent-cli.mjs";
 import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { judgeSessionArgs, judgeMcpUrl } from "./lib/judge-session.mjs";
-import { DIAG_JUDGED, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, listDiagnoses } from "./lib/case-diag-client.mjs";
+import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, listDiagnoses } from "./lib/case-diag-client.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -44,6 +44,9 @@ const LIMIT = Number(argOf("--limit", "0"));
 const MODEL = argOf("--model", "");
 const TIMEOUT_MS = Number(argOf("--timeout-sec", "1800")) * 1000;
 const KEEP = has("--keep-package");
+// 推诊断表状态时报上的经手人（落进 status_changed_by，页面上「被谁改的」显的就是它）。
+// 与诊断那条 loop 的 --claimed-by 同一个形状：机器名带上，一台机器跑多条时看得出是哪条。
+const JUDGED_BY = argOf("--judged-by", `loop-judge@${os.hostname()}`);
 const DRY = has("--dry-run");
 if (!DATASET) fail("--dataset 必填");
 
@@ -69,13 +72,16 @@ const cases = needJudge.filter((r) => {
 const groups = LIMIT > 0 ? cases.slice(0, LIMIT) : cases;
 console.error(`待判 ${needJudge.length} 条，可判 ${cases.length} 条${LIMIT > 0 ? `，本轮取前 ${groups.length} 条` : ""}（一例一个会话）`);
 
-// 诊断表里「待判题」那批：按 trace_id 认人，判完把对应的行推到 judged。
+// 诊断表里「待判题 / 判题中」那批：按 trace_id 认人，开判前推到 judging，判完推到 judged。
 // 拿不到不阻断——判题的判据是差集，表只是进度展示（见文件头注）。
+//
+// **judging 也要捞回来**：判题进程被杀会把行留在 judging，而差集下一轮照样把这条算成待判
+//（批注没落库）。只捞 pending_judgement 的话，那一行会永远停在「判题中」没人再碰它。
 let diagByTrace = new Map();
 try {
-  const rows = await listDiagnoses({ statuses: [DIAG_PENDING_JUDGEMENT], limit: 1000 });
+  const rows = await listDiagnoses({ statuses: [DIAG_PENDING_JUDGEMENT, DIAG_JUDGING], limit: 1000 });
   diagByTrace = new Map(rows.filter((d) => d.trace_id).map((d) => [d.trace_id, d]));
-  console.error(`· 诊断表里待判题 ${rows.length} 条`);
+  console.error(`· 诊断表里待判题 / 判题中 ${rows.length} 条`);
 } catch (e) {
   console.error(`⚠ 读诊断表失败，本轮只判题不推进度：${e.message || e}`);
 }
@@ -125,6 +131,21 @@ for (const c of groups) {
 
     if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); okN++; continue; }   // dry-run 的包一律留着看
 
+    // 开判前先把诊断表那行推到「判题中」。这一步**同时是互斥**：advance 带 from 断言，
+    // 两轮 loop 同时打进来只有一轮改得动，后到的那轮拿到 409（下面的 row 为 null）。
+    // 改不动不跳过这一例：判题的判据是差集，行已经在 judging 多半是上一轮被杀留下的，
+    // 那条仍然没有批注、仍然该判。这里只是不再重复推一次状态。
+    const diag = diagByTrace.get(c.traceId);
+    if (diag && diag.status === DIAG_PENDING_JUDGEMENT) {
+      try {
+        const row = await advanceDiagnosis({ id: diag.id, from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING, by: JUDGED_BY });
+        if (row) diag.status = DIAG_JUDGING;
+        else console.error(`· ${diag.case_source} 已不在待判题（多半另一轮先领走了），本轮照判但不改它的状态`);
+      } catch (e) {
+        console.error(`⚠ ${diag.case_source} 推「判题中」失败（不影响判题）：${e.message || e}`);
+      }
+    }
+
     console.error(`⚖ 判题会话开跑（包在 ${pkg}）…`);
     let prose = "";
     try {
@@ -151,14 +172,13 @@ for (const c of groups) {
     if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); failN++; continue; }
     okN++; thisOk = true;
 
-    // 批注回流成功之后才推进度：顺序反过来的话，页面会先显示「已判」而批注还没写进去，
+    // 批注回流成功之后才推「已判」：顺序反过来的话，页面会先显示「已判」而批注还没写进去，
     // 中间那段时间里点开看是空的。推进度失败不算判题失败——批注已经落库了，
-    // 页面上那一行停在「待判题」只是显示滞后，下一轮还会再推一次。
-    const diag = diagByTrace.get(c.traceId);
+    // 页面上那一行停在「判题中」只是显示滞后，下一轮还会再推一次。
     if (diag) {
       try {
-        const row = await advanceDiagnosis({ id: diag.id, from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGED });
-        if (!row) console.error(`· ${diag.case_source} 已不在待判题（多半是重判），不改它的状态`);
+        const row = await advanceDiagnosis({ id: diag.id, from: diag.status, to: DIAG_JUDGED, by: JUDGED_BY });
+        if (!row) console.error(`· ${diag.case_source} 已不在 ${diag.status}（多半是重判），不改它的状态`);
       } catch (e) {
         console.error(`⚠ ${diag.case_source} 推进度失败（批注已回流，不影响判题结果）：${e.message || e}`);
       }

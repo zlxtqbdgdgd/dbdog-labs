@@ -92,7 +92,7 @@ if (claimed.length) {
       foreign++;
       // 放回去，别攥着别的集合的活。放不回去也只是等租约，不阻断本轮。
       try {
-        await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING });
+        await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING, by: CLAIMED_BY });
       } catch { /* 等租约回收 */ }
     }
     claimed = keep;
@@ -168,7 +168,7 @@ for (const [recordId, diag] of diagByRecord) {
   const traceId = traceOf.get(recordId) || "";
   const to = traceId ? DIAG_PENDING_JUDGEMENT : DIAG_PENDING;
   try {
-    const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId });
+    const row = await advanceDiagnosis({ id: diag.id, from: DIAG_DIAGNOSING, to, traceId, by: CLAIMED_BY });
     if (!row) {
       // 409：这条已经不在 diagnosing 了（租约被回收后别人重跑过）。本轮放弃它，不是错。
       console.error(`· ${diag.case_source} 的租约已易主，本轮不改它的状态`);

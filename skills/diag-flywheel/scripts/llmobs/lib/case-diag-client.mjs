@@ -1,9 +1,12 @@
 // case-diag-client.mjs —— 用例诊断表的客户端（server 蓝图 pg/0025 · ADR-0049 偏离 #21）。
 //
 // **一行 = 一次复现**，不是一条用例。同一道题复现 N 次就有 N 行，各自诊断、各自判题。
-// 行由复现回执创建（另一个系统复现完把窗口推给 server），四态按顺序流转：
+// 行由复现回执创建（另一个系统复现完把窗口推给 server），五态按顺序流转：
 //
-//   pending_diagnosis → diagnosing → pending_judgement → judged
+//   pending_diagnosis → diagnosing → pending_judgement → judging → judged
+//
+// judging 是 2026-09-11 owner 看页面时补的（蓝图 0026）：判题与诊断同构，也是按周期醒的
+// loop、单条判题也会跑过一轮的间隔，没有这一档就分不出「还没轮到」和「正在判」。
 //
 // ## 为什么两条 loop 要改成抢这张表，而不是继续「每轮现算差集」
 //
@@ -18,10 +21,11 @@
 // 自己再拼一份就是第二个真相源，key 的取法一改就会漏掉这里（军规 3）。
 import { baseUrl, authHeaders } from "./exp-client.mjs";
 
-/** 四态，与 server 的 domain 常量同一份口径（值是线缆原文）。 */
+/** 五态，与 server 的 domain 常量同一份口径（值是线缆原文）。 */
 export const DIAG_PENDING = "pending_diagnosis";
 export const DIAG_DIAGNOSING = "diagnosing";
 export const DIAG_PENDING_JUDGEMENT = "pending_judgement";
+export const DIAG_JUDGING = "judging";
 export const DIAG_JUDGED = "judged";
 
 const path = (p) => `${baseUrl().replace(/\/+$/, "")}/api/v1/llm-obs/case-diagnoses${p}`;
@@ -51,9 +55,13 @@ async function call(url, init) {
  * 抢走（两个进程同时诊断同一条），给大了卡住的行要等更久才被捞回来，所以按
  * **诊断超时 × 2** 取，留一倍余量给收尾与上报。
  */
-export async function claimDiagnosis({ claimedBy, staleAfterSec }) {
+export async function claimDiagnosis({ claimedBy, staleAfterSec, from, to }) {
   const body = { claimed_by: claimedBy };
   if (staleAfterSec > 0) body.stale_after_sec = staleAfterSec;
+  // from/to 留空 = 诊断那一档（pending_diagnosis → diagnosing）。判题那条 loop 传
+  // pending_judgement → judging 走同一条抢占；租约回收捞的也是 to 态，两边对称。
+  if (from) body.from = from;
+  if (to) body.to = to;
   const out = await call(path("/claim"), { method: "POST", body: JSON.stringify(body) });
   return out?.data ?? null;
 }
@@ -65,9 +73,12 @@ export async function claimDiagnosis({ claimedBy, staleAfterSec }) {
  * 没有这个断言，一条被租约回收后重新诊断的行，会被上一个已经死掉的进程改成 pending_judgement
  * ——一次没跑完的诊断就这样被当成跑完了。所以**吞掉 409 不算错**，它正是断言在生效：
  * 本轮放弃这一条就好，下轮重抢。
+ *
+ * `by` 是经手人，**server 侧必填**（蓝图 0026）：落进 status_changed_by，页面上「这一步被谁
+ * 推的」显的就是它。传 loop 实例名（与 claimed_by 同一个串），不传会被 400 挡回来。
  */
-export async function advanceDiagnosis({ id, from, to, traceId }) {
-  const body = { from, to };
+export async function advanceDiagnosis({ id, from, to, traceId, by }) {
+  const body = { from, to, by };
   if (traceId) body.trace_id = traceId;
   try {
     const out = await call(path(`/${encodeURIComponent(id)}/advance`), { method: "POST", body: JSON.stringify(body) });

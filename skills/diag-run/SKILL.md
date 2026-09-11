@@ -1,6 +1,6 @@
 ---
 name: diag-run
-description: 跑 N 轮盲诊断——从 dbdog 诊断表领走「待诊断」的复现（一次复现一行），逐条起 headless 会话在被测源码树里盲定位，跑完推到「待判题」交给判题那条 loop（judge-run，在另一个会话里跑）。领到手即占住租约，别的轮次看不见，所以同一次复现不会被诊断两遍。触发词：dbdog test loop N / diag-run / 跑诊断 / 诊断一轮 / 领诊断。
+description: 跑 N 轮盲诊断——从 dbdog 诊断表领走「待诊断」的复现（一次复现一行），逐条起 headless 会话在被测源码树里盲定位，跑完推到「待判题」交给判题那条 loop（judge-run，在另一个会话里跑，它再把行推「判题中 → 已判」）。领到手即占住租约，别的轮次看不见，所以同一次复现不会被诊断两遍。触发词：dbdog test loop N / diag-run / 跑诊断 / 诊断一轮 / 领诊断。
 ---
 
 # diag-run —— 领一批待诊断的复现，跑成 trace
