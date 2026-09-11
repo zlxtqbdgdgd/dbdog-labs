@@ -1,36 +1,43 @@
 ---
 name: diag-run
-description: 跑一轮盲诊断——从 dbdog 的诊断表领走「待诊断」的复现（一次复现一行），逐条起 headless 会话在被测源码树里盲定位，跑完把状态推到「待判题」。领到手即占住租约，别的轮次看不见，所以同一次复现不会被诊断两遍。配合 /loop 做定时：`/loop 30m /diag-run`。触发词：diag-run / 跑诊断 / 诊断一轮 / 领诊断 / loop 诊断。
+description: 跑 N 轮盲诊断——从 dbdog 诊断表领走「待诊断」的复现（一次复现一行），逐条起 headless 会话在被测源码树里盲定位，跑完推到「待判题」并接着判。领到手即占住租约，别的轮次看不见，所以同一次复现不会被诊断两遍。触发词：dbdog test loop N / diag-run / 跑诊断 / 诊断一轮 / 领诊断 / 触发诊断和判题。
 ---
 
-# diag-run —— 领一批待诊断的复现，跑完交给判题
+# diag-run —— 领一批待诊断的复现跑完，接着判
 
-这是诊断飞轮的第二棒。第一棒是**复现**（另一个系统做，跑完把时间窗推给 dbdog，
-一次复现在诊断表里落一行）；你这一棒是**把复现变成 trace**；第三棒 `diag-judge` 判它。
+诊断飞轮的第二棒。第一棒是**复现**（dbdog-benchmark 做，跑完把时间窗推给 dbdog，
+一次复现在诊断表里落一行）；你这一棒把复现变成 trace；第三棒 `judge-run` 判它。
+
+## 口令
+
+**「dbdog test loop N」= 跑 N 条**：领最多 N 条待诊断的复现，跑完，再接着判。
+N 缺省是 5。用户说「dbdog test loop 3」就是 `--max-per-round 3`。
+
+要反复跑就 `/loop 30m /diag-run`——**不要自己装 launchd / cron**，那要改用户机器的开机项，
+还得按平台分两套，而且它会自己起来烧 token。
 
 ## 为什么是「领」不是「算」
 
 此前待跑集合是每轮现算的差集「有复现、没 trace」。**那个算法没有在途这一档**：
-一轮跑 30 分钟间隔而单条诊断可能跑 40 分钟，两轮必然重叠——第一轮还在跑，第二轮去算差集，
+一轮间隔 30 分钟而单条诊断可能跑 40 分钟，两轮必然重叠——第一轮还在跑，第二轮去算差集，
 那条还没有 trace，于是被当成待跑又发一遍。同一次复现诊断两遍，烧两份预算，
 还在判题队列里留下两条互相矛盾的轨迹。
 
-现在改成抢诊断表：抢的动作在服务端是单条带行锁的 UPDATE，抢到即占住租约，别人看不见。
+改成抢诊断表之后，抢的动作在服务端是单条带行锁的 UPDATE，抢到即占住租约，别人看不见。
 
-## 开跑前先确认这五样
+## 开跑前确认这几样
 
 缺任何一样都**不要跑**——宁可这一轮不跑，也不要跑出一轮盲测失效的数据。
-缺了就问用户要，拿到后写进 `~/.claude/settings.json` 的 `env` 块（那是 key 的单一来源，
-别在别处存副本）。
+缺了就问用户要，拿到后写进 `~/.claude/settings.json` 的 `env` 块（那是 key 的单一来源）。
 
-| 变量 | 是什么 | 拿不到就问用户 |
-|---|---|---|
-| `DBDOG_BASE_URL` | dbdog server 的地址 | 「你们 dbdog server 的地址是？」 |
-| `DBDOG_API_KEY` | 控制台 `/settings/api-keys` 签发；与 hooks 上报用的是同一把，已配 `DBDOG_OBS_API_KEY` 就复用那个值 | 「API key 有吗，没有去控制台签一把」 |
-| `DBDOG_MCP_URL` | 诊断会话连的 MCP 地址，带 toolsets/skillsets 查询串 | 「MCP 地址是？」 |
-| `DBDOG_MCP_BEARER` | 连 MCP 的 bearer | 「MCP 的 bearer 在哪？」 |
-| `DIAG_WORKDIR` | **被诊断的那棵源码树**，会话的 cwd。agent 在这里 grep/read 内核源码 | 「被测的源码树 clone 在哪？要对得上被复现的那个版本」 |
-| `DENY_ROOT`（可多个） | **禁读根**，见下 | 见下，这个必须问清楚 |
+| 变量 | 是什么 |
+|---|---|
+| `DBDOG_BASE_URL` | dbdog server 地址 |
+| `DBDOG_API_KEY` | 控制台 `/settings/api-keys` 签发；已配 `DBDOG_OBS_API_KEY` 就复用那个值 |
+| `DBDOG_MCP_URL` | 诊断会话连的 MCP 地址，带 toolsets/skillsets 查询串 |
+| `DBDOG_MCP_BEARER` | 连 MCP 的 bearer。**用 bearer 不走 OAuth，所以远端 http 地址可以直连**，不用回环反代 |
+| `DIAG_WORKDIR` | **被诊断的那棵源码树**，会话的 cwd，要对得上被复现的那个版本 |
+| `DENY_ROOT`（可多个） | **禁读根**，见下 |
 
 ### 禁读根是什么，为什么不能省
 
@@ -42,34 +49,31 @@ description: 跑一轮盲诊断——从 dbdog 的诊断表领走「待诊断」
 所以要问用户：**哪些目录放着这道题的答案**。典型是语料库/issue 镜像、历史报告目录、
 整个产品源码仓。宁可多圈几个——圈错了最多让 agent 少看一点，圈漏了整轮评测作废。
 
-护栏是两层，脚本会自动装：`permissions.deny` 挡工具面（每个根三条，Read/Grep/Glob 各有
-自己的 path 参数），PreToolUse 钩子挡 Bash 的 `cat`/`grep`/`head`——那条路 deny 一个字节都不挡。
+护栏两层，脚本自动装，不用你操心：`permissions.deny` 挡工具面（每个根三条，
+Read/Grep/Glob 各有自己的 path 参数），PreToolUse 钩子挡 Bash 的 `cat`/`grep`/`head`
+——那条路 deny 一个字节都不挡。
 
 ## 跑
 
 ```bash
-S=<本 skill 同级的 diag-flywheel/scripts 目录>   # 你知道自己的 skill 装在哪
+S=<diag-flywheel/scripts 目录>   # 你知道自己的 skill 装在哪
 node $S/llmobs/loop-diagnose.mjs \
   --dataset <用例集名> \
   --workdir "$DIAG_WORKDIR" \
   --deny-root "$DENY_ROOT_1" [--deny-root "$DENY_ROOT_2" ...] \
   --timeout-sec 2400 \
-  --max-per-round 5
+  --max-per-round <N>
 ```
 
-`--max-per-round` 是这一轮最多领几条。领多了进程被杀时它们会卡在「诊断中」，
-要等租约超时才被捞回来；租约默认是 `--timeout-sec` 的两倍。
+跑完**接着调 `judge-run`**——「dbdog test loop N」要的是诊断加判题一整趟。
+队列里没有待判的就跳过，别为此起一个空会话。
 
 ## 看输出
 
 - `队列：待诊断 N 条 · 诊断中 M 条` —— 每轮都印。**M 长期不降说明有行卡住了**，
-  多半是进程被杀，等租约回收或去查。
-- `本轮无事` —— 没有待诊断的复现。这是常态，不是错。
-- `状态推进：X 条 → 待判题，Y 条没拿到 trace 已放回待诊断` —— Y 不为 0 要看一眼，
-  那些下一轮会重试。**一条每次都失败的用例会一直重试**，队列数字会暴露它。
+  多半是进程被杀，等租约回收（默认是 `--timeout-sec` 的两倍）。
+- `本轮无事` —— 没有待诊断的复现。常态，不是错。
+- `状态推进：X 条 → 待判题，Y 条没拿到 trace 已放回待诊断` —— Y 不为 0 要看一眼。
+  **一条每次都失败的用例会一直重试**，队列数字会暴露它。
 
-跑完告诉用户：领了几条、几条成了、队列还剩多少。别复述整段日志。
-
-## 定时
-
-不要自己装 launchd / cron。用 `/loop 30m /diag-run`——跨平台、随时能停、日志在会话里。
+跑完告诉用户：领了几条、几条出了 trace、队列还剩多少、接着判的结果。别复述整段日志。
