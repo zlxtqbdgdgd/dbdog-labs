@@ -255,11 +255,19 @@ export function parseChainResponse(text, m) {
     if (relation === "root" && parent !== null) throw new Error(`编号 ${id} relation=root 却有 semantic_parent ${parent}`);
     if (relation !== "root" && parent === null) throw new Error(`编号 ${id} relation=${relation} 却没有 semantic_parent`);
     const d = declaredById.get(id);
+    // 「与现象并列」「与现象同一 claim」不成立：现象是根，根因只能解释它。模型这么写时归一成 explains 并留原词（8252 第二轮实测）。
+    let rel = relation;
+    let normalizedFrom = null;
+    if (parent !== null && (relation === "alternative" || relation === "same_as") && isSymptomType(declaredById.get(parent).type)) {
+      rel = "explains";
+      normalizedFrom = relation;
+    }
     nodes.push({
       id,
       claim: d.claim,
       semantic_parent: parent,
-      relation,
+      relation: rel,
+      ...(normalizedFrom ? { normalized_from: normalizedFrom } : {}),
       claim_drift: Boolean(rn.claim_drift),
       drift_note: rn.claim_drift && rn.drift_note ? String(rn.drift_note) : null,
       declared_parent: d.parent ?? null,
@@ -279,13 +287,19 @@ export function parseChainResponse(text, m) {
   if (finalNode !== null && !declaredById.has(finalNode)) throw new Error(`final_mechanism_node ${finalNode} 不在声明树里`);
 
   const conflicts = [];
+  const symptomConflicts = new Map(); // 现象编号 → 证实了的根因们（现象证伪却有根因在解释它）
   for (const n of nodes) {
     if (!DEEPENS.has(n.relation)) continue;
     const p = byId.get(n.semantic_parent);
-    if (p.declared_verdict === "falsified" && n.declared_verdict === "confirmed") {
+    if (p.declared_verdict !== "falsified" || n.declared_verdict !== "confirmed") continue;
+    if (p.is_symptom) {
+      if (!symptomConflicts.has(p.id)) symptomConflicts.set(p.id, []);
+      symptomConflicts.get(p.id).push(n.id);
+    } else {
       conflicts.push({ kind: "parent_refuted_child_supported", parent: p.id, child: n.id });
     }
   }
+  for (const [symptom, causes] of symptomConflicts) conflicts.push({ kind: "symptom_refuted_cause_supported", symptom, causes });
   if (finalNode && byId.get(finalNode).declared_verdict === "falsified") {
     conflicts.push({ kind: "final_mechanism_refuted", node: finalNode });
   }
@@ -329,6 +343,7 @@ export function renderChain(c, m) {
       const pad = "  ".repeat(depth);
       const flags = [];
       if (n.relation !== "root" && n.relation !== "explains") flags.push(`${RELATION_ZH[n.relation]} [${n.semantic_parent}]`);
+      if (n.normalized_from) flags.push(`模型原写 ${n.normalized_from}，已按「现象是根」归一`);
       if (n.claim_drift) flags.push(`claim 漂移${n.drift_note ? `：${clip(n.drift_note, 80)}` : ""}`);
       if (n.is_symptom) flags.push("现象，根");
       if (c.final_mechanism_node === n.id) flags.push("最终机制");
@@ -343,6 +358,7 @@ export function renderChain(c, m) {
   if (!c.conflicts.length) lines.push("（没有：语义父子之间的声明判定不打架）");
   for (const x of c.conflicts) {
     if (x.kind === "parent_refuted_child_supported") lines.push(`- [${x.parent}] 被判证伪，而解释它的 [${x.child}] 被判证实——父桶证伪、桶里的具体机制证实，账本自相矛盾`);
+    else if (x.kind === "symptom_refuted_cause_supported") lines.push(`- 现象确认 [${x.symptom}] 被判证伪，却有根因 ${x.causes.map((c) => `[${c}]`).join("、")} 被判证实在解释它——现象没立住就有了成立的原因，要么现象的写法错了，要么根因证实得太早`);
     else if (x.kind === "final_mechanism_refuted") lines.push(`- 报告最终机制落在 [${x.node}]，账本却把它判成证伪`);
   }
   lines.push("");

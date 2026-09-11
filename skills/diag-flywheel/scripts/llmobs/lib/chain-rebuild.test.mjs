@@ -195,6 +195,51 @@ describe("parseChainResponse：粗→细与现象根的深度口径", () => {
   });
 });
 
+describe("parseChainResponse：现象节点当父时的两条归一（8252 第二轮实测）", () => {
+  const m8252 = () => chainMaterials(fixture("og-8252-vector-tag-filter").spans);
+
+  it("alternative / same_as 的父是现象节点 → 归一成 explains（「与现象并列」不成立），并记下原词", () => {
+    const c = parseChainResponse(
+      JSON.stringify({
+        nodes: [
+          { id: "H0", semantic_parent: null, relation: "root", claim_drift: false },
+          { id: "H1", semantic_parent: "H0", relation: "alternative", claim_drift: false },
+          { id: "H2", semantic_parent: "H0", relation: "explains", claim_drift: false },
+          { id: "H3", semantic_parent: "H2", relation: "explains", claim_drift: false },
+        ],
+        final_mechanism_node: "H2",
+        notes: "",
+      }),
+      m8252(),
+    );
+    const h1 = c.nodes.find((n) => n.id === "H1");
+    expect(h1.relation).toBe("explains");
+    expect(h1.normalized_from).toBe("alternative");
+    const md = renderChain(c, m8252());
+    expect(md).toMatch(/^  - \*\*\[H1\]\*\*/m);
+  });
+
+  it("现象确认被判证伪、解释它的根因却被判证实 → 单独一类冲突，措辞不叫「父桶」", () => {
+    const c = parseChainResponse(
+      JSON.stringify({
+        nodes: [
+          { id: "H0", semantic_parent: null, relation: "root", claim_drift: false },
+          { id: "H1", semantic_parent: "H0", relation: "explains", claim_drift: false },
+          { id: "H2", semantic_parent: "H0", relation: "explains", claim_drift: false },
+          { id: "H3", semantic_parent: "H2", relation: "explains", claim_drift: false },
+        ],
+        final_mechanism_node: "H2",
+        notes: "",
+      }),
+      m8252(),
+    );
+    expect(c.conflicts).toEqual([{ kind: "symptom_refuted_cause_supported", symptom: "H0", causes: ["H2"] }]);
+    const md = renderChain(c, m8252());
+    expect(md).toMatch(/现象确认.*证伪.*H2.*证实|H0.*证伪.*H2.*证实/);
+    expect(md).not.toMatch(/父桶证伪.*H2/);
+  });
+});
+
 describe("buildChainPrompt：口径要写给模型", () => {
   it("提示词讲清 refines（粗桶→具体机制）与 explains 的区别，并说明判定不影响谱系", () => {
     const p = buildChainPrompt(chainMaterials(fixture("og-7458-lob-insert").spans));
