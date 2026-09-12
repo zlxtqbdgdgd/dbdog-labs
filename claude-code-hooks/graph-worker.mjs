@@ -15,6 +15,7 @@ import { obsDir, readState, reportSpans, run, scanSpans } from "./lib.mjs";
 import { build, compactGraph, dedupe, writeGraph } from "./hypothesis-graph.mjs";
 import { sourceEvidenceCandidates } from "./source-evidence.mjs";
 import { buildSourceEvidencePrompt, parseSourceEvidenceReply } from "./source-evidence-prompt.mjs";
+import { mapWithBudget } from "./budget.mjs";
 import { generateSummary, summaryEnv } from "./summary.mjs";
 
 function logNote(sessionId, msg) {
@@ -33,7 +34,11 @@ export function graphDir(traceId) {
  * 代码证据：正则粗筛 → 模型切分（source-evidence.mjs / source-evidence-prompt.mjs）。
  * **best-effort**：没配模型 env、或某一条判不出来，就少一条代码证据，图照出。
  * 复用 summaryEnv()——跟诊断总结同一把 key，不额外要配置。
- * 一条 trace 的候选平均 4.9K 字符（27 条历史 trace 实测），逐个 Agent 回参各发一次。
+ * 一条 trace 的候选平均 4.9K 字符（27 条历史 trace 实测），逐个回参各发一次。
+ *
+ * 调度走 budget.mjs：并发上限压墙钟 + 整体截止时间兜底。原来是串行 await 且整张图要等这步
+ * 跑完才落盘，模型一慢就连**不需要模型的工具边**一起看不见；现在到点即收，拿到几条算几条。
+ * 单次请求的超时压成「当下剩余预算」与 summary.mjs 自己那 30s 里的小值——不让一条吃光整份。
  */
 async function collectSourceEvidence(spans, note) {
   const cands = sourceEvidenceCandidates(spans);
@@ -43,27 +48,44 @@ async function collectSourceEvidence(spans, note) {
     note(`代码证据：${cands.length} 条候选，但没配模型 env（DBDOG_SUMMARY_LLM_* / ANTHROPIC_*），跳过`);
     return { sourceEvidence: {}, sourceVerdict: {}, tried: 0, got: 0 };
   }
+  const budgetMs = Number(process.env.DBDOG_SOURCE_EVIDENCE_BUDGET_MS) || 90_000;
+  const concurrency = Number(process.env.DBDOG_SOURCE_EVIDENCE_CONCURRENCY) || 3;
+  const { results, failed, skipped } = await mapWithBudget(
+    cands,
+    async (c, { remainingMs }) => {
+      const prompt = buildSourceEvidencePrompt(c);
+      if (!prompt) return null;
+      try {
+        const reply = await generateSummary([{ role: "user", content: prompt }], {
+          ...env,
+          maxTokens: 1500,
+          timeoutMs: Math.min(env.timeoutMs ?? remainingMs, remainingMs),
+        });
+        return parseSourceEvidenceReply(reply?.text ?? reply);
+      } catch (err) {
+        note(`代码证据：span ${c.spanId} 判切分失败（${err?.message ?? err}）`);
+        throw err;
+      }
+    },
+    { concurrency, budgetMs },
+  );
+  if (skipped) note(`代码证据：预算 ${budgetMs}ms 用尽，${skipped} 条候选没轮上（并发 ${concurrency}）`);
+
+  // 合并按候选原序做，别在并发回调里就地 push——否则同一假设名下的证据步顺序随网络抖动变。
   const sourceEvidence = {};
   const sourceVerdict = {};
   let got = 0;
-  for (const c of cands) {
-    const prompt = buildSourceEvidencePrompt(c);
-    if (!prompt) continue;
-    try {
-      const reply = await generateSummary([{ role: "user", content: prompt }], { ...env, maxTokens: 1500 });
-      const parsed = parseSourceEvidenceReply(reply?.text ?? reply);
-      if (!parsed) continue;
-      if (parsed.steps.length) {
-        sourceEvidence[parsed.id] = [...(sourceEvidence[parsed.id] ?? []), ...parsed.steps];
-        got += parsed.steps.length;
-      }
-      // 裁决取粗筛的正则结果（c.verdict），不取模型的——见 source-evidence.mjs 文件头
-      if (c.verdict && !sourceVerdict[parsed.id]) sourceVerdict[parsed.id] = c.verdict;
-    } catch (err) {
-      note(`代码证据：span ${c.spanId} 判切分失败（${err?.message ?? err}）`);
+  results.forEach((parsed, i) => {
+    if (!parsed) return;
+    if (parsed.steps.length) {
+      sourceEvidence[parsed.id] = [...(sourceEvidence[parsed.id] ?? []), ...parsed.steps];
+      got += parsed.steps.length;
     }
-  }
-  return { sourceEvidence, sourceVerdict, tried: cands.length, got };
+    // 裁决取粗筛的正则结果（c.verdict），不取模型的——见 source-evidence.mjs 文件头
+    const v = cands[i].verdict;
+    if (v && !sourceVerdict[parsed.id]) sourceVerdict[parsed.id] = v;
+  });
+  return { sourceEvidence, sourceVerdict, tried: cands.length, got, failed, skipped };
 }
 
 /** root = kind=agent 且无 parent；多条取最后一版（dedupe 已按后写赢）。 */
@@ -86,7 +108,7 @@ run(async () => {
     const ev = await collectSourceEvidence(spans, (m) => logNote(sessionId, `trace=${state.trace_id} ${m}`));
     const opts = { sourceEvidence: ev.sourceEvidence, sourceVerdict: ev.sourceVerdict };
     const { summary: s } = writeGraph(spans, graphDir(state.trace_id), { trace: state.trace_id, session: sessionId }, opts);
-    logNote(sessionId, `trace=${state.trace_id} 假设 ${s.hypotheses} 工具边 ${s.tool_edges} 代码证据边 ${s.source_edges}（候选 ${ev.tried} 条回参）未挂 ${s.unattached_tools} 源码假设 ${s.source_hypotheses}/无现场证据 ${s.source_without_evidence}`);
+    logNote(sessionId, `trace=${state.trace_id} 假设 ${s.hypotheses} 工具边 ${s.tool_edges} 代码证据边 ${s.source_edges}（候选 ${ev.tried} 条回参${ev.failed ? `，判切分失败 ${ev.failed}` : ""}${ev.skipped ? `，超预算未跑 ${ev.skipped}` : ""}）未挂 ${s.unattached_tools} 源码假设 ${s.source_hypotheses}/无现场证据 ${s.source_without_evidence}`);
 
     // ② 紧凑图挂 root 重发（server 存 root 行的 graph 列）
     const root = rootOf(spans, state.root_span_id);

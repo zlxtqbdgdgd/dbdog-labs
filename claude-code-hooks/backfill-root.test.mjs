@@ -2,7 +2,7 @@
 // 回刷用本地 root 当推送载体，同键重发把服务端侧 tag（evaluation.verdict /
 // mcp_version / skills_digest）全抹了，46 条 root 的判题裁决一次归零。
 import { describe, expect, it } from "vitest";
-import { isServerSideTag, rootForBackfill, serverTagDiff, withIngestTs } from "./backfill-root.mjs";
+import { isServerSideTag, rootForBackfill, serverTagDiff, withIngestTs, remoteReason } from "./backfill-root.mjs";
 
 const remote = {
   trace_id: "aa", span_id: "r1", kind: "agent", ts: "2026-09-11T11:53:51.112Z",
@@ -87,5 +87,19 @@ describe("serverTagDiff 也守正文字段", () => {
   it("服务端那份本来就空的字段不算破坏", () => {
     const out = rootForBackfill(remote, {});
     expect(serverTagDiff(remote, out)).toEqual([]);
+  });
+});
+
+// 回刷把「拉服务端 root」提到了最前面当过滤器用（2026-09-12），于是必须分清三件事：
+// 服务端确实没有（404，跳过是对的）／取不到（连不上、5xx，**这条要重跑**）／拿到了。
+// 压成同一个 null 的话，服务端抖一下就会让那段时间的 trace 全被静默丢掉，跑完还报成功。
+describe("remoteReason", () => {
+  it("404 是「没有」，连不上和 5xx 是「取不到」，两者不能混", () => {
+    expect(remoteReason(null)).toBe("unreachable"); // fetch 直接抛（隧道断/服务没起）
+    expect(remoteReason({ ok: false, status: 404 })).toBe("absent");
+    expect(remoteReason({ ok: false, status: 502 })).toBe("unreachable");
+    expect(remoteReason({ ok: false, status: 500 })).toBe("unreachable");
+    expect(remoteReason({ ok: false, status: 401 })).toBe("unreachable"); // 鉴权错也不是「没有」
+    expect(remoteReason({ ok: true, status: 200 })).toBe("ok");
   });
 });
