@@ -223,6 +223,13 @@ for (const summary of events) {
       ? expected.expected_roots.map((r) => String(r))
       : null)
     : [];
+  // 还没做「根因 / 修复分离」的题：根因数组里混着 `【根因】`『【修复】』这类小标题、PR 链接、
+  // 整段 diff（2026-09-11 扫全集：141 条里 80 条不是根因）。混装时按集合算命中没有意义——
+  // 判官只能把小标题也标成命中。报出来，别让判题方以为这就是一份干净的答案纸。
+  const mixed = (expectedRoots ?? []).filter((r) => /^【[^】]{1,8}】|^(PR|pr|issue|Issue)\s*#?\s*\d|^(---|\+\+\+|@@|diff --git)|^[+-]\s/.test(String(r).trim()));
+  if (mixed.length) {
+    missing.push(`答案纸还没做「根因 / 修复分离」：${expectedRoots.length} 条里 ${mixed.length} 条是小标题 / PR 链接 / diff 行，按集合算命中会虚高（控制台用例页编辑一次即分开）`);
+  }
   if (expectedRoots === null) {
     missing.push("expected_roots（答案纸有正文但没有结构化根因：本例不核根因集合，judge 照文字判，并提一条 case 让建用例那步补上）");
   }

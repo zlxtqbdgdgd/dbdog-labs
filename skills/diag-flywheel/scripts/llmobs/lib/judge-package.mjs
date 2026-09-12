@@ -348,6 +348,11 @@ export function renderGroundTruth(expected, { eventId = "" } = {}) {
     // 用无序列表他得自己数，数错就是整包拒。
     lines.push("## 期望根因", "", ...e.expected_roots.map((r, i) => `${i + 1}. ${r}`), "");
   }
+  // 修复**单独一段**（owner 2026-09-11 定）：判题只拿「期望根因」那一组算命中，修复是给人复核用的。
+  // 混在根因里时，判官面对 PR 链接只有两个选择——标成命中（分数虚高）或标成没命中（把对的诊断判成 partial）。
+  if (Array.isArray(e.expected_fix) && e.expected_fix.length) {
+    lines.push("## 修复（不参与判分）", "", ...e.expected_fix.map((r) => `- ${r}`), "");
+  }
   if (Array.isArray(e.expected_phenomena) && e.expected_phenomena.length) {
     lines.push("## 期望现象", "", ...e.expected_phenomena.map((r) => `- ${r}`), "");
   }
@@ -355,7 +360,7 @@ export function renderGroundTruth(expected, { eventId = "" } = {}) {
     lines.push("## 行为基准", "", ...e.expected_behaviors.map((r) => `- ${r}`), "");
   }
   if (e.notes) lines.push("## 附注", "", String(e.notes), "");
-  const known = new Set(["expected_roots", "expected_phenomena", "expected_behaviors", "notes"]);
+  const known = new Set(["expected_roots", "expected_fix", "expected_phenomena", "expected_behaviors", "notes"]);
   const rest = Object.fromEntries(Object.entries(e).filter(([k]) => !known.has(k)));
   if (Object.keys(rest).length) lines.push("## 其余字段（原样）", "", "```json", JSON.stringify(rest, null, 1), "```", "");
   return `${lines.join("\n")}\n`;
