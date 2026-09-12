@@ -107,9 +107,10 @@ const JUDGE_PROMPT = `本目录是一个**自包含判题包**。请：
 2. 逐个读 \`cases/<event_id>/\` 下的材料判分。每例的材料可能有：
    - \`forward.md\`  正向假设树（agent 实际提了哪些假设、各拿什么证据、怎么收口）
    - \`ground-truth.md\` 答案纸（**可能没有**——没有就是无参照题，按 skill 里的无参照口径判）
-   - \`prior-judgments.json\` 这道题之前几轮的判题（改进点、复验、修复标记）。
-     **还没关的每一条都要在 \`findings.checks\` 里复验，一条都不许漏**；
+   - \`open-findings.json\` **这道题还没关的条目清单**（脚本按 rubric 那套规则算好的）。
+     **这上面的每一条都要在 \`findings.checks\` 里复验，一条都不许漏**；
      打过 \`claimed_fixed\` 标记的要特意走到那条路去验——标记是声明，复验才是判决。
+   - \`prior-judgments.json\` 这道题之前几轮判题的全量记录（要看来龙去脉时读它）。
    - \`reverse.md\`  反向证据链（从答案倒推「本该留下哪些痕迹」）
    - \`probe.json\`  探针结果（同样的工具、同样的参数由固定代码重放一遍的存否）
    - \`trace.json\`  原始 span（**几 MB，不要通读**）。\`forward.md\` 已经是它的结构化摘要；
@@ -162,17 +163,24 @@ const UNRESOLVED_WHY = {
   duplicate_trace: "同一条 trace 本轮已经判过，判两遍批注会互相覆盖",
 };
 
-/** 判一条：导包 → 判题会话 → 回流 → 推「已判」。回 true 算成。 */
+/**
+ * 判一条：导包 → 判题会话 → 回流 → 推「已判」。
+ *
+ * 回 `ok` / `failed` / `skipped`（`--dry-run` 回 skipped：包导了但没判，既不算成也不算败，
+ * 否则空跑一轮的退出码会让 loop 以为判题失败）。**没判成的行不在这里放回**——
+ * 放回去下一次 claim 会立刻又领到它（server 按 created_at 排序），队头一条稳定失败的行
+ * 能把后面所有行挡住。由 walkJudgeQueue 攥到本轮结束统一放。
+ */
 async function judgeOne(c) {
   console.error(`\n════ 判 ${c.eventId}（trace ${String(c.traceId).slice(0, 10)}，轮次 ${c.experiment}）════`);
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), "judge-pkg-"));
   let thisOk = false;   // 这一例成没成——失败的包要留着给人看，不能按全局计数删
   try {
     const exp = await spawnScript(HERE, "judge-package-export.mjs", ["--project", PROJECT, "--dataset", DATASET, "--experiment", c.experiment, "--cases", c.eventId, "--out", pkg]);
-    if (exp.code !== 0) { console.error(`✗ 导包失败：${c.eventId}`); return false; }
+    if (exp.code !== 0) { console.error(`✗ 导包失败：${c.eventId}`); return "failed"; }
 
-    // dry-run 的包一律留着看；行在 finally 里放回待判题，空跑不该把队列消掉。
-    if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); return false; }
+    // dry-run 的包一律留着看；行由 walkJudgeQueue 在本轮结束放回，空跑不该把队列消掉。
+    if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); return "skipped"; }
 
     console.error(`⚖ 判题会话开跑（判官 ${MODEL}，包在 ${pkg}）…`);
     let prose = "";
@@ -185,7 +193,7 @@ async function judgeOne(c) {
       prose = res.prose || "";
     } catch (e) {
       console.error(`✗ 判题会话失败：${e.message || e}`);
-      return false;
+      return "failed";
     }
 
     const annFile = path.join(pkg, "annotations.jsonl");
@@ -193,11 +201,11 @@ async function judgeOne(c) {
       // 没产出批注就不回流：回流一个空文件会把「判过了」的假象写进去，下一轮就再也捞不到它。
       console.error(`✗ 判题会话没写出 annotations.jsonl，不回流（包留在 ${pkg}）`);
       console.error(`  会话结尾：${prose.slice(-300)}`);
-      return false;
+      return "failed";
     }
 
     const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", MODEL]);
-    if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); return false; }
+    if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); return "failed"; }
     thisOk = true;
 
     // 批注回流成功之后才推「已判」：顺序反过来的话，页面会先显示「已判」而批注还没写进去，
@@ -209,12 +217,9 @@ async function judgeOne(c) {
     } catch (e) {
       console.error(`⚠ ${c.row.case_source} 推「已判」失败（批注已回流；这一行会留在判题中，下一轮租约到期会被重判）：${e.message || e}`);
     }
-    return true;
+    return "ok";
   } finally {
     if (!KEEP && thisOk) { try { fs.rmSync(pkg, { recursive: true, force: true }); } catch { /* */ } }
-    // 没判成的**当场放回待判题**，不留在 judging 等租约：留着的话页面上它一直显示
-    // 「判题中」，是在骗人，而且要等一个判题超时 × 2 才有人再碰它。
-    if (!thisOk) await release(c.row);
   }
 }
 

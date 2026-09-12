@@ -25,8 +25,10 @@ const fail = (m) => { console.error(`✗ ${m}`); process.exit(1); };
 
 const load = (p, which) => {
   if (!p) fail(`--${which} 必填（判题包目录，或包里的 annotations.jsonl）`);
+  // 先看在不在：statSync 对不存在的路径直接抛裸栈，而「路径写错了」正是最常见的那一种错
+  if (!fs.existsSync(p)) fail(`--${which} 指的 ${p} 不存在`);
   const file = fs.statSync(p).isDirectory() ? path.join(p, "annotations.jsonl") : p;
-  if (!fs.existsSync(file)) fail(`${file} 不存在`);
+  if (!fs.existsSync(file)) fail(`${file} 不存在（这个目录像判题包，但里面没有 annotations.jsonl——那一包还没判）`);
   const { rows, problems } = parseAnnotationsJsonl(fs.readFileSync(file, "utf8"));
   // 坏行照报不静默吞：拿一份缺了几行的材料算一致性，算出来的数没有意义
   for (const x of problems) console.error(`⚠ ${which}: ${x}`);
@@ -42,5 +44,5 @@ const line = (name, r) => `· ${name}：κ=${r.kappa === null ? "—" : r.kappa.
 console.error(`\n配对 ${report.paired} 例（只 a 有 ${report.only_a.length} · 只 b 有 ${report.only_b.length}）`);
 console.error(line("verdict", report.verdict));
 console.error(line("evidence", report.evidence));
-console.error(`· 改进点类别重合度（Jaccard）：${report.kinds.jaccard === null ? "—" : report.kinds.jaccard.toFixed(3)}`);
+console.error(`· 改进点类别重合度：${report.kinds.jaccard === null ? "—" : report.kinds.jaccard.toFixed(3)}（按 ${report.kinds.n} 例算${report.kinds.both_empty ? `；另有 ${report.kinds.both_empty} 例两边都没提改进点，没算进去` : ""}）`);
 console.error(`· 弃判率：a ${(report.abstention.a * 100).toFixed(1)}% · b ${(report.abstention.b * 100).toFixed(1)}%（单列：两边都不敢判也能凑出很像的一致率）`);

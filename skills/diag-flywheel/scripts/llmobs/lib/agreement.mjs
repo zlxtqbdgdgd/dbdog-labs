@@ -51,8 +51,9 @@ const kindSetOf = (labels) => {
   return new Set(items.map((it) => it?.kind).filter((k) => k && k !== "unsure"));
 };
 
+/** 两边都空时回 null：那是「这一例谁都没提改进点」，算成 1.0 会把判不出来美化成完全一致。 */
 const jaccard = (a, b) => {
-  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 && b.size === 0) return null;
   let inter = 0;
   for (const v of a) if (b.has(v)) inter += 1;
   return inter / (a.size + b.size - inter);
@@ -79,11 +80,13 @@ export function agreementReport(rowsA, rowsB) {
   const verdictPairs = [];
   const evidencePairs = [];
   const jaccards = [];
+  let bothEmpty = 0;   // 两边都没提改进点的例子：单独数，不混进平均
   for (const t of shared) {
     const a = byA.get(t).labels ?? {}; const b = byB.get(t).labels ?? {};
     if (a.verdict != null && b.verdict != null) verdictPairs.push([a.verdict, b.verdict]);
     if (a.evidence != null && b.evidence != null) evidencePairs.push([a.evidence, b.evidence]);
-    jaccards.push(jaccard(kindSetOf(a), kindSetOf(b)));
+    const j = jaccard(kindSetOf(a), kindSetOf(b));
+    if (j === null) bothEmpty += 1; else jaccards.push(j);
   }
 
   return {
@@ -92,7 +95,11 @@ export function agreementReport(rowsA, rowsB) {
     only_b: [...byB.keys()].filter((t) => !byA.has(t)),
     verdict: cohensKappa(verdictPairs),
     evidence: cohensKappa(evidencePairs),
-    kinds: { jaccard: jaccards.length ? jaccards.reduce((x, y) => x + y, 0) / jaccards.length : null, n: jaccards.length },
+    kinds: {
+      jaccard: jaccards.length ? jaccards.reduce((x, y) => x + y, 0) / jaccards.length : null,
+      n: jaccards.length,
+      both_empty: bothEmpty,
+    },
     abstention: {
       a: abstentionRate(shared.map((t) => byA.get(t))),
       b: abstentionRate(shared.map((t) => byB.get(t))),

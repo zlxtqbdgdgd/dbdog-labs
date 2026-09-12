@@ -22,6 +22,14 @@ const REQUIRED_FIXED_ROUNDS = (kind) => (kind === "skill" ? 2 : 1);
 /** 这两类不进待复验清单：`model` 只计次，`unsure` 等的是人来核，不是等下一轮自己复验。 */
 const NOT_RECHECKED = new Set(["model", "unsure"]);
 
+/**
+ * 修的人标了 `wont_fix` 的也不进清单：他已经说了这条不修，再让每一轮判官去复验，
+ * 只会让「漏验」的数字随轮次单调上涨，把真正漏掉的那几条淹掉。
+ * `needs_human`（要人协助）与 `claimed_fixed`（改了等复验）都还留在清单里——前者还没了结，
+ * 后者恰恰**必须**复验：标记是声明，复验才是判决。
+ */
+const MARK_CLOSES = new Set(["wont_fix"]);
+
 const roundsOf = (rounds) => (rounds ?? []).filter((r) => r && (r.items || r.checks));
 
 /**
@@ -37,8 +45,11 @@ function replay(rounds) {
       const key = String(it?.key ?? "");
       if (!key) continue;
       const kind = FINDING_KINDS.includes(it?.kind) ? it.kind : "tool";
-      // 关了之后又被当新条目提出来 = 重新算没关（rubric：换个 key 把老缺口当新的提更不行）
-      state.set(key, { key, kind, open: true, streak: 0, last_status: "proposed", since: r.round, fix_mark: null });
+      // 关了之后又被当新条目提出来 = 重新算没关（rubric：换个 key 把老缺口当新的提更不行）。
+      // **修复标记要留着**：它跟的是这个缺口，不是某一轮——上一轮打的 claimed_fixed，
+      // 这一轮重提时清掉的话，判官就不知道「有人说改过了，该特意走那条路去验」。
+      const prev = state.get(key);
+      state.set(key, { key, kind, open: true, streak: 0, last_status: "proposed", since: prev?.since ?? r.round, fix_mark: prev?.fix_mark ?? null });
     }
     for (const c of checks) {
       const key = String(c?.key ?? "");
@@ -51,7 +62,9 @@ function replay(rounds) {
       } else if (c.status === "still_open") {
         state.set(key, { ...cur, kind, streak: 0, last_status: "still_open", open: true });
       } else if (c.status === "not_exercised") {
-        // 不算数：那一条维持原状（既不关，也不算又撞上）
+        // 不算数：那一条维持原状（既不关，也不算又撞上）。**也不打断 skill 类的连胜**——
+        // 「连续两轮 fixed」数的是两次**有效复验**，中间夹一轮没走到那条路不该把计数清零，
+        // 否则一条走得少的路永远关不掉。
         state.set(key, { ...cur, kind, last_status: "not_exercised" });
       }
     }
@@ -70,7 +83,7 @@ function replay(rounds) {
  */
 export function openFindings(rounds) {
   return [...replay(rounds).values()]
-    .filter((s) => s.open && !NOT_RECHECKED.has(s.kind))
+    .filter((s) => s.open && !NOT_RECHECKED.has(s.kind) && !MARK_CLOSES.has(s.fix_mark))
     .map(({ key, kind, last_status, since, fix_mark }) => ({ key, kind, last_status, since, fix_mark }));
 }
 
@@ -82,6 +95,7 @@ export function qualityReport(rounds) {
   const byKind = {};
   let itemsTotal = 0; let abstained = 0; let needsHuman = 0;
   let marked = 0; let wontFix = 0; let needsHumanMark = 0;
+  const markByKey = new Map();
   for (const r of list) {
     const items = Array.isArray(r.items) ? r.items : normalizeFindings(r).items;
     for (const it of items) {
@@ -90,13 +104,17 @@ export function qualityReport(rounds) {
       byKind[kind] = (byKind[kind] ?? 0) + 1;
       if (kind === "unsure") { abstained += 1; needsHuman += 1; }
     }
-    for (const m of Object.values(r.fix_marks && typeof r.fix_marks === "object" ? r.fix_marks : {})) {
+    for (const [key, m] of Object.entries(r.fix_marks && typeof r.fix_marks === "object" ? r.fix_marks : {})) {
       const st = m?.status ?? m;
-      if (!st) continue;
-      marked += 1;
-      if (st === "wont_fix") wontFix += 1;
-      if (st === "needs_human") needsHumanMark += 1;
+      if (st) markByKey.set(key, st);   // 同一个 key 被标了好几轮，只算最后一次（见下）
     }
+  }
+  // 无效条目率的分母是**条目**，不是「轮次 × 条目」：一个 key 在三轮里都带着标记，
+  // 按轮次数会把它算三次，把比率算歪。
+  for (const st of markByKey.values()) {
+    marked += 1;
+    if (st === "wont_fix") wontFix += 1;
+    if (st === "needs_human") needsHumanMark += 1;
   }
 
   const last = list[list.length - 1];

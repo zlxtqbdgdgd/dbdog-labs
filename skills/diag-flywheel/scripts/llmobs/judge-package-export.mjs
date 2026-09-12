@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { openFindings } from "./lib/judge-quality.mjs";
 import {
   baseUrl, findProject, loadDataset,
   listAnnotationQueues, upsertAnnotationQueue, listAnnotationLabels, replaceAnnotationLabels,
@@ -195,6 +196,13 @@ for (const summary of events) {
   );
   fs.writeFileSync(path.join(caseDir, "prior-judgments.json"), JSON.stringify(prior, null, 1));
 
+  // **待复验清单随包走**：rubric 要判题方「开判第一件事就是拿这份清单」，但判题会话的
+  // 工作目录是这个临时包，里面既没有 `case-history.mjs` 也没有凭证——照 rubric 做不到，
+  // 只能退回「自己在几十条历史里推」，正是那条规则要取代的做法。这里把脚本算好的结果放进包。
+  const open = openFindings(prior);
+  fs.writeFileSync(path.join(caseDir, "open-findings.json"), JSON.stringify(open, null, 1));
+  if (open.length) console.error(`  · 待复验 ${open.length} 条：${open.map((o) => o.key).join("、")}`);
+
   // 探针结果由 probe.mjs 写进本目录；重跑 export 不覆盖已有的那份。
   const probePath = path.join(caseDir, "probe.json");
   if (!fs.existsSync(probePath)) missing.push("probe（探针还没跑：node scripts/llmobs/probe.mjs --case <本目录>）");
@@ -202,9 +210,22 @@ for (const summary of events) {
   // 答案纸里的根因**按顺序带进 manifest**：判题方按这个顺序编号划分命中 / 没命中，
   // import 据此核 `findings.roots`，并推导 verdict（`deriveVerdictFromRoots`）。
   // 带原文而不是只带条数，是为了让人看回流报错时知道第 2 条指的是哪一条。
+  //
+  // **三态，不是两态**（2026-09-11 晚修）：
+  //   · 数组 → 核集合；
+  //   · `null` = 有答案纸、但根因不在 `expected_roots` 这个数组里（答案纸是整段文字、
+  //     或只有 expected_phenomena）。这种**不核集合**，判题方照答案纸的文字判 verdict。
+  //     早前把它和「没有答案纸」一起压成 `[]`，于是包里明明躺着 ground-truth.md，
+  //     回流却报「这道题没有答案纸，verdict 只能是 unknown」——报错与材料自相矛盾，整包白判。
+  //   · `[]` = 真没有答案纸（题坏了）。
   const expectedRoots = hasGroundTruth(expected)
-    ? (Array.isArray(expected?.expected_roots) ? expected.expected_roots.map((r) => String(r)) : [])
+    ? (Array.isArray(expected?.expected_roots) && expected.expected_roots.length
+      ? expected.expected_roots.map((r) => String(r))
+      : null)
     : [];
+  if (expectedRoots === null) {
+    missing.push("expected_roots（答案纸有正文但没有结构化根因：本例不核根因集合，judge 照文字判，并提一条 case 让建用例那步补上）");
+  }
 
   cases.push({
     event_id: eventID,

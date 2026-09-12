@@ -36,6 +36,8 @@ const DEST = path.join(LABS, "skills", "diag-flywheel", "scripts");
  * 镜像清单 = 入口脚本的依赖闭包（`scripts/llmobs/` + `scripts/e2e/lib/`）。
  * **不写死列表**：从入口出发解析 import，闭包变了这里自动跟着变（军规 3：能推导的不钉字面量）。
  * 测试与夹具不镜像——用户跑的是脚本，不是我们的守门。
+ * 正则同时认静态 `from "…"` 与**动态** `import("…")`：run-experiment 用动态 import 拿
+ * `prompt-fetch.mjs`，只认静态时它扫不到，插件用户配了 `E2E_PROMPT_USER` 跑就 ENOENT。
  */
 const ENTRIES = [
   "scripts/llmobs/run-experiment.mjs",
@@ -83,7 +85,7 @@ function closure() {
     if (!fs.existsSync(abs)) throw new Error(`镜像清单里的文件不存在：${rel}`);
     seen.add(rel);
     const src = fs.readFileSync(abs, "utf8");
-    for (const m of src.matchAll(/from\s+"(\.[^"]+)"/g)) {
+    for (const m of src.matchAll(/(?:from|import)\s*\(?\s*"(\.[^"]+)"/g)) {
       const tgt = path.resolve(path.dirname(abs), m[1]);
       const relTgt = path.relative(MCP_ROOT, tgt);
       if (relTgt.startsWith("..")) throw new Error(`闭包跑出仓外：${m[1]}（来自 ${rel}）`);

@@ -27,7 +27,7 @@ export const LABEL_SCHEMA = [
   { label: "evidence", value_type: "categorical", options: ["solid", "weak"], display: "证据撑不撑得住结论" },
   { label: "findings", value_type: "json", display: "改进点（一条一个）+ 对之前几轮条目的复验" },
   { label: "finding_kinds", value_type: "json", display: "改进点类别（由 import 从 findings 算出，筛选用）" },
-  { label: "summary", value_type: "string", display: "总评（≤ 300 字大白话）" },
+  { label: "summary", value_type: "string", display: "总评（大白话，≤ 600 字符）" },
   { label: "fix_marks", value_type: "json", display: "修复标记（改了等复验 / 要人协助 / 不修；fix-mark.mjs 写）" },
 ];
 
@@ -266,7 +266,7 @@ export function renderForward(spans, { eventId = "", traceId = "" } = {}) {
       lines.push(`${pad}  - 类型 ${type}　结论 ${verdictOf(nodes, node.id)}　取证 ${node.calls.length} 次`);
       if (node.expect) lines.push(`${pad}  - 判据：${clip(node.expect, 200)}`);
       if (node.calls.length) {
-        lines.push(`${pad}  - 调用：${node.calls.map((c) => `#${c.seq} \`${c.tool}\``).join("、")}`);
+        lines.push(`${pad}  - 调用：${node.calls.map((c) => `#${c.seq} \`${c.tool}\`（span \`${c.span_id ?? "—"}\`）`).join("、")}`);
       }
     }
     const orphan = [...nodes.values()].filter((n) => n.parent && !nodes.has(n.parent));
@@ -284,12 +284,15 @@ export function renderForward(spans, { eventId = "", traceId = "" } = {}) {
 
   lines.push("## 工具调用（按时间）");
   lines.push("");
-  lines.push("| # | 工具 | 假设 | 状态 | 意图 |");
-  lines.push("|---|---|---|---|---|");
+  // span 列不是装饰：每条改进点的 pointers 要指到 span_id，回流会拿它跟 trace.json 对。
+  // 而判官被告知「trace.json 几 MB 不要通读，看 forward.md」——摘要里不打 span_id，
+  // 就等于逼他去翻几 MB 原文，或者编一个（编的会被整包拒）。
+  lines.push("| # | span | 工具 | 假设 | 状态 | 意图 |");
+  lines.push("|---|---|---|---|---|---|");
   const idOf = new Map();
   for (const node of nodes.values()) for (const c of node.calls) idOf.set(c.seq, node.id);
   for (const c of calls) {
-    lines.push(`| ${c.seq} | \`${c.tool}\` | ${idOf.get(c.seq) ? `[${idOf.get(c.seq)}]` : "未挂"} | ${c.status || "—"} | ${clip(c.intent, 160) || "—"} |`);
+    lines.push(`| ${c.seq} | \`${c.span_id ?? "—"}\` | \`${c.tool}\` | ${idOf.get(c.seq) ? `[${idOf.get(c.seq)}]` : "未挂"} | ${c.status || "—"} | ${clip(c.intent, 160) || "—"} |`);
   }
   if (calls.length === 0) lines.push("| — | （这条 trace 一次工具都没调） | — | — | — |");
   lines.push("");
@@ -341,7 +344,9 @@ export function renderGroundTruth(expected, { eventId = "" } = {}) {
   if (typeof expected === "string") return `${lines.join("\n")}\n${expected}\n`;
   const e = expected ?? {};
   if (Array.isArray(e.expected_roots) && e.expected_roots.length) {
-    lines.push("## 期望根因", "", ...e.expected_roots.map((r) => `- ${r}`), "");
+    // 有序列表不是排版偏好：判题方要按**这个顺序**把命中的根因编号写进 `findings.roots`，
+    // 用无序列表他得自己数，数错就是整包拒。
+    lines.push("## 期望根因", "", ...e.expected_roots.map((r, i) => `${i + 1}. ${r}`), "");
   }
   if (Array.isArray(e.expected_phenomena) && e.expected_phenomena.length) {
     lines.push("## 期望现象", "", ...e.expected_phenomena.map((r) => `- ${r}`), "");
@@ -481,14 +486,14 @@ export function validateFindings(a) {
     if (QUALIFIED_KINDS.includes(it.kind) && !FINDING_QUALIFIERS.includes(it.qualifier)) {
       problems.push(`${w}.qualifier ${JSON.stringify(it.qualifier)} 只能是 ${FINDING_QUALIFIERS.join(" / ")}（缺失 / 写错 / 多余）`);
     }
-    if (it.qualifier !== undefined && !FINDING_QUALIFIERS.includes(it.qualifier)) {
+    if (!QUALIFIED_KINDS.includes(it.kind) && it.qualifier !== undefined && !FINDING_QUALIFIERS.includes(it.qualifier)) {
       problems.push(`${w}.qualifier ${JSON.stringify(it.qualifier)} 只能是 ${FINDING_QUALIFIERS.join(" / ")}`);
     }
     // 工具错要说清落在哪一层：四层四个仓四种验法，写不出来多半是还没定位到落点。
     if (it.kind === "tool" && !TOOL_LAYERS.includes(it.layer)) {
       problems.push(`${w}.layer ${JSON.stringify(it.layer)} 只能是 ${TOOL_LAYERS.join(" / ")}（tool 类必填）`);
     }
-    if (it.layer !== undefined && !TOOL_LAYERS.includes(it.layer)) {
+    if (it.kind !== "tool" && it.layer !== undefined && !TOOL_LAYERS.includes(it.layer)) {
       problems.push(`${w}.layer ${JSON.stringify(it.layer)} 只能是 ${TOOL_LAYERS.join(" / ")}`);
     }
     // tool 类关它的判据是「重放必须变对」——没有可重放的东西，这一条就永远关不掉。
@@ -521,7 +526,13 @@ export function validateFindings(a) {
     if (!c || typeof c !== "object") return problems.push(`${w} 必须是对象`);
     if (!FIX_KEY_RE.test(String(c.key ?? ""))) problems.push(`${w}.key ${JSON.stringify(c.key)} 不合规`);
     if (!FIX_CHECK_STATUSES.includes(c.status)) problems.push(`${w}.status 只能是 ${FIX_CHECK_STATUSES.join(" / ")}`);
-    if (c.kind !== undefined && !FINDING_KINDS.includes(c.kind)) problems.push(`${w}.kind ${JSON.stringify(c.kind)} 不在词表里（${FINDING_KINDS.join(" / ")}）`);
+    // `still_open` 的 kind 必填：`finding_kinds` 只把**带 kind** 的 still_open 算进去，
+    // 缺了这条缺口就不进页面的类别筛选——「又撞上了」却在类别里查无此人。
+    if (c.status === "still_open" && !FINDING_KINDS.includes(c.kind)) {
+      problems.push(`${w}.kind 缺失或不在词表里（${FINDING_KINDS.join(" / ")}）：又撞上的那条要带类别，否则页面上这个缺口不显形`);
+    } else if (c.kind !== undefined && !FINDING_KINDS.includes(c.kind)) {
+      problems.push(`${w}.kind ${JSON.stringify(c.kind)} 不在词表里（${FINDING_KINDS.join(" / ")}）`);
+    }
     problems.push(...pointerProblems(w, c.pointers, c.status === "fixed" || c.status === "still_open"));
     if (keys.has(c.key)) problems.push(`${w}.key ${c.key} 同时出现在 items 里——又撞上的只写 still_open 复验，不要再提一条`);
   });
@@ -598,7 +609,12 @@ export function validateAgainstCase(labels, ctx = {}) {
       const all = [...matched, ...missed];
       const seen = new Set();
       for (const n of all) {
-        if (!Number.isInteger(n) || n < 1 || n > expected.length) {
+        if (!Number.isInteger(n)) {
+          // 最常见的写法错误是把根因原文抄进来。说「越界」会让人往数字上找问题，说不到点子上。
+          problems.push(`findings.roots 里的 ${JSON.stringify(n)} 不是编号：这里只写数字（答案纸里根因的出现序号，1..${expected.length}），不写根因原文`);
+          continue;
+        }
+        if (n < 1 || n > expected.length) {
           problems.push(`findings.roots 里的 ${JSON.stringify(n)} 越界：答案纸只有 ${expected.length} 条根因，编号 1..${expected.length}`);
           continue;
         }
@@ -608,9 +624,17 @@ export function validateAgainstCase(labels, ctx = {}) {
       const absent = [];
       for (let i = 1; i <= expected.length; i++) if (!seen.has(i)) absent.push(i);
       if (absent.length) problems.push(`findings.roots 漏了第 ${absent.join(" / ")} 条根因：答案纸上每一条都要表态（命中或没命中）`);
-      const derived = deriveVerdictFromRoots({ matched, missed });
-      if (labels?.verdict !== undefined && labels.verdict !== derived && problems.length === 0) {
-        problems.push(`verdict ${JSON.stringify(labels.verdict)} 与根因集合对不上：命中 ${matched.length}/${expected.length} 条，按口径是 ${derived}`);
+      // 集合本身有问题时不拿它推 verdict（推出来的没意义），但**要说一句**——
+      // 不说的话判官改完集合、下一轮才撞上 verdict 这条，又白烧一次判题会话。
+      if (labels?.verdict !== undefined) {
+        if (problems.length) {
+          problems.push(`verdict 这次没核：上面的根因集合先改对（改完请自查——找齐 correct / 找到一部分 partial / 一条没找到 wrong）`);
+        } else {
+          const derived = deriveVerdictFromRoots({ matched, missed });
+          if (labels.verdict !== derived) {
+            problems.push(`verdict ${JSON.stringify(labels.verdict)} 与根因集合对不上：命中 ${matched.length}/${expected.length} 条，按口径是 ${derived}`);
+          }
+        }
       }
     }
   }
