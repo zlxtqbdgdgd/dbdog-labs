@@ -1,6 +1,6 @@
 ---
 name: judge-run
-description: 判一轮诊断——从诊断表领走「待判题」的复现（一次复现一行），一例一个会话按同插件 diag-judge 的口径判：结论对不对、证据撑不撑得住、改进点一条一条分六类；开判前把诊断表那行推到「判题中」，判完回流批注再推到「已判」。在线是默认：有答案纸就从根因倒推该有哪些证据，逐条去活系统取到手。触发词：judge-run / 判题 / 判一轮 / 判诊断 / 判这批诊断。
+description: 判一轮诊断——从诊断表领走「待判题」的复现（一次复现一行），一例一个会话按同插件 diag-judge 的口径判：结论对不对、证据撑不撑得住、改进点一条一条按 diag-judge 的词表分类；开判前把诊断表那行推到「判题中」，判完回流批注再推到「已判」。在线是默认：有答案纸就从根因倒推该有哪些证据，逐条去活系统取到手。触发词：judge-run / 判题 / 判一轮 / 判诊断 / 判这批诊断。
 ---
 
 # judge-run —— 判「这次诊断做得对不对」，并挖出 dbdog 该修什么
@@ -16,7 +16,8 @@ description: 判一轮诊断——从诊断表领走「待判题」的复现（�
 一轮四步，顺序不能换（owner 2026-09-11 定：「judge 只看状态是待判题的，先改状态为判题中，
 再判题，判完之后先上报，再改为判完」）：
 
-1. **抢**：诊断表里「待判题」的行 → 改「判题中」。抢占**顺带就是互斥**——server 那边是单条
+1. **抢**：诊断表里「待判题」的行 → 改「判题中」。**一条一条领，判完一条再领下一条**，
+   租约就永远只覆盖正在判的那一条。抢占**顺带就是互斥**——server 那边是单条
    带 `FOR UPDATE SKIP LOCKED` 的 UPDATE，两轮同时打进来，后到的那轮拿到下一条或者 204。
 2. **判**：导包 → 一例一个会话。
 3. **上报**：`judge-package-import.mjs` 把批注写回。
@@ -71,7 +72,7 @@ S=<diag-flywheel/scripts 目录>
 export DBDOG_BASE_URL=<server 的 API 面>          # 控制面在 API 口，不是 MCP 口
 export DBDOG_OBS_API_KEY=<控制台签发的 key>        # 与 hooks 上报 span 同一把
 export DBDOG_MCP_URL=<dbdog-mcp 的 /mcp 地址>      # 判题会话取证用，带上 databases=<引擎>
-export DBDOG_MCP_BEARER=<短时 JWT>                 # scripts/llmobs/mint-mcp-jwt.mjs 铸
+export DBDOG_MCP_BEARER=<短时 JWT>                 # dbdog-mcp 仓的 scripts/llmobs/mint-mcp-jwt.mjs 铸（不在插件里）
 DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
 ```
 
@@ -80,10 +81,11 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/lo
 - `DBDOG_BASE_URL` 填成 MCP 那个口会在 `/api/v2/llm-obs/v1/projects` 上吃 404
   （装了 hooks 的机器上 `DBDOG_OBS_REPORT_URL` 指的就是 MCP 口，别直接拿它当 base）；
 - `DBDOG_MCP_BEARER` 缺了脚本**当场停**（判题要连 dbdog 取证据，没 bearer 就是连不上，
-  与其让判题模型「工具全报错还照判」不如不跑）；
+  与其让判题模型「工具全报错还照判」不如不跑）。它由 **dbdog-mcp 仓**的 `scripts/llmobs/mint-mcp-jwt.mjs` 铸——
+  注意那个脚本**不在插件里**（`$S/llmobs/` 下没有），插件只镜像了飞轮这一套客户端脚本；
 - 地址与 key 的实际取值看家族 `SECRET-INDEX.md` 与环境总表，**别写进本文**。
 
-`CLAUDE_CONFIG_DIR` **不能省**，省了会 401，理由见下一节。
+`CLAUDE_CONFIG_DIR` **不能省**，省了判官会跑成便宜模型或直接 401，理由见下一节。
 
 `DBDOG_OPERATOR` 也**不能省**（如 `qinqiang`）：它落进诊断表的 `status_changed_by`，
 控制台「状态」列底下那行显的就是它。没有就问用户要，别自己编——loop 在导包起会话**之前**
@@ -93,7 +95,15 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/lo
 一例一个会话，不是一轮一个。早前按轮导过，三例材料叠起来 11 MB 塞进一个会话，
 40 分钟没判完，而且一例失败整轮都不回流。
 
-用户说「判 N 条」就把 N 传给 `--limit`。
+用户说「判 N 条」就把 N 传给 `--limit`；不给 = 判到队列空为止。
+
+**领活是一条一条领的**（2026-09-11 晚改）：判完一条才去领下一条。以前是一轮先把待判题的全领走再串行判，
+而租约是「判题超时 × 2」= 默认 1 小时、判一例要几十分钟——领 3 条，排在后面那条还没轮到租约就过期了，
+下一轮（30 分钟一次）会把它当卡死行抢走**并真的开判**：两个会话判同一条 trace，批注互相覆盖。
+流式领之后租约永远只覆盖正在判的那一条。
+
+**`--limit` 数的是「判了几条」，不是「领了几条」**：抢占是全局的（诊断表上没有用例集这一维），
+会领到别的用例集的行，那些当场放回、不占配额。
 
 ## 判官用 opus，**而且必须切配置目录**（owner 2026-09-11 定）
 
@@ -105,10 +115,10 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/lo
 考生用便宜快的、判官用强的：诊断要跑很多轮很长，成本在那儿；判卷判错了整条 loop 的产出
 都不可信。
 
-### 光传 `--judge-model opus` 不够，会 401
+### 光在命令行上写个模型名不够，会 401（或者更糟：静默跑成便宜模型）
 
 `~/.claude` 那份配置的 `env.ANTHROPIC_BASE_URL` 指着 DeepSeek 网关、key 也是 DeepSeek 的。
-模型名传 opus 只会拿**DeepSeek 的 key 去那个端点要 opus**，2026-09-11 实测报：
+在那份配置下要 opus，就是拿**DeepSeek 的 key 去那个端点要 opus**，2026-09-11 实测报：
 
 ```
 Failed to authenticate. API Error: 401 Authentication Fails, Your api key: ****hgAA is invalid
@@ -124,14 +134,30 @@ CLAUDE_CONFIG_DIR=~/.claude-max node $S/llmobs/loop-judge.mjs --dataset <用例�
 跑之前确认 `~/.claude-max` 在、登录态没过期。**别用 flash 判**——判出来的结论不可信，
 而且这个错是静默的：判题照跑、分数照记。
 
+判官模型由 `--model` 定，**默认 `opus`**（2026-09-11 晚起）。以前默认空串，有两个后果：会话跑成那份配置的
+默认模型（可能是便宜模型），批注的 `annotator` 还会记成 `default`——而 annotator 存在的理由正是
+「两轮结论不一样时分得清是 agent 变了还是判官换了」。换判官就显式传 `--model`。
+
 ## 看输出
 
-- `队列：待判题 N 条 · 判题中 M 条（含本轮抢到的 K 条）` —— 积压要看这行，数字悄悄变小
-  多半是诊断那一侧没跟上，不是「都判完了」。
+- `队列：待判题 N 条 · 判题中 M 条（各自最多数到 1000）` —— 积压要看这行，数字悄悄变小
+  多半是诊断那一侧没跟上，不是「都判完了」；两个数都封顶在 1000，真堆到那个量级要另外查。
 - `本轮判题：成 X 例 · 败 Y 例`
 
 跑完告诉用户：判了几例、结论分布、**挖出几条改进点**。最后一项是这条 loop 存在的理由，
 别把它埋在日志里。
+
+产量之外还有两个数该定期看，都有现成脚本（不跑判题会话，只读）：
+
+```bash
+node $S/llmobs/judge-scorecard.mjs --dataset <用例集名>     # 弃判率、无效条目率、复验漏没漏
+node $S/llmobs/judge-agreement.mjs --a <包目录> --b <包目录> # 同一批判两遍，出 κ
+```
+
+- **无效条目率**（修的人打了 `wont_fix` 的占比）超 10% 就别催判官多提条目了，回头改 rubric——
+  外部经验是误报率一过这条线，修的人会整体不看这张清单。
+- **弃判率**单列：两边都不敢判也能凑出很好看的产量。
+- **κ**（同一批判两遍有多像）低于 0.6 的那一轴，是 rubric 那一节没写清，不是判官不行。
 
 ## 判完之后
 

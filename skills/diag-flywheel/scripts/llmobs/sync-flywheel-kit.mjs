@@ -33,7 +33,7 @@ const LABS = path.resolve(argOf("--labs", path.join(MCP_ROOT, "..", "dbdog-labs"
 const DEST = path.join(LABS, "skills", "diag-flywheel", "scripts");
 
 /**
- * 镜像清单 = 九个入口脚本的依赖闭包（`scripts/llmobs/` 12 个 + `scripts/e2e/lib/` 7 个）。
+ * 镜像清单 = 入口脚本的依赖闭包（`scripts/llmobs/` + `scripts/e2e/lib/`）。
  * **不写死列表**：从入口出发解析 import，闭包变了这里自动跟着变（军规 3：能推导的不钉字面量）。
  * 测试与夹具不镜像——用户跑的是脚本，不是我们的守门。
  */
@@ -53,6 +53,10 @@ const ENTRIES = [
   // 闭包会自动带上它们独有的三个依赖：spawn-script / judge-session / case-diag-client。
   "scripts/llmobs/loop-diagnose.mjs",
   "scripts/llmobs/loop-judge.mjs",
+  // 2026-09-11 晚加判官自己的两把尺：judge skill 的正文直接让人跑它们（`$S/llmobs/…`），
+  // 不镜像就是文档指着一个插件里没有的文件。
+  "scripts/llmobs/judge-agreement.mjs",
+  "scripts/llmobs/judge-scorecard.mjs",
 ];
 
 /**

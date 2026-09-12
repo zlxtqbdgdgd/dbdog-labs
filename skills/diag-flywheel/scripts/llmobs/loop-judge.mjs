@@ -57,7 +57,11 @@ const fail = (m) => { console.error(`✗ ${m}`); process.exit(1); };
 const PROJECT = argOf("--project", "default-project");
 const DATASET = argOf("--dataset", "");
 const LIMIT = Number(argOf("--limit", "0"));
-const MODEL = argOf("--model", "");
+// 判官用强模型（owner 2026-09-11 定）。**默认值不是空串**：空串既不会给会话钉模型
+// （跑成 CLAUDE_CONFIG_DIR 那份配置的默认模型，可能是便宜模型），又会把 `--annotator` 落成
+// "default"——而 annotator 存在的理由正是「两轮结论不一样时分得清是 agent 变了还是判官换了」。
+// 判官换模型就显式传 `--model`，别靠环境里的默认值。
+const MODEL = argOf("--model", "opus");
 const TIMEOUT_SEC = Number(argOf("--timeout-sec", "1800")) || 1800;
 const TIMEOUT_MS = TIMEOUT_SEC * 1000;
 const KEEP = has("--keep-package");
@@ -66,97 +70,47 @@ const DRY = has("--dry-run");
 const CLAIMED_BY = argOf("--claimed-by", `loop-judge@${os.hostname()}`);
 // 租约时长按**判题超时 × 2** 取，理由与诊断侧同一条（见 loop-diagnose.mjs）。
 const STALE_AFTER_SEC = Number(argOf("--stale-after-sec", String(TIMEOUT_SEC * 2)));
-// `--limit N` = 本轮最多领几条；不给就把待判题的都领走（判题是串行的，领多了也只是排队）。
+// `--limit N` = 本轮最多判几条；不给 = 判到队列空为止（一条一条领，见下面的流式循环）。
 const MAX_PER_ROUND = LIMIT > 0 ? LIMIT : 0;
 if (!DATASET) fail("--dataset 必填");
 // 报上跑的人是谁（DBDOG_OPERATOR）。**在抢任何东西之前就查**：抢到手的行会被改成 judging
 // 占住租约，等跑到推状态那一步才发现缺这个变量，那批行就得等租约超时才被捞回来。
 try { operator(); } catch (e) { fail(e.message); }
 
-/** 把一行放回「待判题」。放不回去也只是等租约，不阻断本轮。 */
-async function release(row) {
-  try { await advanceDiagnosis({ id: row.id, from: DIAG_JUDGING, to: DIAG_PENDING_JUDGEMENT }); }
-  catch { /* 等租约回收 */ }
-}
-
-/** 整批放回（本轮开不下去时用，别攥着一批 judging 的行退出）。 */
-async function releaseAll(rows, why) {
-  if (!rows.length) return;
-  console.error(`· ${why}，把领到的 ${rows.length} 条放回待判题`);
-  for (const row of rows) await release(row);
-}
-
-// ---- ① 抢：从诊断表领「待判题」的行，原子改成「判题中」 ----
+// ---- 先做所有「不领活也能做」的检查，再去抢 ----
 //
-// 抢占本身**就是互斥**：server 那边是单条带 FOR UPDATE SKIP LOCKED 的 UPDATE，两轮同时
-// 打进来，后到的那轮拿到的是下一条或者 204。所以这里不需要再自己加锁。
-//
-// 租约（stale_after_sec）兜的是**进程被杀**：判题跑一半被 kill，行会留在 judging，
-// 靠租约过期被下一轮重新抢回来。判题超时 × 2 与诊断侧同一个取法——给小了会把正在判的
-// 那条抢走（两个会话判同一条，批注互相覆盖），给大了卡住的行要等更久。
-let claimedRows = [];
-try {
-  for (let i = 0; MAX_PER_ROUND === 0 || claimedRows.length < MAX_PER_ROUND; i++) {
-    const row = await claimDiagnosis({
-      claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC,
-      from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING,
-    });
-    if (!row) break;
-    claimedRows.push(row);
-  }
-} catch (e) {
-  fail(`抢判题任务失败：${e.message || e}`);
-}
+// 顺序是有代价的：抢到手的行会被改成 judging 占住租约，等跑到一半才发现缺变量 / 用例集解析不出来，
+// 那批行就得等租约超时才被捞回来，页面上它们一直显示「正在判」。所以解析用例集、MCP 配置、
+// bearer 这三件都排在抢之前。
 
-// 积压要报出来，哪怕本轮没抢到：数字悄悄变小很危险——不报，看到的人会以为「都判完了」，
-// 而真相可能是诊断那一侧没跟上，或者一堆行卡在 judging 等租约。
-try {
-  const backlog = await listDiagnoses({ statuses: [DIAG_PENDING_JUDGEMENT], limit: 1000 });
-  const inflight = await listDiagnoses({ statuses: [DIAG_JUDGING], limit: 1000 });
-  console.error(`· 队列：待判题 ${backlog.length} 条 · 判题中 ${inflight.length} 条（含本轮抢到的 ${claimedRows.length} 条）`);
-} catch { /* 看板信息，拿不到不阻断本轮 */ }
-
-if (claimedRows.length === 0) {
-  console.error(`本轮无事：诊断表里没有待判题的复现。`);
-  process.exit(0);
-}
-
-// 行上只有 trace_id，而导包要 experiment + event id（judge-package-export 按 event id 挑子集）。
-// 这座桥在 lib/judge-queue.mjs，配不上的带理由分流出来，下面一律放回待判题。
 let runsByRecord = new Map();
 try {
   ({ runsByRecord } = await resolveDatasetTraces({ project: PROJECT, dataset: DATASET }));
 } catch (e) {
-  // 解析不出来就全放回去再退出：攥着一批 judging 的行死掉，页面上它们会「正在判」到租约过期。
-  await releaseAll(claimedRows, "解析用例集失败");
   fail(`解析用例集 ${DATASET} 的历次 run 失败：${e.message || e}`);
 }
-const { targets, unresolved } = matchJudgeTargets(claimedRows, runsByRecord);
-for (const { row, reason } of unresolved) {
-  const why = {
-    no_trace: "行上没有 trace（诊断侧该在拿到 trace 时才推待判题）",
-    foreign: `trace 不属于用例集 ${DATASET}（抢占目前是全局的）`,
-    no_event: "配到了 run 但缺 event id，判题包导不出来",
-    duplicate_trace: "同一条 trace 已有另一行在本轮判，判两遍批注会互相覆盖",
-  }[reason] ?? reason;
-  console.error(`· 放回 ${row.case_source}：${why}`);
-  await release(row);
-}
 
-// **一例一个会话**（不是一轮一个）。判题包本来就支持按 event id 挑子集
-// （judge-package-export --cases），早前按轮导是编排层自己加的限制，代价很大：
-// 三例材料叠起来 11 MB 塞进一个会话，40 分钟没判完；而且一例失败整轮都不回流。
-const groups = targets;
-console.error(`本轮领到 ${claimedRows.length} 条，可判 ${groups.length} 条（一例一个会话）`);
-if (groups.length === 0) process.exit(0);
+// MCP 配置写一份给所有判题会话共用（与诊断会话同一份 buildMcpConfig，连的是同一个 dbdog）。
+// 判题连的不是诊断那份地址——要补上 llmobs toolset（见 lib/judge-session.mjs 的 judgeMcpUrl）。
+const mcpConfigPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "judge-mcp-")), "mcp.json");
+process.env.DBDOG_MCP_URL = judgeMcpUrl(process.env.DBDOG_MCP_URL ?? "");
+fs.writeFileSync(mcpConfigPath, JSON.stringify(buildMcpConfig(), null, 2));
+if (!process.env.DBDOG_MCP_BEARER?.trim()) {
+  // 边缘口有 OAuth 门禁，headless 起的会话读不到交互式客户端的登录态——没 bearer 就是连不上，
+  // 与其让判题模型「工具全报错还照判」，不如现在就停。
+  fail("判题会话要连 dbdog 取证据，缺 DBDOG_MCP_BEARER（scripts/llmobs/mint-mcp-jwt.mjs 铸）");
+}
 
 const JUDGE_PROMPT = `本目录是一个**自包含判题包**。请：
 
 1. 先读 \`skill/SKILL.md\`，那是判题口径的正文，严格按它判。
 2. 逐个读 \`cases/<event_id>/\` 下的材料判分。每例的材料可能有：
    - \`forward.md\`  正向假设树（agent 实际提了哪些假设、各拿什么证据、怎么收口）
-   - \`reverse.md\`  反向证据链（从答案倒推「本该留下哪些痕迹」）
    - \`ground-truth.md\` 答案纸（**可能没有**——没有就是无参照题，按 skill 里的无参照口径判）
+   - \`prior-judgments.json\` 这道题之前几轮的判题（改进点、复验、修复标记）。
+     **还没关的每一条都要在 \`findings.checks\` 里复验，一条都不许漏**；
+     打过 \`claimed_fixed\` 标记的要特意走到那条路去验——标记是声明，复验才是判决。
+   - \`reverse.md\`  反向证据链（从答案倒推「本该留下哪些痕迹」）
    - \`probe.json\`  探针结果（同样的工具、同样的参数由固定代码重放一遍的存否）
    - \`trace.json\`  原始 span（**几 MB，不要通读**）。\`forward.md\` 已经是它的结构化摘要；
      只在要核对某一条具体证据时，去里面搜那一条。
@@ -170,22 +124,83 @@ const JUDGE_PROMPT = `本目录是一个**自包含判题包**。请：
      **同一条 trace 只许一行**（重判是覆盖，不是追加）。
    - \`summary.md\`  本轮总账。
 
+回流会**整包拒写**的四件事（写之前自己对一遍）：
+- 有答案纸的题必须写 \`findings.roots\`（按答案纸里根因的出现顺序编号，划进 matched / missed，
+  不重不漏），且 \`verdict\` 要与集合对得上：找齐 correct、找到一部分 partial、没找到 wrong；
+  没有答案纸的题 \`verdict\` 只能 unknown，且不写 roots。
+- 每条改进点的 \`span_id\` 指针必须在这条 trace 里真找得到（前 8 位也行，但不能配到两条）。
+- \`tool\` 类要写 \`layer\`（server / agent / hooks / scripts）与 \`repro\`；\`tool\` 与 \`skill\` 类要写
+  \`qualifier\`（missing 缺失 / incorrect 写错 / extraneous 多余）。
+- \`model\` 类要写 \`rule_ref\`（规矩写在哪个 skill 的哪一节）；\`unsure\` 类要写 \`suspected_kind\`。
+
 两条硬规矩：**归因必须指到某条 span 或探针结果的某一行**；**建议必须写清「改哪里」**。
 判不了的照实写判不了，不要猜一个填上。`;
 
-// MCP 配置写一份给所有判题会话共用（与诊断会话同一份 buildMcpConfig，连的是同一个 dbdog）。
-// 判题连的不是诊断那份地址——要补上 llmobs toolset（见 lib/judge-session.mjs 的 judgeMcpUrl）。
-const mcpConfigPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "judge-mcp-")), "mcp.json");
-process.env.DBDOG_MCP_URL = judgeMcpUrl(process.env.DBDOG_MCP_URL ?? "");
-fs.writeFileSync(mcpConfigPath, JSON.stringify(buildMcpConfig(), null, 2));
-if (!process.env.DBDOG_MCP_BEARER?.trim()) {
-  // 边缘口有 OAuth 门禁，headless 起的会话读不到交互式客户端的登录态——没 bearer 就是连不上，
-  // 与其让判题模型「工具全报错还照判」，不如现在就停。
-  fail("判题会话要连 dbdog 取证据，缺 DBDOG_MCP_BEARER（scripts/llmobs/mint-mcp-jwt.mjs 铸）");
+// 积压要报出来，哪怕本轮一条没领：数字悄悄变小很危险——不报，看到的人会以为「都判完了」，
+// 而真相可能是诊断那一侧没跟上，或者一堆行卡在 judging 等租约。
+try {
+  const backlog = await listDiagnoses({ statuses: [DIAG_PENDING_JUDGEMENT], limit: 1000 });
+  const inflight = await listDiagnoses({ statuses: [DIAG_JUDGING], limit: 1000 });
+  console.error(`· 队列：待判题 ${backlog.length} 条 · 判题中 ${inflight.length} 条（各自最多数到 1000）`);
+} catch { /* 看板信息，拿不到不阻断本轮 */ }
+
+// ---- 一条一条地领：判完一条再领下一条 ----
+//
+// **不要一次把待判题的都领走**（2026-09-11 晚改）。租约是「判题超时 × 2」= 默认 1 小时，
+// 而判一例要几十分钟：一次领 3 条，排在后面那条还没轮到，租约就已经过期了——下一轮
+// （skill 推荐 /loop 30m）会把它当卡死行抢走**并真的开判**，于是两个会话判同一条 trace，
+// 批注互相覆盖，先判完的那个推「已判」还会吃 409。
+// 流式领之后，租约永远只覆盖**正在判的那一条**，这个洞就不存在了。
+//
+// `--limit N` = 本轮最多判几条（不给 = 把队列判空为止）。
+// 抢占本身就是互斥：server 那边是单条带 FOR UPDATE SKIP LOCKED 的 UPDATE，两轮同时打进来，
+// 后到的那轮拿到的是下一条或者 204。租约兜的是**进程被杀**：判到一半被 kill，行留在 judging，
+// 靠租约过期被下一轮重新抢回来。
+
+/** 把一行放回「待判题」。放不回去也只是等租约，不阻断本轮。 */
+async function release(row) {
+  try { await advanceDiagnosis({ id: row.id, from: DIAG_JUDGING, to: DIAG_PENDING_JUDGEMENT }); }
+  catch { /* 等租约回收 */ }
 }
 
-let okN = 0, failN = 0;
-for (const c of groups) {
+const UNRESOLVED_WHY = {
+  no_trace: "行上没有 trace（诊断侧该在拿到 trace 时才推待判题）",
+  foreign: `trace 不属于用例集 ${DATASET}（抢占是全局的：诊断表上没有用例集这一维）`,
+  no_event: "配到了 run 但缺 event id，判题包导不出来",
+  duplicate_trace: "同一条 trace 本轮已经判过，判两遍批注会互相覆盖",
+};
+
+let okN = 0, failN = 0, skipped = 0;
+const seenRows = new Set();      // 放回去的行会被自己重新领到——认出来就说明队列转了一圈，该停了
+const seenTraces = new Set();
+
+while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
+  let row;
+  try {
+    row = await claimDiagnosis({
+      claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC,
+      from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING,
+    });
+  } catch (e) {
+    console.error(`✗ 抢判题任务失败：${e.message || e}`);
+    break;
+  }
+  if (!row) break;
+  if (seenRows.has(row.id)) { await release(row); break; }   // 队列里剩下的都是本轮配不上的
+  seenRows.add(row.id);
+
+  const { targets, unresolved } = matchJudgeTargets([row], runsByRecord);
+  for (const u of unresolved) {
+    const why = (seenTraces.has(String(u.row.trace_id ?? "")) ? UNRESOLVED_WHY.duplicate_trace : UNRESOLVED_WHY[u.reason]) ?? u.reason;
+    console.error(`· 放回 ${u.row.case_source}：${why}`);
+    await release(u.row);
+    skipped += 1;
+  }
+  const c = targets[0];
+  if (!c) continue;
+  if (seenTraces.has(c.traceId)) { console.error(`· 放回 ${row.case_source}：${UNRESOLVED_WHY.duplicate_trace}`); await release(row); skipped += 1; continue; }
+  seenTraces.add(c.traceId);
+
   console.error(`\n════ 判 ${c.eventId}（trace ${String(c.traceId).slice(0, 10)}，轮次 ${c.experiment}）════`);
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), "judge-pkg-"));
   let thisOk = false;   // 这一例成没成——失败的包要留着给人看，不能按全局计数删
@@ -196,13 +211,13 @@ for (const c of groups) {
     // dry-run 的包一律留着看；行在 finally 里放回待判题，空跑不该把队列消掉。
     if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); okN++; continue; }
 
-    console.error(`⚖ 判题会话开跑（包在 ${pkg}）…`);
+    console.error(`⚖ 判题会话开跑（判官 ${MODEL}，包在 ${pkg}）…`);
     let prose = "";
     try {
       // 参数（含「必须挂 MCP」那条硬判据）单源在 lib/judge-session.mjs。
       const res = await runAgentCli({
         prompt: JUDGE_PROMPT,
-        ...judgeSessionArgs({ mcpConfigPath, model: MODEL || undefined, cwd: pkg, timeoutMs: TIMEOUT_MS }),
+        ...judgeSessionArgs({ mcpConfigPath, model: MODEL, cwd: pkg, timeoutMs: TIMEOUT_MS }),
       });
       prose = res.prose || "";
     } catch (e) {
@@ -218,18 +233,18 @@ for (const c of groups) {
       failN++; continue;
     }
 
-    const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", MODEL || "default"]);
+    const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", MODEL]);
     if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); failN++; continue; }
     okN++; thisOk = true;
 
     // 批注回流成功之后才推「已判」：顺序反过来的话，页面会先显示「已判」而批注还没写进去，
-    // 中间那段时间里点开看是空的。推进度失败不算判题失败——批注已经落库了，
-    // 页面上那一行停在「判题中」只是显示滞后，下一轮租约到期把它捞回来重判。
+    // 中间那段时间里点开看是空的。推不动不算判题失败（批注已落库），但也不是纯显示问题——
+    // 那一行会留在「判题中」，等租约到期被下一轮捞回去**重判一遍**（再烧一次判题会话、批注被覆盖）。
     try {
-      const row = await advanceDiagnosis({ id: c.row.id, from: DIAG_JUDGING, to: DIAG_JUDGED });
-      if (!row) console.error(`· ${c.row.case_source} 已不在判题中（租约多半被回收了），不改它的状态`);
+      const moved = await advanceDiagnosis({ id: c.row.id, from: DIAG_JUDGING, to: DIAG_JUDGED });
+      if (!moved) console.error(`· ${c.row.case_source} 已不在判题中（租约多半被回收了），不改它的状态`);
     } catch (e) {
-      console.error(`⚠ ${c.row.case_source} 推「已判」失败（批注已回流，不影响判题结果）：${e.message || e}`);
+      console.error(`⚠ ${c.row.case_source} 推「已判」失败（批注已回流；这一行会留在判题中，下一轮租约到期会被重判）：${e.message || e}`);
     }
   } finally {
     if (!KEEP && thisOk) { try { fs.rmSync(pkg, { recursive: true, force: true }); } catch { /* */ } }
@@ -239,5 +254,6 @@ for (const c of groups) {
   }
 }
 
-console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例 ==`);
+if (okN + failN + skipped === 0) console.error("本轮无事：诊断表里没有待判题的复现。");
+console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例${skipped ? ` · 放回 ${skipped} 条` : ""} ==`);
 process.exit(failN > 0 ? 1 : 0);

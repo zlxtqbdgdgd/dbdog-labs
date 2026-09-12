@@ -199,10 +199,18 @@ for (const summary of events) {
   const probePath = path.join(caseDir, "probe.json");
   if (!fs.existsSync(probePath)) missing.push("probe（探针还没跑：node scripts/llmobs/probe.mjs --case <本目录>）");
 
+  // 答案纸里的根因**按顺序带进 manifest**：判题方按这个顺序编号划分命中 / 没命中，
+  // import 据此核 `findings.roots`，并推导 verdict（`deriveVerdictFromRoots`）。
+  // 带原文而不是只带条数，是为了让人看回流报错时知道第 2 条指的是哪一条。
+  const expectedRoots = hasGroundTruth(expected)
+    ? (Array.isArray(expected?.expected_roots) ? expected.expected_roots.map((r) => String(r)) : [])
+    : [];
+
   cases.push({
     event_id: eventID,
     trace_id: traceID,
     record_id: recordID,
+    expected_roots: expectedRoots,
     status: event?.status ?? summary.status ?? "",
     prior_rounds: prior.length,
     stamp: stampOf(rootSpanOf(spans)),
