@@ -48,10 +48,12 @@ import {
   DIAG_PENDING,
   DIAG_PENDING_JUDGEMENT,
   advanceDiagnosis,
+  blockDiagnosis,
   claimDiagnosis,
   operator,
   listDiagnoses,
 } from "./lib/case-diag-client.mjs";
+import { preflight, resumeBlocked } from "./lib/preflight.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -81,6 +83,21 @@ const STALE_AFTER_SEC = Number(argOf("--stale-after-sec", String(TIMEOUT_SEC * 2
 const MAX_PER_ROUND = LIMIT > 0 ? LIMIT : Number(argOf("--max-per-round", "5"));
 // 并发默认 3（见文件头）。给 0 或负数没有意义，兜回 1。
 const CONCURRENCY = Math.max(1, Number(argOf("--concurrency", "3")) || 3);
+
+// ---- 开跑前守门的三个旋钮（owner 2026-09-12）----
+// MCP 地址与凭证复用探针那两个 env（同一个 server，不另立一套名字）。
+const MCP_URL = argOf("--mcp-url", process.env.DBDOG_MCP_URL || "");
+const MCP_BEARER = process.env.DBDOG_MCP_BEARER || "";
+// 同步考生那份代码的命令。**不内置默认值**：装机形态与配置目录都因机器而异，
+// 写死一条在这儿等于把一个会漂的事实钉成第二个真相源。没给就跳过这一项并告警。
+const SYNC_CMD = argOf("--sync-cmd", process.env.DBDOG_LOOP_SYNC_CMD || "");
+// 现场过期的安全余量。复现方那边已经减过他那一份，这里再减一道——他排期失准时
+// 我们不该跟着烧一轮 agent 预算。
+const TTL_BUFFER_HOURS = Number(argOf("--ttl-buffer-hours", "2")) || 2;
+
+// ---- ⓪ 解除：环境类挡住的行，探活通过就放回队列（蓝图 0028）----
+// 判据（捞哪一族、回哪一步、探几次）单源在 lib/preflight.mjs 的 resumeBlocked，两条 loop 共用。
+await resumeBlocked({ mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD });
 
 // 「同题只跑最新那次复现」要在**抢之前**先有一张快照才判得出来：抢的动作会把行改成
 // diagnosing，之后再去列 pending 就看不见同题的兄弟行了。快照拿不到就不筛——宁可这一轮
@@ -171,6 +188,46 @@ if (claimed.length) {
   } catch (e) {
     console.error(`⚠ 核用例集归属失败，本轮按抢到的原样跑：${e.message || e}`);
   }
+}
+
+// ---- ①b 守门：逐条查依赖的基础环境与代码同步，不过的挡住（owner 2026-09-12）----
+//
+// ⚠️ **已知局限：这一批的检查都发生在整批开跑之前，不是每条真正启动的那一刻。**
+// 本 loop 的形状是「抢 N 条 → 交给 run-experiment 一次跑完（一轮 = 一个 experiment，
+// 重测挂 --parent 才有对照物）」，中途插不进钩子。于是第 5 条真正开跑时，环境可能已经
+// 和这里探到的不一样了。要真做到「每条开跑那一刻」，得让 run-experiment 在每条前面调
+// 一次守门——那个文件是 dbdog-mcp 的镜像（一致性有守门测试钉着），改它是跨仓的另一条改动。
+// 先做成这样：它已经能挡住「环境整个不通」与「这条的现场已经过期」两类，
+// 而那正是眼下会把环境故障记成模型错的两类。
+const blocked = [];
+if (claimed.length) {
+  const keep = [];
+  for (const d of claimed) {
+    const verdict = await preflight(d, {
+      mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD, bufferHours: TTL_BUFFER_HOURS,
+    });
+    for (const c of verdict.checks ?? []) {
+      if (c.skipped) console.error(`  ⚠ ${d.case_source} 守门·${c.name}：${c.detail}`);
+    }
+    if (verdict.ok) { keep.push(d); continue; }
+    console.error(`· ${d.case_source} 被挡住（${verdict.reason}）：${verdict.detail}`);
+    try {
+      // 挡不住也不能留在 diagnosing——那会一直显示「诊断中」。挡失败就放回队列，下轮重试。
+      if (await blockDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, reason: verdict.reason })) {
+        blocked.push({ source: d.case_source, reason: verdict.reason });
+      } else {
+        await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING });
+      }
+    } catch (e) {
+      console.error(`⚠ ${d.case_source} 标记被挡住失败（下轮靠租约回收）：${e.message || e}`);
+    }
+  }
+  claimed = keep;
+}
+if (blocked.length) {
+  const by = new Map();
+  for (const b of blocked) by.set(b.reason, (by.get(b.reason) ?? 0) + 1);
+  console.error(`· 本轮挡住 ${blocked.length} 条：${[...by].map(([r, n]) => `${r} ${n}`).join("、")}`);
 }
 
 // 积压要报出来，哪怕本轮没抢到：数字悄悄变小很危险——不报，看到的人会以为「都跑完了」，
