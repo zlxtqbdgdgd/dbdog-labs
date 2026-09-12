@@ -435,3 +435,57 @@ describe("graph-worker · pushes the graph to the server on the root span", () =
     expect(fs.readFileSync(path.join(dir, "graph-worker.log"), "utf8")).toContain("已推 root+graph");
   });
 });
+
+// ── 代码证据边（2026-09-12）────────────────────────────────────────────────
+// 代码证据由 graph-worker 先跑 source-evidence 两段（正则粗筛 + 模型切分）算好，再传进 build。
+// **build 本身保持零模型**。原来那版在 build 里用纯正则切子代理回参，27 条历史 trace 实测
+// 召回只有 12.5%（43/343）——回参格式每次都不一样，正则追不过来（见 source-evidence.mjs 文件头）。
+// owner 2026-09-12 定：代码证据与遥测证据两种边都要，同级但靠 basis 区分。
+describe("hypothesis-graph · 代码证据边", () => {
+  const EV = {
+    H2: [
+      { title: "出厂构建里那道守卫无条件命中", refs: ["src/common/backend/parser/gram.y:24015-24037", "prepare.cpp:380"] },
+      { title: "PGXC 在所有构建变体里都被定义", refs: ["configure.in:1930-1931", "cmake/src/build_options.cmake:172"] },
+    ],
+  };
+
+  it("传进来的代码证据成 source 边，与工具边并存、靠 basis 区分", () => {
+    const g = build(
+      [dbdog("t1", "search_dbdog_logs", 1, "[H2] type=cause; claim=feature could be enabled on this instance")],
+      { sourceEvidence: EV },
+    );
+    const src = g.edges.filter((e) => e.kind === "source");
+    expect(src.length).toBe(2);
+    expect(src.every((e) => e.from === "H2" && e.basis === "source")).toBe(true);
+    expect(src[0].refs).toContain("prepare.cpp:380");
+    expect(src[1].refs).toContain("cmake/src/build_options.cmake:172");
+    expect(g.edges.some((e) => e.kind === "tool" && e.from === "H2")).toBe(true);
+    expect(g.summary.source_edges).toBe(2);
+  });
+
+  it("子代理裁决当收口用——不必等模型在下一次调用写 close=", () => {
+    const g = build(
+      [dbdog("t1", "search_dbdog_logs", 1, "[H2] type=cause; claim=x")],
+      { sourceEvidence: EV, sourceVerdict: { H2: "falsified" } },
+    );
+    expect(byId(g).H2.verdict).toBe("falsified");
+    expect(g.edges.some((e) => e.kind === "resolve" && e.to === "H2" && e.verdict === "falsified")).toBe(true);
+  });
+
+  it("已经被 close= 关过的假设，子代理裁决不覆盖（工具调用上写的优先）", () => {
+    const g = build(
+      [
+        dbdog("t1", "search_dbdog_logs", 1, "[H2] type=cause; claim=x"),
+        dbdog("t2", "search_dbdog_logs", 2, "[H3] type=cause; claim=y; close=H2:supported"),
+      ],
+      { sourceVerdict: { H2: "falsified" } },
+    );
+    expect(byId(g).H2.verdict).toBe("confirmed");
+  });
+
+  it("不传代码证据时一切照旧（零模型路径不受影响）", () => {
+    const g = build([dbdog("t1", "search_dbdog_logs", 1, "[H1] type=confirm; claim=z")]);
+    expect(g.summary.source_edges).toBe(0);
+    expect(g.edges.filter((e) => e.kind === "source").length).toBe(0);
+  });
+});

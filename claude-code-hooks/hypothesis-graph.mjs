@@ -244,10 +244,19 @@ function compareHid(a, b) {
   return 0;
 }
 
-export function build(spans) {
+/**
+ * @param spans
+ * @param opts.sourceEvidence  hid → [{title, refs[]}]：代码证据，由 graph-worker 先跑
+ *   source-evidence 两段（正则粗筛 + 模型切分）算好再传进来。**build 本身仍是零模型**。
+ *   2026-09-12 换掉了原来那版纯正则切分：27 条历史 trace 实测召回只有 12.5%（43/343），
+ *   漏的全是回参格式抖动（`## H3 verdict:` / `### 1. …` / 行号写在正文不在反引号里）。
+ * @param opts.sourceVerdict   hid → 裁决：子代理回参里说的，省得等模型在下一次调用写 close=
+ */
+export function build(spans, { sourceEvidence = {}, sourceVerdict = {} } = {}) {
   const nodes = new Map();
   const toolEdges = [];
   const resolveEdges = [];
+  const sourceEdges = [];
   const unattached = [];
   const traces = new Set();
   const ordered = spans.slice().sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
@@ -346,6 +355,24 @@ export function build(spans) {
     }
   }
 
+  // 代码证据（外部算好传进来，见 opts.sourceEvidence）：与工具边同级、靠 basis 区分。
+  // 遥测证据是「支持」，代码证据是「必然」——两种都要（owner 2026-09-12）。
+  for (const [hid, steps] of Object.entries(sourceEvidence)) {
+    if (!Array.isArray(steps) || !steps.length) continue;
+    const n = ensure(nodes, hid);
+    n.has_source_evidence = true;
+    for (const st of steps) {
+      sourceEdges.push({ kind: "source", basis: "source", from: hid, title: st.title ?? "", refs: st.refs ?? [] });
+    }
+  }
+  for (const [hid, verdict] of Object.entries(sourceVerdict)) {
+    if (!verdict || verdict === "open") continue;
+    const n = ensure(nodes, hid);
+    if (n.verdict !== "open") continue;
+    n.verdict = verdict;
+    n.closed_by = { from: "子代理裁决", in: "subagent" };
+    resolveEdges.push({ kind: "resolve", from: "子代理裁决", to: hid, verdict });
+  }
   const nodeList = [...nodes.values()].sort(compareHid);
   // covered_through（2026-09-10）：图覆盖到的事件时间上界 = 参与出图的 span 里最晚的 ts 原值
   // （不取 now——那是出图时刻，不是覆盖面）。server 拿它跟 span 水位 max(ts) 比判「图落后于 span」；
@@ -360,7 +387,7 @@ export function build(spans) {
     tool_call_count: seq,
     tool_call_count_all: toolCallsAll,
     nodes: nodeList,
-    edges: [...parentEdges, ...toolEdges, ...resolveEdges],
+    edges: [...parentEdges, ...toolEdges, ...sourceEdges, ...resolveEdges],
     unattached_tools: unattached,
     summary: {
       hypotheses: nodeList.length,
@@ -369,6 +396,8 @@ export function build(spans) {
       // 父编号（点分推出的或显式写的）指向的节点从没被提出过的数量。0 才算这棵树是连的。
       orphan_hypotheses: orphans,
       tool_edges: toolEdges.length,
+      // 代码证据边：一层子代理回参里带行号的引用（与工具边同级、靠 basis 区分）
+      source_edges: sourceEdges.length,
       resolve_edges: resolveEdges.length,
       unattached_tools: unattached.length,
       unattached_intent_without_head: unattached.filter((u) => u.reason === "intent_without_head").length,
@@ -414,12 +443,12 @@ export function renderMd(g) {
     `- trace：\`${g.trace_ids.join(", ") || "—"}\``,
     `- span ${g.span_count} 条，其中工具调用 ${g.tool_call_count_all ?? g.tool_call_count} 次；dbdog（MCP）调用 ${g.tool_call_count} 次进图，${localExcludedNote(s)}`,
     `- 假设 ${s.hypotheses} 个（其中 ${s.undeclared} 个只被引用、未在调用上声明）· ` +
-      `假设↔假设边 ${s.parent_edges} · 假设↔工具边 ${s.tool_edges} · 收口边 ${s.resolve_edges} · ` +
+      `假设↔假设边 ${s.parent_edges} · 假设↔工具边 ${s.tool_edges} · 代码证据边 ${s.source_edges ?? 0} · 收口边 ${s.resolve_edges} · ` +
       `未挂到假设的工具调用 ${s.unattached_tools}（其中 ${s.unattached_intent_without_head} 次写了字段但 intent 不带 [H..] 头）· ` +
       `正文提出 ${s.proposed_in_prose ?? 0}` +
       (s.source_hypotheses ? ` · 源码来源的假设 ${s.source_hypotheses}（其中 ${s.source_without_evidence} 个没有任何现场证据调用）` : ""),
     "",
-    "读法：节点 = 假设；缩进 = `[H2.1<H2]` 声明的父子关系；每个假设下面的表 = 该假设名下的工具调用（seq 是 dbdog（MCP）工具调用的序号，从 1 起连续，可据此看先后；Grep/Read/Bash 等本地工具不计、不进图）。",
+    "读法：节点 = 假设；缩进 = `[H2.1<H2]` 声明的父子关系；每个假设下面的表 = 该假设名下的工具调用（seq 是 dbdog（MCP）工具调用的序号，从 1 起连续，可据此看先后；Grep/Read/Bash 等本地工具不计、不进图）代码证据来自一层子代理的回参，与工具证据同级、靠「代码证据」小节区分——遥测证据是「支持」，代码证据是「必然」，两种都要看。",,
     "",
     "## 假设树（假设↔假设、假设↔工具）",
     "",
@@ -460,6 +489,14 @@ export function renderMd(g) {
       lines.push(`- 假设：${n.text ?? "（未写 claim=）"}`);
       lines.push(`- 判据：${n.expect ?? "（未写 expect=）"}`);
       lines.push(`- 首次出现：seq ${n.first_seq}`);
+    }
+    const srcEdges = g.edges.filter((e) => e.kind === "source" && e.from === n.id);
+    if (srcEdges.length) {
+      lines.push("", `**代码证据**（子代理回参，逐条可回源码核）：`);
+      for (const e of srcEdges) {
+        lines.push(`- ${e.title || "（无小节标题）"}`);
+        for (const r of e.refs) lines.push(`  - \`${r}\``);
+      }
     }
     if (n.basis === "source") {
       lines.push(
@@ -555,9 +592,9 @@ export function agentConclusion(spans) {
  * 出图：写 forward-path.json / forward-path.md / forward-conclusion.md 到 out 目录。
  * 返回 { md, json, summary }。spans 为空抛错（调用方决定怎么报）。
  */
-export function writeGraph(spans, out, source = {}) {
+export function writeGraph(spans, out, source = {}, opts = {}) {
   if (!spans.length) throw new Error("没有读到 span（检查路径 / --trace / --session）");
-  const g = build(spans);
+  const g = build(spans, opts);
   g.source = source;
   fs.mkdirSync(out, { recursive: true });
   const jp = path.join(out, "forward-path.json");

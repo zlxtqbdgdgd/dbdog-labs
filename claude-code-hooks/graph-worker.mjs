@@ -13,6 +13,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { obsDir, readState, reportSpans, run, scanSpans } from "./lib.mjs";
 import { build, compactGraph, dedupe, writeGraph } from "./hypothesis-graph.mjs";
+import { sourceEvidenceCandidates } from "./source-evidence.mjs";
+import { buildSourceEvidencePrompt, parseSourceEvidenceReply } from "./source-evidence-prompt.mjs";
+import { generateSummary, summaryEnv } from "./summary.mjs";
 
 function logNote(sessionId, msg) {
   try {
@@ -24,6 +27,43 @@ function logNote(sessionId, msg) {
 
 export function graphDir(traceId) {
   return path.join(obsDir(), "graphs", traceId);
+}
+
+/**
+ * 代码证据：正则粗筛 → 模型切分（source-evidence.mjs / source-evidence-prompt.mjs）。
+ * **best-effort**：没配模型 env、或某一条判不出来，就少一条代码证据，图照出。
+ * 复用 summaryEnv()——跟诊断总结同一把 key，不额外要配置。
+ * 一条 trace 的候选平均 4.9K 字符（27 条历史 trace 实测），逐个 Agent 回参各发一次。
+ */
+async function collectSourceEvidence(spans, note) {
+  const cands = sourceEvidenceCandidates(spans);
+  if (!cands.length) return { sourceEvidence: {}, sourceVerdict: {}, tried: 0, got: 0 };
+  const env = summaryEnv();
+  if (!env) {
+    note(`代码证据：${cands.length} 条候选，但没配模型 env（DBDOG_SUMMARY_LLM_* / ANTHROPIC_*），跳过`);
+    return { sourceEvidence: {}, sourceVerdict: {}, tried: 0, got: 0 };
+  }
+  const sourceEvidence = {};
+  const sourceVerdict = {};
+  let got = 0;
+  for (const c of cands) {
+    const prompt = buildSourceEvidencePrompt(c);
+    if (!prompt) continue;
+    try {
+      const reply = await generateSummary([{ role: "user", content: prompt }], { ...env, maxTokens: 1500 });
+      const parsed = parseSourceEvidenceReply(reply?.text ?? reply);
+      if (!parsed) continue;
+      if (parsed.steps.length) {
+        sourceEvidence[parsed.id] = [...(sourceEvidence[parsed.id] ?? []), ...parsed.steps];
+        got += parsed.steps.length;
+      }
+      // 裁决取粗筛的正则结果（c.verdict），不取模型的——见 source-evidence.mjs 文件头
+      if (c.verdict && !sourceVerdict[parsed.id]) sourceVerdict[parsed.id] = c.verdict;
+    } catch (err) {
+      note(`代码证据：span ${c.spanId} 判切分失败（${err?.message ?? err}）`);
+    }
+  }
+  return { sourceEvidence, sourceVerdict, tried: cands.length, got };
 }
 
 /** root = kind=agent 且无 parent；多条取最后一版（dedupe 已按后写赢）。 */
@@ -43,8 +83,10 @@ run(async () => {
     });
     const spans = dedupe(mine);
     if (!spans.length) return;
-    const { summary: s } = writeGraph(spans, graphDir(state.trace_id), { trace: state.trace_id, session: sessionId });
-    logNote(sessionId, `trace=${state.trace_id} 假设 ${s.hypotheses} 工具边 ${s.tool_edges} 未挂 ${s.unattached_tools} 源码假设 ${s.source_hypotheses}/无现场证据 ${s.source_without_evidence}`);
+    const ev = await collectSourceEvidence(spans, (m) => logNote(sessionId, `trace=${state.trace_id} ${m}`));
+    const opts = { sourceEvidence: ev.sourceEvidence, sourceVerdict: ev.sourceVerdict };
+    const { summary: s } = writeGraph(spans, graphDir(state.trace_id), { trace: state.trace_id, session: sessionId }, opts);
+    logNote(sessionId, `trace=${state.trace_id} 假设 ${s.hypotheses} 工具边 ${s.tool_edges} 代码证据边 ${s.source_edges}（候选 ${ev.tried} 条回参）未挂 ${s.unattached_tools} 源码假设 ${s.source_hypotheses}/无现场证据 ${s.source_without_evidence}`);
 
     // ② 紧凑图挂 root 重发（server 存 root 行的 graph 列）
     const root = rootOf(spans, state.root_span_id);
@@ -52,7 +94,7 @@ run(async () => {
       logNote(sessionId, `trace=${state.trace_id} 没有 root span，图未推 server`);
       return;
     }
-    const graph = compactGraph(build(spans));
+    const graph = compactGraph(build(spans, opts));
     const ok = await reportSpans([{ ...root, graph }]);
     logNote(sessionId, ok ? `trace=${state.trace_id} 已推 root+graph（${JSON.stringify(graph).length} B）` : `trace=${state.trace_id} root+graph 未送达（未配上报 env 或上报失败）`);
   } catch (err) {

@@ -289,10 +289,12 @@ export function synthesize({ lines, traceId, sessionId, parentId, mlApp, pending
       duration_ms: duration,
       // input 恒 null：每轮的完整 prompt = 之前全部对话，处理侧按 trace 内时间序从各 span
       // 的正文复原即可，逐轮重复入盘是纯冗余（2026-08-10～09-08 的 input_local 实测占本地
-      // 文件 70%，已移除）。thinking 没有上报字段，只落本地全量。
+      // 文件 70%，已移除）。thinking 走 capField：服务端 2026-09-12 起有这一列（蓝图 0036），
+      // 截断值上报、超 contentCap 的全量仍留本地。此前只落 thinking_local，于是整条推理过程
+      // 只能在开发机上查——控制台上 thinking 恒空，别人没法审这条链。
       input: null,
       ...capField("output", emittedOutput),
-      ...(emittedThinking ? { thinking_local: emittedThinking } : {}),
+      ...(emittedThinking ? capField("thinking", emittedThinking) : {}),
       tokens_input: msg.usage.input_tokens ?? null,
       tokens_output: msg.usage.output_tokens ?? null,
       tokens_cache_read: msg.usage.cache_read_input_tokens ?? null,
