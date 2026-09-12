@@ -48,15 +48,32 @@ export const EVIDENCE_VALUES = ["solid", "weak"];
  */
 export const FINDING_KINDS = ["tool", "skill", "model", "case", "env", "unsure"];
 
-/** 这几类是能动手修的（web「有 dbdog 要修的」筛的是 tool / skill；case 改用例；env 回复现那一侧）。 */
-export const FIXABLE_KINDS = ["tool", "skill", "case", "env"];
+/**
+ * 这几类是**有人能动手**的：`tool` / `skill` 修 dbdog，`case` 回出题那一侧人工改题面或答案纸。
+ *
+ * `env` 2026-09-12 退出这一档（owner：「改题面可以判为需要人工介入，但是环境是改不了的」）。
+ * 现场不成立没有下一步——既不是 dbdog 的错也不是题的错，只能重新复现。把改不了的东西留在
+ * 「能动手修的」里，修的人每轮都要先筛一遍，而清单越长越没人看（Tricorder：误报率过约 10%
+ * 开发者就不再看它报的任何东西）。
+ */
+export const FIXABLE_KINDS = ["tool", "skill", "case"];
 
 /**
- * `tool` 类落在哪一层。**这一维独立于 kind**：同是「工具错」，改 server 的查询、改 agent 的采集项、
- * 改 hooks、改跑批脚本是四个仓四个人，连「怎么验」都不同（采集项改完要重装 + 等一个采集周期，
- * 不是「重放必须变对」）。原先只靠 `key` 的第一段暗示，没有词表也不校验，于是各写各的。
+ * `TOOL_LAYERS` 与 `fix_where` 2026-09-12 撤销（owner：「判题层把问题找到就可以了，
+ * 在哪个仓库修复应该是修复层做的事情」「layer / fix_where 就不要写，我们不确定，
+ * 给出去的东西不确定」）。
+ *
+ * 撤销的硬理由不是分工，是**判题包里没有这个材料**：判官手上是 trace / 答案纸 / 历史判定 /
+ * 还没关的条目，外加 MCP。这几样都答不了「这个工具返回空是服务端查询写错了还是采集就没采」
+ * ——在线去活系统核能分开「有这项但返回错」与「根本没这项」（那是 qualifier 这一维），
+ * 但分不开 server 和 agent，那要知道 dbdog 的实现。逼填就是逼猜。
+ *
+ * 猜错的代价是隐形的：修的人照着落点打开一个文件，发现不是那儿，重新定位一遍——而工单上
+ * 那行错落点会一直留着，下一轮同 `key` 又按它聚合。
+ *
+ * **老包里带着这两个字段不拒**，忽略即可：拒一条无害的多余字段，代价是一例几十分钟白跑，
+ * 收益只是整洁。
  */
-export const TOOL_LAYERS = ["server", "agent", "hooks", "scripts"];
 
 /**
  * ODC（Orthogonal Defect Classification，IBM Chillarege）的 qualifier：**缺失 / 写错 / 多余**是与
@@ -455,12 +472,13 @@ const nonEmpty = (v) => typeof v === "string" && v.trim().length > 0;
 
 /**
  * `findings` 的形状：
- * `{ items: [{key, kind, title, evidence, fix_where, suggestion, repro?, pointers}], checks: [{key, status, kind?, pointers, note}] }`。
- * - items：这一轮新发现的改进点，一条一个落点。三个属性各管一维（ODC 式，互不替代）：
- *   `kind` 谁去干（六类）、`layer` 落在哪一层（tool 必填）、`qualifier` 缺失 / 写错 / 多余（tool、skill 必填）。
- *   `title` / `evidence` 必填（读的人靠它们，不靠 key）；`fix_where` 与 `suggestion` 在 tool / skill / case / env
- *   四类必填（能动手修的必须说改哪里）；**`repro` 六类全必填**（owner 2026-09-12）；`rule_ref` 在 model 必填；
- *   `suspected_kind` 在 unsure 必填；`unsure` 的 `suggestion` 写要人核什么。
+ * `{ items: [{key, kind, qualifier?, title, evidence, expected, repro, pointers}], checks: [{key, status, kind?, pointers, note}] }`。
+ * - items：这一轮新发现的改进点，一条一个缺口。判官只交**自己观察得到的**：
+ *   `kind` 这是哪一类错（六类，判据是「固定代码重放会不会一样错」）、`qualifier` 缺失 / 写错 / 多余
+ *   （tool、skill 必填）。`title` / `evidence` 必填（读的人靠它们，不靠 key）；
+ *   `expected`（修好之后重放该看到什么）在 tool / skill / case 三类与 unsure 必填；
+ *   **`repro` 六类全必填**（owner 2026-09-12）；`rule_ref` 在 model 必填；`suspected_kind` 在 unsure 必填。
+ *   `layer` / `fix_where` 已撤（见 FIXABLE_KINDS 上方那段）：代码位置归修复层。
  * - checks：这道题之前几轮提过、还没关的，逐条复验（`fixed` / `still_open` 必须带证据指针）。
  * 旧形状（`attribution`、顶层一段 `fix_where`）直接拒：一段里塞五处改动，数不出哪处修了。
  */
@@ -484,11 +502,16 @@ export function validateFindings(a) {
     if (!FINDING_KINDS.includes(it.kind)) problems.push(`${w}.kind ${JSON.stringify(it.kind)} 只能是 ${FINDING_KINDS.join(" / ")}`);
     if (!nonEmpty(it.title)) problems.push(`${w}.title 缺失（一句话说谁在哪出了什么事）`);
     if (!nonEmpty(it.evidence)) problems.push(`${w}.evidence 缺失（看到了什么 / 本该是什么 / 为什么是问题）`);
-    if (FIXABLE_KINDS.includes(it.kind)) {
-      if (!nonEmpty(it.fix_where)) problems.push(`${w}.fix_where 缺失（${it.kind} 类必须说改哪里，且只写一处）`);
-      if (!nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（${it.kind} 类必须说怎么改）`);
+    // `expected` 取代 `suggestion`（2026-09-12）：写的是**修好之后重放该看到什么**，不是「去哪儿改」。
+    // 怎么改归修复层；判官这一栏同时是关单判据——`fix-mark` 打了 claimed_fixed 之后，
+    // 复验对照的就是它。
+    if (nonEmpty(it.suggestion)) {
+      problems.push(`${w}.suggestion 已废弃，改写 expected：不是「去哪儿改」（那归修复层），是「修好之后重放该看到什么」`);
     }
-    if (it.kind === "unsure" && !nonEmpty(it.suggestion)) problems.push(`${w}.suggestion 缺失（unsure 要写清要人核什么、看哪里）`);
+    if (FIXABLE_KINDS.includes(it.kind) && !nonEmpty(it.expected)) {
+      problems.push(`${w}.expected 缺失（${it.kind} 类必填：修好之后重放该看到什么）`);
+    }
+    if (it.kind === "unsure" && !nonEmpty(it.expected)) problems.push(`${w}.expected 缺失（unsure 写「请核：…（看哪里）」）`);
     // ODC 的第二维：缺失 / 写错 / 多余。不问这一句，「没这个能力」与「有但坏了」会挤在同一类里，
     // 而它们的下一步和验法都不同（见 FINDING_QUALIFIERS）。
     if (QUALIFIED_KINDS.includes(it.kind) && !FINDING_QUALIFIERS.includes(it.qualifier)) {
@@ -496,13 +519,6 @@ export function validateFindings(a) {
     }
     if (!QUALIFIED_KINDS.includes(it.kind) && it.qualifier !== undefined && !FINDING_QUALIFIERS.includes(it.qualifier)) {
       problems.push(`${w}.qualifier ${JSON.stringify(it.qualifier)} 只能是 ${FINDING_QUALIFIERS.join(" / ")}`);
-    }
-    // 工具错要说清落在哪一层：四层四个仓四种验法，写不出来多半是还没定位到落点。
-    if (it.kind === "tool" && !TOOL_LAYERS.includes(it.layer)) {
-      problems.push(`${w}.layer ${JSON.stringify(it.layer)} 只能是 ${TOOL_LAYERS.join(" / ")}（tool 类必填）`);
-    }
-    if (it.kind !== "tool" && it.layer !== undefined && !TOOL_LAYERS.includes(it.layer)) {
-      problems.push(`${w}.layer ${JSON.stringify(it.layer)} 只能是 ${TOOL_LAYERS.join(" / ")}`);
     }
     // **六类全要写「怎么复现」**（owner 2026-09-12：「所有类别都是各自使用一段话说清楚」）。
     //
@@ -532,8 +548,8 @@ export function validateFindings(a) {
       }
     }
     // skill 类的下一步是「改一段话」：不写出原句，改的人还得自己再想一遍——那就不算能走下去的条目
-    if (it.kind === "skill" && nonEmpty(it.suggestion) && !/[「“"]/.test(it.suggestion)) {
-      problems.push(`${w}.suggestion 没写出要加或要改的原句（skill 类要用「」把那句话引出来）`);
+    if (it.kind === "skill" && nonEmpty(it.expected) && !/[「“"]/.test(it.expected)) {
+      problems.push(`${w}.expected 没写出要加或要改的原句（skill 类要用「」把那句话引出来）`);
     }
     if (it.kind === "scaffold") problems.push(`${w}.kind scaffold 已撤（2026-09-11）：hooks / 跑批脚本的代码错归 tool，模板 / 提示词的话归 skill`);
     problems.push(...pointerProblems(w, it.pointers, true));

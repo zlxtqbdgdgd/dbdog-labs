@@ -51,6 +51,25 @@ description: 给一次数据库诊断（一条 trace）判卷：结论对不对�
 证据强度：直查底层数据 > 换一条路取到 > 原样复调。每条改进点的 evidence 里写清走的是哪条路、拿到什么值。
 只有活系统也看不出来，才记 `unsure`。离线判题才依赖包里给的探针 / 反向链，没有就如实写。
 
+#### 自己调 dbdog 核
+
+判题会话挂着 MCP，你能自己调 dbdog。轨迹里返回空的、报错的、值看着不对的地方，调一次就知道——
+原样重调、换一维参数、换一条路查同一份数据。
+
+怎么读：
+
+| 试出来 | 判成 |
+|---|---|
+| 原样重调还是那个结果 | 确定性的，可以往 `tool` 上判 |
+| 换一维参数就对了 | `skill`（没教这一维怎么填）或 `model`（教了没照做，要引规矩出处） |
+| 这条路查不到、别的路查得到 | `tool`·`incorrect` |
+| 哪条路都查不到 | 数据本来就没有，**不是缺陷**——写进 `summary` 的「未调无碍」旁边，别记成条目 |
+| 报错 | `tool`·`incorrect` |
+
+最后一行最容易记错：「取不到」和「本来就没有」在轨迹上长得一模一样，只有去试才分得开。
+
+调出来的那条调用直接写进 `repro`：它天然带着实例与窗口，下游贴上去就能跑。
+
 ### 包判题（离线，连不上 dbdog）
 
 只读包里的文件，**不能回头追问**：材料不全就是结论的一部分。包目录：
@@ -76,11 +95,12 @@ cases/<event_id>/
 | 缺什么 | 在线判题 | 包判题 |
 |---|---|---|
 | `probe.json` | **去活系统核**：走任何能到的路查同一份数据（别的工具、DDSQL、直查、控制台），也可以原样重调一次做对照。核得出就照常判「工具错」或「不是问题」；活系统也看不出才判 `unsure`，并写明看了哪里、为什么看不出。**不许因为「没有探针」就直接当没有工具错，也不许因此记 `unsure`** | 抓不到两两对照的判 `unsure`，`summary` 里写明「未经探针交叉验证」 |
-| `reverse.md` | 有答案纸就能倒推该有哪些证据；每条去活系统看有没有，再对照 trace 看 agent 查没查 | `skill` / `model` 两类判不准，拿不准的记 `unsure`，`summary` 写「反向链缺席」 |
+| `reverse.md` | 有答案纸就能倒推该有哪些证据；每条去活系统看有没有，再对照 trace 看 agent 查没查。**另有一条不靠反向链的路**：把 agent 调过的那次换一维参数自己再调一遍——换了就对说明是 `skill` / `model`，怎么换都不对说明是 `tool`（见「自己调 dbdog 核」） | `skill` / `model` 两类判不准，拿不准的记 `unsure`，`summary` 写「反向链缺席」 |
 | `ground-truth.md` | 两种模式相同：**题坏了**，见「没有答案纸 = 题坏了」 | 同左 |
 
 没有反向链与探针时，「模型没想到查 X」和「查了 X 但 dbdog 没采」在 trace 里长得一模一样。
-取数模式下你有办法把这两者分开——那就去分；猜出来的归因比不填更糟。
+在线判题有办法把这两者分开——自己调一次 X 就知道（「自己调 dbdog 核」那一节），那就去分；
+猜出来的归因比不填更糟。
 
 ## 你要写的四个 label
 
@@ -117,24 +137,26 @@ cases/<event_id>/
 （别用「加分级证据」这种说法——那是反向证据链里的分档，在线判题多半没有反向链，判官无从对照。）
 否则清单里会堆满「本来就不必查」，下一轮排优先级全是噪音。
 
-每条改进点要填**三个互不替代的属性**：谁去干（`kind`）、落在哪一层（`layer`）、是缺失还是写错（`qualifier`）。
+每条改进点要填**两个互不替代的属性**：这是哪一类错（`kind`）、是缺失还是写错（`qualifier`）。
+两个都由**观察**定，不由推断定——`kind` 的判据是「固定代码重放会不会一样错」，`qualifier` 的判据是
+「工具压根没这一项，还是有但返回错」，两样你都试得出来。
 一条改进点提出来，读的人要能不假思索地走下去（owner 2026-09-11：「我们的错一定是能转换为下一步动作的，
 不能提了不知道怎么往下走」）。
 
-### ① `kind`：下一步**谁**去干，六类互斥
+### ① `kind`：这是哪一类错，六类互斥
 
-**分类的唯一标准是「下一步谁去干什么、怎么验」。按这个顺序问**：
+**分类的唯一标准是「固定代码重放会不会一样错、错在哪一层材料上」。按这个顺序问**：
 
 | 问 | 答「是」→ kind | 判据 | 下一步动作 | 怎么验 |
 |---|---|---|---|---|
-| 1. 去活系统核（在线：走任何一条路查同一份数据；离线：探针），固定代码重放同一调用会不会一样错？ | `tool`（工具错，**确定性**） | dbdog 返回错值 / 有数据却返回空 / 报错 / 该有的工具或采集项没有；也包括 hooks、跑批脚本这类**代码**的错（停不掉子任务、该打点的没打），以及判题 / 诊断编排自己的运行时问题（会话被超时杀掉、批量调用打爆预算） | 在 `fix_where` 指的仓 + 文件改代码或配置，出 PR；`repro` 要能**一条命令重放**（六类都必填 `repro`，见字段表） | 重放必须变对；下一轮复验一次 `fixed` 即关 |
-| 2. 重放不会错，但**给模型的话**写错了、或该写的没写？（skill 正文、工作目录模板 `HYPOTHESIS.md`、派单提示词都算） | `skill`（skill 错，**非确定性**） | 模型照着做了却做错；或那条路 / 那条规矩根本没写——子代理派发规则、假设怎么记、谁能收口，都是「给模型的话」 | 在 `fix_where` 指的那一节改一段话；`suggestion` **必须写出要加或要改的原句**（用「」引起来） | 非确定性：重跑至少 2 轮不再犯才关 |
+| 1. 去活系统核（在线：走任何一条路查同一份数据；离线：探针），固定代码重放同一调用会不会一样错？ | `tool`（工具错，**确定性**） | dbdog 返回错值 / 有数据却返回空 / 报错 / 该有的工具或采集项没有；也包括 hooks、跑批脚本这类**代码**的错（停不掉子任务、该打点的没打），以及判题 / 诊断编排自己的运行时问题（会话被超时杀掉、批量调用打爆预算） | 修 dbdog 的代码或配置（**改哪个仓、哪个文件由修复层定，不是你**）；`repro` 要能**一条命令重放**（六类都必填 `repro`，见字段表） | 重放必须变对；下一轮复验一次 `fixed` 即关 |
+| 2. 重放不会错，但**给模型的话**写错了、或该写的没写？（skill 正文、工作目录模板 `HYPOTHESIS.md`、派单提示词都算） | `skill`（skill 错，**非确定性**） | 模型照着做了却做错；或那条路 / 那条规矩根本没写——子代理派发规则、假设怎么记、谁能收口，都是「给模型的话」 | 改「给模型的话」；`expected` **必须写出要加或要改的原句**（用「」引起来） | 非确定性：重跑至少 2 轮不再犯才关 |
 | 3. 工具返回对、规矩也写了，模型自己推错 / 编造 / 没照做 / 结论没用上证据？ | `model`（模型抽风） | 证据在手却用反、引用树上不存在的假设、把「没有」读成「丢了」。**必须给反证**：`rule_ref` 写出规矩写在哪个 skill 的哪一节 | 不改代码，先记着；**这道题之前已经有过一次同 key 的 `model`，这一轮就直接提一条 `skill`**（带原句），不要等页面提示 | 计次 |
 | 4. 答案纸与证据矛盾、题面缺时间窗、用例本身不可复现？ | `case`（题有问题） | 证据链完整、结论合理，却与答案纸**讲的机制**对不上。**「答案纸与证据矛盾」这一种，必须去读答案纸标的出处**（issue 正文或那条已合入 PR）并在 `evidence` 里引出原文与矛盾点；
 引不出来就不是 `case`（`wrong` 是 `verdict` 的取值、不是类别）：按 `unsure` 提、`suspected_kind` 写 `case`，结论错不错由 `verdict` 那一轴说。
-**另外两种 case 不要求引出处**：题面缺时间窗 / 缺必要信息，以及题面指望的东西按设计就不存在（见「已知的设计取舍」） | 回**建用例**那一步改题面 / 答案纸，`fix_where` 指到那条 record（判官自己不改用例） | 下一轮按新答案纸判 |
-| 5. 题没问题、dbdog 也没问题，但**这次复现的现场不对**？ | `env`（复现 / 环境侧） | 窗口里现象根本没出来、靶机被重装或换了版本、时间窗与现场对不上——诊断做得再对也定位不到 | 回**复现**那一侧重跑（那是另一个系统的活，我们只收回执），`fix_where` 指到这条复现回执 | 下一次复现的窗口里能看到现象 |
-| 6. 以上都拿不准：两种以上说得通、材料不够分是谁的锅？ | `unsure`（判不出，要人看） | 例如「没有数据」与「丢了数据」分不开。**在线判题要判 `unsure`，先走完三条路**：① 直查库表 ② 换一个工具或另一个口 ③ 控制台 / 日志 / 指标——三条都看不出才算数，`evidence` 里写明各走到哪。`suspected_kind` 必填 | 人按 `suggestion` 写的地方去核，定成上面之一；`summary` 里要点名「本例有 N 条要人核」，否则没人知道该来看 | 人定后重跑一次 import 覆盖，不是追加一行 |
+**另外两种 case 不要求引出处**：题面缺时间窗 / 缺必要信息，以及题面指望的东西按设计就不存在（见「已知的设计取舍」） | **要人工介入**：回建用例那一步改题面 / 答案纸（判官自己不改用例） | 下一轮按新答案纸判 |
+| 5. 题没问题、dbdog 也没问题，但**这次复现的现场不对**？ | `env`（复现 / 环境侧） | 窗口里现象根本没出来、靶机被重装或换了版本、时间窗与现场对不上——诊断做得再对也定位不到 | **没有下一步，环境改不了**：这一例作废，回复现那一侧重跑（那是另一个系统的活，我们只收回执）。所以 `env` 不在「能动手修的」那一档里，也不要求写 `expected` | 下一次复现的窗口里能看到现象 |
+| 6. 以上都拿不准：两种以上说得通、材料不够分是谁的锅？ | `unsure`（判不出，要人看） | 例如「没有数据」与「丢了数据」分不开。**在线判题要判 `unsure`，先走完三条路**：① 直查库表 ② 换一个工具或另一个口 ③ 控制台 / 日志 / 指标——三条都看不出才算数，`evidence` 里写明各走到哪。`suspected_kind` 必填 | 人按 `expected` 写的地方去核，定成上面之一；`summary` 里要点名「本例有 N 条要人核」，否则没人知道该来看 | 人定后重跑一次 import 覆盖，不是追加一行 |
 
 **`env` 是 2026-09-11 补的**：在此之前，「这次复现根本没出现象」无处可放，只能塞 `case`（冤枉了题）
 或 `unsure`（假装判不出）——两种都会让下一轮读不懂这条到底该谁去动。
@@ -148,26 +170,24 @@ cases/<event_id>/
 **「编排错」（`scaffold`）这一类没有了**（2026-09-11 撤掉；校验器见到 `kind: "scaffold"` 会直接拒）：它按话题分，不按下一步分，一条提出来分不清该改代码还是改话。
 以前归它的：hooks / 跑批脚本的代码错 → `tool`；工作目录模板 / 派单提示词写错或没写 → `skill`。
 
-### ② `layer`：`tool` 类落在哪一层（必填）
+### ② 落点不归你写（`layer` / `fix_where` 2026-09-12 撤销）
 
-同是「工具错」，四个落点是四个仓、四个人，连怎么验都不一样：
+owner 定：「判题层把问题找到就可以了，在哪个仓库修复应该是修复层做的事情」「`layer` / `fix_where`
+就不要写，我们不确定，给出去的东西不确定」。
 
-| layer | 什么样的问题 | 怎么验 |
-|---|---|---|
-| `server` | MCP 工具的查询 / 返回契约错（返回空、字段拼错、not_found 乱放） | 重放同一调用，返回必须变对 |
-| `agent` | 该采的没采、采集项没开、集成配置不对 | 改配置 + 重装 + **等一个采集周期**，再查该有的点位 |
-| `hooks` | 采集 span 的钩子漏采、错采、超预算 | 重放一次会话，span 必须齐 |
-| `scripts` | 跑批 / 编排脚本的错（停不掉子任务、领了活不放回、会话超时被杀） | 重跑那一条命令 |
+**硬理由不是分工，是你手上没有这个材料。** 判题包里是 trace、答案纸、历史判定、还没关的条目，
+外加 MCP。这几样都答不了一个问题：这个工具返回空，是服务端的查询写错了，还是采集就没采？
+去活系统核能分开「有这一项但返回错」与「根本没这一项」——那是 `qualifier` 这一维，你判得出来；
+但分不开 `server` 和 `agent`，那要知道 dbdog 的实现。
 
-**从现象跳到落点**，常见的几条（写 `fix_where` 时对着找，别只写到仓级——写到仓级，修的人还得再找一遍）：
+猜错的代价是隐形的：修的人照着落点打开一个文件，发现不是那儿，重新定位一遍——而工单上那行错落点
+会一直留着，下一轮同 `key` 又按它聚合。
 
-| 看到的现象 | 多半落在 | 去哪儿看 |
-|---|---|---|
-| 工具返回空 / 返回错值 / 字段拼错 / not_found 乱放 | `server` | dbdog-mcp 的 `src/tools/<工具名>` 与它拼的查询 |
-| 指标 / 样本 / 计划根本没有点位，库里也查不到 | `agent` | dbdog-agent 的集成配置（那个引擎的采集项开没开） |
-| 轨迹里少了本该有的 span、假设没记上、会话结尾丢一段 | `hooks` | dbdog-labs 的 `claude-code-hooks/` |
-| 领了活不放回、会话被超时杀掉、子任务停不掉、批量调用打爆预算 | `scripts` | `skills/diag-flywheel/scripts/llmobs/` 里那条 loop |
-| 模型没想到查某样东西 | 这条不是 `tool`、也就没有 `layer`：先查 skill 正文写没写，没写就是 `skill`·`missing` | 那个引擎的 dbm-* skill |
+所以现象就写成现象。「直查指标库，`checkpoints_timed` 近 7 天零点位，同版本另一台有」——
+这是你的观察，写进 `evidence`；「所以要改 dbdog-agent 的采集配置」是推断，不写。
+
+**`key` 也跟着改**：前缀按**症状**取，不按落点取（详见字段表）。落点写进 `key` 是永久的，
+`key` 一旦定了改不动，跨轮聚合就一直按那个猜来的落点算。
 
 ---
 
@@ -203,23 +223,25 @@ cases/<event_id>/
 
 | 字段 | 要求 |
 |---|---|
-| `key` | 稳定短名：只能用 `a-z0-9._-`、≤ 80 字符（中文、大写、空格一律被拒），形如 `<层>.<模块>.<缺什么>`，如 `server.database-schemas.not-found-echoes-request`、`skill.dbm-opengauss.sample-attribute-prefix`、`template.dispatch.background-leaf-results-lost`、`hooks.taskstop.owner-check-rejects-dispatcher`。它是跨轮次认「同一个缺口」的唯一依据 |
+| `key` | 稳定短名：只能用 `a-z0-9._-`、≤ 80 字符（中文、大写、空格一律被拒），形如 `<工具或现象>.<缺什么>`，如 `database-schemas.not-found-echoes-request`、`dbm-opengauss.sample-attribute-prefix`、`dispatch.background-leaf-results-lost`、`taskstop.owner-check-rejects-dispatcher`。**按症状取名，别按落点取**（别写 `server.` / `agent.` / `hooks.` 前缀）——落点是猜的，而 `key` 一旦定了改不动，跨轮聚合会一直按那个猜算。它是跨轮次认「同一个缺口」的唯一依据 |
 | `kind` | 上表六类之一 |
-| `layer` | `tool` 类必填：`server` / `agent` / `hooks` / `scripts`（见 ② 那张表） |
 | `qualifier` | `tool`、`skill` 必填：`missing` / `incorrect` / `extraneous`（见 ③ 那张表） |
 | `rule_ref` | `model` 类必填：规矩写在哪个 skill / 模板的**哪一节**。查不到那一节 = 这是 `skill` 缺规矩，不是模型抽风 |
 | `suspected_kind` | `unsure` 类必填：疑似是上面哪一类。弃判不是一种缺陷，它是「还没定」——记下疑似类别，这一条才还算在对应那一类的账上 |
 | `title` | 一句话，≤ 40 字，说「谁在哪出了什么事」：「schemas 工具把同一张表同时放进 tables 和 not_found」 |
 | `evidence` | ≤ 3 句：**看到了什么**（带具体值与 span / 探针编号）；**本该是什么**；**为什么是问题**。例：「查 host109 的 schema 时（span 0be77ce9），表 bench.c538 同时出现在 tables 和 not_found 里。not_found 应该只放没解析到的对象。模型据此以为表不存在，绕了一圈。」 |
-| `fix_where` | 能直接打开的那个位置：仓 + 文件 + 段落、skill 名 + 小节、采集项，或（`case` / `env`）那条用例 record / 这次复现。**只写一处**——五处改动就是五条。`tool` / `skill` / `case` / `env` 四类必填。`env` 拿不到复现回执的编号就写 `manifest.json` 里这一例的 `record_id` 加上现场时间窗 |
-| `suggestion` | 动词开头，在那儿改什么。`tool` / `skill` / `case` / `env` 必填；`skill` 类必须含要加或要改的原句（「」引起来）；`unsure` 写「请核：…（看哪里）」 |
+| `expected` | **修好之后重放该看到什么**，不是「去哪儿改」（那归修复层）。`tool` / `skill` / `case` 三类与 `unsure` 必填；`skill` 类必须含要加或要改的原句（「」引起来）；`unsure` 写「请核：…（看哪里）」。`env` 不填——环境改不了，没有「修好之后」。它同时是关单判据：修的人打了 `claimed_fixed`，下一轮复验对照的就是这一栏 |
 | `repro` | **六类全必填**（owner 2026-09-12）：**一段话**说清怎么再现——在哪、做什么、期望什么、实际什么。下游拿到一条改进点，第一件事永远是先把它再现一遍。`tool` 类能写成一条命令的就写进这段话里（工具名 + 入参 + 期望 vs 实际）——关掉 `tool` 的判据就是「重放变对」，没有可重放的东西这一条永远关不掉。**另外五类不要凑命令**：skill 缺一句话、模型推错一步、题面缺时间窗，这些的「复现」是「照着走一遍会看到什么」，凑出来的只会是一条跑不通的假命令。一律别写成要搭半小时环境的步骤，那种没人会跑 |
 | `pointers` | 至少一项：`{"span_id":"…"}`（正向那一步，**从 `forward.md` 调用表的 span 那一列抄**，写全或写前 8 位都行）或 `{"probe":"E3"}` / `{"probe":"online:<看了什么>"}`。**`span_id` 会被回流脚本拿去跟 `trace.json` 对**：轨迹里没有这条 span，或者你写的前缀配到两条以上，整包拒写 |
 
 三条硬规则（违反就等于没判，import 会整包拒写）：
 
-1. **能修的必须说「改哪里」**，而且一条只说一处。写「改进工具契约」「优化 prompt」这种没有落点的话，等于没写。
-2. **每条都必须指到具体一行。** 指不到就说明你还没找到证据：这一条不写，在 `summary` 里写明「归因不明，缺什么」——那也是有效结论。
+1. **能修的必须说「怎么再看见一次」**（`repro`）和**「修好之后该看到什么」**（`expected`），一条只说一个缺口。
+   写「改进工具契约」「优化 prompt」这种既不能重放也没有验收标准的话，等于没写。
+   （2026-09-12 改：原来这条要求「说改哪里」——那是替修复层定位，见 ② 那一节。）
+2. **每条都必须指到具体一次调用**（`pointers` 里的 span，或活系统那一次取证）。指不到就说明你还没找到证据：
+   这一条不写，在 `summary` 里写明「归因不明，缺什么」——那也是有效结论。
+   （原文写的是「具体一行」，容易被读成代码行——**判题会话手上没有源码树**，能指到的只有调用。）
 3. **指针要真指得到。** `span_id` 写全或写前 8 位都行，但它必须在这条 trace 里；配到两条以上等于没指。
    这一条是机器核的：外部基准（TRAIL）实测，长轨迹下模型的错误定位准确率极低、有的模型连完整轨迹都读不下——
    只校验形状不校验存在，等于在鼓励编一个 span id 填上。
@@ -307,7 +329,7 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 | 答案纸 | 怎么判 |
 |---|---|
 | 有「期望根因」这一节（`expected_roots` 有条目） | 按上一节划集合、推 `verdict`。回流会核 |
-| 有答案纸正文、但没有「期望根因」这一节（整段文字，或只有「期望现象」） | **不划集合**（写了反而被拒）：照答案纸的文字判 `verdict`，并记一条 `case`·`missing`，`suggestion` 写「把根因整理进 `expected_roots`，判题才算得出分」 |
+| 有答案纸正文、但没有「期望根因」这一节（整段文字，或只有「期望现象」） | **不划集合**（写了反而被拒）：照答案纸的文字判 `verdict`，并记一条 `case`·`missing`，`expected` 写「答案纸里有 `expected_roots` 这一节，判题算得出分」 |
 | 整个没有答案纸 | 题坏了，见下 |
 
 包里怎么认：`manifest.json` 里这一例的 `expected_roots` 是数组就是第一种、是 `null` 就是第二种、是 `[]` 就是第三种。
@@ -319,8 +341,8 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 - `evidence` 照判（判据换成「结论有没有被自己的证据链撑住」）；**工具错照找**——那判的是 dbdog，跟有没有标准答案无关，这道题的价值也只剩这一半。
 - `findings.items` **必记一条 `case` 类**：`key` 写 `case.answer-key.missing`，`title`「这道题没有答案纸」，
   `evidence`「答案纸里没有期望根因（`expected_output` 缺 `expected_roots`），这次诊断的结论没有对照物」，
-  `qualifier` 写 `missing`，`fix_where` 指到用例集里这条 record，
-  `suggestion`「回建用例那一步补根因（取自 issue 正文或已合入 PR），补不了就删题」，`pointers` 指 root span。
+  `qualifier` 写 `missing`，`expected`「这条 record 的答案纸里有根因（取自 issue 正文或已合入 PR）」，
+  `pointers` 指 root span。
 - `summary` **第一句**写明：`⚠ 无答案纸，本题不可判结论——请回建用例那一步补根因（取自 issue 或其 PR）或删题`。
 
 这样这类题会在判题结果里**显形**（结论「判不了」+ 一条「题有问题」），下一轮一眼能数出「有几道题没根因」；
@@ -354,7 +376,7 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 | 「键缺席」不等于工具丢数据 | 2026-09-10 首例的教训（下一节） | 拿不到对照就 `unsure`，别记 `tool` |
 | 停机跨多次轮转丢中间文件 | owner 2026-09-08 定不修 | 不记 |
 
-**这张表要随取舍更新**；遇到拿不准是不是取舍的，按 `unsure` 提并在 `suggestion` 里写「请核：这是不是已定的取舍」。
+**这张表要随取舍更新**；遇到拿不准是不是取舍的，按 `unsure` 提并在 `expected` 里写「请核：这是不是已定的取舍」。
 
 ## 你只判不改；哪些你自己闭合，哪些升 owner
 
@@ -374,7 +396,7 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 | 必须留给人（升 owner） | 为什么 |
 |---|---|
 | 「答案纸本身错了」 | 你能指出矛盾，但改用例集会让**所有历史轮次的分数失去可比性**——这是权威判断 |
-| 「dbdog 该不该有这个能力」 | 路线图问题，不是事实问题；参见上面那张取舍表 |
+| 「这个能力**值不值得做**」 | 路线图问题，不是事实问题；参见上面那张取舍表。**但「有没有」是事实**：三条路都试过、dbdog 拿不到，就照记一条 `tool`·`missing`，`expected` 写你期望看到什么——要不要做由下游定，不因为「可能不该做」把条目退成 `unsure`（2026-09-12） |
 | 判题口径本身要不要改 | 改口径影响跨轮可比性 |
 | 三条路都看不出的 `unsure` | 真·判不出：写清看过哪里，交给人 |
 
@@ -385,9 +407,10 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 - [ ] 有答案纸：`findings.roots` 把每条根因都划进 `matched` 或 `missed`（从 1 编号、只写数字），且 `verdict` 与集合对得上
 - [ ] 没答案纸：`verdict` 是 `unknown`、没有 `roots`
 - [ ] 每条改进点都有 `title` / `evidence` / `pointers`，且 `span_id` 在这条 trace 里真找得到
-- [ ] 每条都写了 `repro`（六类全必填，一段话）；`tool` 类另外还要 `layer` + `qualifier` + `fix_where` + `suggestion`
-- [ ] `skill` 类：`qualifier` 在，`suggestion` 里用「」引出了要加或要改的原句
-- [ ] `case` / `env` 类：`fix_where` + `suggestion` 在
+- [ ] 每条都写了 `repro`（六类全必填，一段话）；`tool` 类另外还要 `qualifier` + `expected`
+- [ ] `skill` 类：`qualifier` 在，`expected` 里用「」引出了要加或要改的原句
+- [ ] `case` 类：`expected` 在（`env` 不要求——环境改不了）
+- [ ] 没有再写 `layer` / `fix_where` / `suggestion`：前两个已撤，`suggestion` 改叫 `expected`（还发 `suggestion` 会整包拒）
 - [ ] `model` 类：`rule_ref` 指到具体哪一节
 - [ ] `unsure` 类：`suspected_kind` + 「请核：…（看哪里）」
 - [ ] `key` 只用 `a-z0-9._-`、≤ 80 字符；一个缺口只提一条（同 key 不重复）
@@ -409,7 +432,7 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 **`annotations.jsonl`**：每例一行，一行一个完整 JSON 对象（不换行、不带注释、不加尾逗号）。
 
 ```json
-{"trace_id":"<本例的完整 trace_id，从 manifest.json 抄>","labels":{"verdict":"partial","evidence":"solid","findings":{"items":[{"key":"agent.opengauss-checkpoint.not-collected","kind":"tool","layer":"agent","qualifier":"missing","title":"openGauss 的检查点指标没有采","evidence":"直查这台实例的指标库，checkpoints_timed 一个点位都没有；同版本的另一台有。采集项没开，所以整个 org 都没有这组指标。模型因此走不到检查点风暴这条路。","fix_where":"dbdog-agent 的 opengauss 集成配置（integrations 的 checkpoint 采集项）","suggestion":"把 checkpoint 相关指标纳入默认采集","repro":"get_dbdog_metric metric=opengauss.bgwriter.checkpoints_timed 近 7 天：期望有点位，实际空","pointers":[{"probe":"online:直查指标库 + 同版本另一台对照"}]},{"key":"skill.dbm-opengauss.metric-reference-checkpoint","kind":"skill","qualifier":"missing","title":"dbm-opengauss skill 没告诉模型该查检查点指标","evidence":"正向假设树里没有任何假设指向检查点（span a1b2c3d4 是最接近的一步，查的是写 I/O）。skill 的指标参考小节没有检查点这一行。模型不知道有这条路。","fix_where":"dbdog/dbm-opengauss 的指标参考小节","suggestion":"在指标参考小节补一行：「写 I/O 抬头时先看 checkpoints_timed 与 checkpoints_req」","repro":"照现在这版 dbm-opengauss skill 让模型诊断同一条 trace：期望假设树里出现一条指向检查点的假设，实际一条都没有（最接近的 span a1b2c3d4 查的是写 I/O）","pointers":[{"span_id":"a1b2c3d4"}]}],"checks":[{"key":"server.samples.wait-event-filter","status":"fixed","kind":"tool","pointers":[{"span_id":"9f0e1d2c"}],"note":"这一轮加 @db.wait_event_type:CPU 过滤返回 16 条，与不带过滤一致"}],"roots":{"matched":[1],"missed":[2]}},"summary":"两条根因命中一条（写 I/O 饱和），没走到检查点风暴，按集合口径判部分对。改进点两条：检查点指标没采（工具错·采集层·缺失），skill 也没教这条路。上一轮的等待事件过滤 bug 这一轮验证修好了。"}}
+{"trace_id":"<本例的完整 trace_id，从 manifest.json 抄>","labels":{"verdict":"partial","evidence":"solid","findings":{"items":[{"key":"opengauss-checkpoint.not-collected","kind":"tool","qualifier":"missing","title":"openGauss 的检查点指标没有采","evidence":"直查这台实例的指标库，checkpoints_timed 一个点位都没有；同版本的另一台有。采集项没开，所以整个 org 都没有这组指标。模型因此走不到检查点风暴这条路。","repro":"get_dbdog_metric metric=opengauss.bgwriter.checkpoints_timed instance=host109-og1 窗口 2026-09-11 13:58–14:02(UTC+8)：期望有点位，实际空；换近 7 天任一活窗口仍空","pointers":[{"probe":"online:直查指标库 + 同版本另一台对照"}],"expected":"近 7 天 opengauss.bgwriter.checkpoints_timed 有点位，与同版本另一台一致"},{"key":"dbm-opengauss.metric-reference-checkpoint","kind":"skill","qualifier":"missing","title":"dbm-opengauss skill 没告诉模型该查检查点指标","evidence":"正向假设树里没有任何假设指向检查点（span a1b2c3d4 是最接近的一步，查的是写 I/O）。skill 的指标参考小节没有检查点这一行。模型不知道有这条路。","repro":"照现在这版 dbm-opengauss skill 让模型诊断同一条 trace：期望假设树里出现一条指向检查点的假设，实际一条都没有（最接近的 span a1b2c3d4 查的是写 I/O）","pointers":[{"span_id":"a1b2c3d4"}],"expected":"dbm-opengauss 的指标参考小节里有这一行：「写 I/O 抬头时先看 checkpoints_timed 与 checkpoints_req」"}],"checks":[{"key":"samples.wait-event-filter","status":"fixed","kind":"tool","pointers":[{"span_id":"9f0e1d2c"}],"note":"这一轮加 @db.wait_event_type:CPU 过滤返回 16 条，与不带过滤一致"}],"roots":{"matched":[1],"missed":[2]}},"summary":"两条根因命中一条（写 I/O 饱和），没走到检查点风暴，按集合口径判部分对。改进点两条：检查点指标没采（工具错·缺失），skill 也没教这条路。上一轮的等待事件过滤 bug 这一轮验证修好了。"}}
 ```
 
 `trace_id` 必须与包里 / 现取到的那条**完整**对得上——它是回流时找 interaction 的唯一键。
@@ -457,12 +480,13 @@ node $S/llmobs/judge-package-import.mjs --package <包目录> --annotator <判�
   逐例判，一例一行追加进包根的 `annotations.jsonl`；最后写 `summary.md`。**不要**为了补材料
   去调工具——包判题的前提就是不能追问，缺什么如实写进 `summary`。
 - 「这一轮哪些是 dbdog 要修的」→ 判完之后从 `summary.md` 的清单答：`tool` / `skill` 两类是 dbdog 侧能动手的，
-  每条带 `key`、`fix_where` 和命中例数；没判过的轮次先判，不要凭 trace 数量猜。
+  每条带 `key`、`repro` 和命中例数；没判过的轮次先判，不要凭 trace 数量猜。
 - 「哪些要人看」→ `unsure` 那几条，每条把「请核：…」念给用户。
 - 「X 修好了没有」→ 不由你说了算，也不由修的人说了算：重跑挖出它的那几道题，判那一轮，看 X 的复验是不是 `fixed`。
 - 「重判一下第 3 例」→ 改那一行、重跑 import，覆盖生效；别追加一行。
 - 材料缺了就说清楚缺哪份：没有 `forward.md` 说明那条 trace 没按假设约定书写
-  （`clients/diag-workdir-template/HYPOTHESIS.md`），只有调用序列可看，`skill` 与 `model` 两类这轮判不准；
+  （`clients/diag-workdir-template/HYPOTHESIS.md`），只有调用序列可看——**在线判题仍分得开 `skill` 与 `model`**
+  （自己调一次看换参数对不对），只有离线才这轮判不准；
   没有 `probe.json`：在线判题就去活系统核（不需要探针）；离线才只能靠 trace 内两两对照抓，抓不到的判 `unsure`。
 
 ## 这一版口径的外部依据（2026-09-11 改版时对过的工作）
@@ -471,7 +495,8 @@ node $S/llmobs/judge-package-import.mjs --package <包目录> --annotator <判�
 
 | 这份 rubric 里的规矩 | 出处 | 那边的结论 |
 |---|---|---|
-| `kind` × `layer` × `qualifier` 三维分开，不靠加类别 | ODC（IBM 的缺陷分类法，Chillarege 等人 1992 年提出） | 缺陷分类要正交；**缺失 / 写错 / 多余**是与类别独立的一维 |
+| `kind` × `qualifier` 两维分开，不靠加类别 | ODC（IBM 的缺陷分类法，Chillarege 等人 1992 年提出） | 缺陷分类要正交；**缺失 / 写错 / 多余**是与类别独立的一维。原先还有第三维 `layer`，2026-09-12 撤（判题包里没有能定落点的材料） |
+| `layer` / `fix_where` 撤销，`suggestion` 改 `expected` | owner 2026-09-12：「判题层把问题找到就可以了，在哪个仓库修复应该是修复层做的事情」 | 每一层只交自己观察得到的东西；不确定的落点写出去，修的人会照着它白跑一趟，而错落点会跟着 `key` 聚合到下一轮 |
 | `model` 类必须给反证，否则降 `unsure` | Who&When Pro（12,326 条轨迹的失败归因基准） | 模型判错误类别 macro-F1 ≤ 22.2%、定位决定性步 ≈ 14%——最容易归错的一类要最硬的证据 |
 | `span_id` 必须在轨迹里真找得到（机器核） | TRAIL（一份 agent 轨迹纠错基准：148 条人工标注轨迹、841 个错误） | 要求同时说对错误类别与出错位置时，最好的模型只有 11% 全对，部分模型连完整轨迹都读不进上下文——只校验形状等于鼓励编 |
 | `repro` 六类全必填（`tool` 类另求「一条命令能跑」） | Bettenburg 等对 466 名开发者的调查 | 复现步骤是开发者最想要的字段，也是最常缺的那个——那份调查问的是所有缺陷，不只工具类；复杂到要一小时搭建的复现没人会跑 |
