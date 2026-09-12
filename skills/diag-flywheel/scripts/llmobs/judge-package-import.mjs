@@ -20,7 +20,7 @@ import {
   resolveExperimentRef, patchCPExperiment, findProject, findDataset, listRecords,
   requireCredential,
 } from "./lib/exp-client.mjs";
-import { parseAnnotationsJsonl, annotationPayload } from "./lib/judge-package.mjs";
+import { parseAnnotationsJsonl, annotationPayload, validateAgainstCase } from "./lib/judge-package.mjs";
 
 const argOf = (name, dflt) => {
   const i = process.argv.indexOf(name);
@@ -72,6 +72,35 @@ if (!jsonl) {
   const invalid = rows.filter((r) => r.invalid?.length);
   if (invalid.length) {
     fail(`判题产物有 ${invalid.length} 行不合契约（上面的 ⚠ 逐条列了）——改完重跑 import，这一次一行都没写`);
+  }
+
+  // 第二道闸：跟**这道题的材料**对（`validateLabels` 只看得见批注自己）。
+  //   · 根因集合与答案纸对得上、verdict 与集合推导一致；
+  //   · 每个 span 指针在这条 trace 里真找得到（TRAIL：长轨迹下模型定位极不可靠，
+  //     只校验形状等于鼓励编 span id）。
+  // 包里没有 trace.json 的（蓝区手工包）就不查那一项——宁可不拦，也不假装校验过。
+  const caseByTrace = new Map((manifest.cases ?? []).filter((c) => c.trace_id).map((c) => [c.trace_id, c]));
+  const caseProblems = [];
+  for (const r of rows) {
+    const c = caseByTrace.get(r.trace_id);
+    if (!c) continue;
+    const tracePath = path.join(PKG, "cases", String(c.event_id), "trace.json");
+    let spanIds;
+    try {
+      const t = JSON.parse(fs.readFileSync(tracePath, "utf8"));
+      spanIds = (t?.spans ?? []).map((sp) => sp?.span_id).filter(Boolean).map(String);
+    } catch { /* 没带 trace.json：这一项不查 */ }
+    const ps = validateAgainstCase(r.labels, {
+      ...(Array.isArray(c.expected_roots) ? { expectedRoots: c.expected_roots } : {}),
+      ...(spanIds?.length ? { spanIds } : {}),
+    });
+    for (const p of ps) {
+      console.error(`⚠ 第 ${r.line} 行（${r.trace_id}）${p}`);
+      caseProblems.push(p);
+    }
+  }
+  if (caseProblems.length) {
+    fail(`判题产物有 ${caseProblems.length} 处与这道题的材料对不上（上面的 ⚠ 逐条列了）——改完重跑 import，这一次一行都没写`);
   }
 
   const known = new Set((manifest.cases ?? []).map((c) => c.trace_id).filter(Boolean));

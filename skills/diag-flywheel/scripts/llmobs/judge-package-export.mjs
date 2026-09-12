@@ -25,6 +25,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { openFindings } from "./lib/judge-quality.mjs";
 import {
   baseUrl, findProject, loadDataset,
   listAnnotationQueues, upsertAnnotationQueue, listAnnotationLabels, replaceAnnotationLabels,
@@ -175,9 +176,17 @@ for (const summary of events) {
     missing.push(`reverse（${recordsReason || `record ${recordID || "?"} 的 metadata.reverse_chain 为空`}）`);
   }
 
-  const expected = event?.expected_output;
+  // 答案纸取**用例当前的**那份，不是实验事件里的快照。
+  // 两者是不同的东西：题面（`input.prompt`）必须用当时的快照——那才是 agent 看到的；
+  // 而答案纸是**我们对这个 bug 的判断**，它被更正之后旧轨迹也该按更正后的判。
+  // 2026-09-11 的「根因 / 修复分离」清洗就是这么一件事：只认快照的话，那次清洗对历史一轮都不生效，
+  // 重判旧 trace 仍按坏答案纸打分，清洗白做。
+  const expected = record?.expected_output ?? event?.expected_output;
+  const corrected = Boolean(record?.expected_output && event?.expected_output
+    && JSON.stringify(record.expected_output) !== JSON.stringify(event.expected_output));
+  if (corrected) console.error(`  · 答案纸在这一轮跑完之后被更正过，按当前那份判`);
   if (hasGroundTruth(expected)) {
-    fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID }));
+    fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID, corrected }));
   } else {
     // 没有答案纸 = **题坏了**，不是「另一种可判的题」。每道用例都必须有根因，
     // 取自 issue 正文或它对应的已合入的 PR；两处都取不到的题不该进用例集。
@@ -195,14 +204,49 @@ for (const summary of events) {
   );
   fs.writeFileSync(path.join(caseDir, "prior-judgments.json"), JSON.stringify(prior, null, 1));
 
+  // **待复验清单随包走**：rubric 要判题方「开判第一件事就是拿这份清单」，但判题会话的
+  // 工作目录是这个临时包，里面既没有 `case-history.mjs` 也没有凭证——照 rubric 做不到，
+  // 只能退回「自己在几十条历史里推」，正是那条规则要取代的做法。这里把脚本算好的结果放进包。
+  const open = openFindings(prior);
+  fs.writeFileSync(path.join(caseDir, "open-findings.json"), JSON.stringify(open, null, 1));
+  if (open.length) console.error(`  · 待复验 ${open.length} 条：${open.map((o) => o.key).join("、")}`);
+
   // 探针结果由 probe.mjs 写进本目录；重跑 export 不覆盖已有的那份。
   const probePath = path.join(caseDir, "probe.json");
   if (!fs.existsSync(probePath)) missing.push("probe（探针还没跑：node scripts/llmobs/probe.mjs --case <本目录>）");
+
+  // 答案纸里的根因**按顺序带进 manifest**：判题方按这个顺序编号划分命中 / 没命中，
+  // import 据此核 `findings.roots`，并推导 verdict（`deriveVerdictFromRoots`）。
+  // 带原文而不是只带条数，是为了让人看回流报错时知道第 2 条指的是哪一条。
+  //
+  // **三态，不是两态**（2026-09-11 晚修）：
+  //   · 数组 → 核集合；
+  //   · `null` = 有答案纸、但根因不在 `expected_roots` 这个数组里（答案纸是整段文字、
+  //     或只有 expected_phenomena）。这种**不核集合**，判题方照答案纸的文字判 verdict。
+  //     早前把它和「没有答案纸」一起压成 `[]`，于是包里明明躺着 ground-truth.md，
+  //     回流却报「这道题没有答案纸，verdict 只能是 unknown」——报错与材料自相矛盾，整包白判。
+  //   · `[]` = 真没有答案纸（题坏了）。
+  const expectedRoots = hasGroundTruth(expected)
+    ? (Array.isArray(expected?.expected_roots) && expected.expected_roots.length
+      ? expected.expected_roots.map((r) => String(r))
+      : null)
+    : [];
+  // 还没做「根因 / 修复分离」的题：根因数组里混着 `【根因】`『【修复】』这类小标题、PR 链接、
+  // 整段 diff（2026-09-11 扫全集：141 条里 80 条不是根因）。混装时按集合算命中没有意义——
+  // 判官只能把小标题也标成命中。报出来，别让判题方以为这就是一份干净的答案纸。
+  const mixed = (expectedRoots ?? []).filter((r) => /^【[^】]{1,8}】|^(PR|pr|issue|Issue)\s*#?\s*\d|^(---|\+\+\+|@@|diff --git)|^[+-]\s/.test(String(r).trim()));
+  if (mixed.length) {
+    missing.push(`答案纸还没做「根因 / 修复分离」：${expectedRoots.length} 条里 ${mixed.length} 条是小标题 / PR 链接 / diff 行，按集合算命中会虚高（控制台用例页编辑一次即分开）`);
+  }
+  if (expectedRoots === null) {
+    missing.push("expected_roots（答案纸有正文但没有结构化根因：本例不核根因集合，judge 照文字判，并提一条 case 让建用例那步补上）");
+  }
 
   cases.push({
     event_id: eventID,
     trace_id: traceID,
     record_id: recordID,
+    expected_roots: expectedRoots,
     status: event?.status ?? summary.status ?? "",
     prior_rounds: prior.length,
     stamp: stampOf(rootSpanOf(spans)),
