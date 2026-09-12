@@ -141,47 +141,6 @@ function readJsonl(file) {
   return out;
 }
 
-/**
- * 一层子代理的**返回值** → 该假设名下的「代码证据步」（2026-09-12）。
- *
- * 为什么要单独抽这一条：代码侧的演绎链**只存在于子代理的回参里**，别处都拿不到——
- *   · 本地工具（Bash/Read/Grep）没有 `telemetry.intent` 字段，物理上带不了假设编号；
- *   · `## Delegation` 明令「No subagent states a hypothesis or invents an id」，
- *     子代理也不许自己起 `H2.1`（那条是 09-10 按实测加的，不动它）。
- * 而回参里那条链本来就是结构化的：实测 trace 2c461f2e 的 H2 子代理回了 5633 字符，
- * 逐条钉着 `gram.y:24015-24037` / `configure.in:1930-1931` / `build_options.cmake:172`，
- * 连「是不是在 `if` 里」「有没有 `#else`」都排过。之前这条 span 被当本地工具整条丢掉。
- *
- * 判据只认**带行号的引用**：`路径.扩展名:行` 或 `:行-行`，且必须在反引号里。
- * 光写 `gram.y` 不算——没有行号就没法回去核，那是提法不是证据。
- */
-const SUB_VERDICT = /^\s*(?:\[\s*(H[0-9]+(?:\.[0-9]+)*)\s*\]|VERDICT\s*:)\s*\**\s*(refuted|supported|inconclusive)\b/i;
-const SUB_STEP = /^\s*(?:\*\*\s*)?(?:\d+\.|\([a-z]\))\s*/;
-const CODE_REF = /`([\w./-]+\.(?:y|ya?ml|cpp|cc|c|hpp|h|in|cmake|txt|mjs|ts|tsx|py|sh|po|sql|conf))[:：](\d+(?:-\d+)?)`/g;
-
-export function scanSubagentReturn(text, hint = "") {
-  const body = String(text ?? "");
-  if (!body.trim()) return null;
-  const lines = body.split(/\r?\n/);
-  const m = SUB_VERDICT.exec(lines[0] ?? "");
-  // 编号来源：回参头里的 `[H2]` 优先；没有就从派单 description 里认（`Verify H1 …`）
-  const hid = m?.[1] || (String(hint).match(/\bH[0-9]+(?:\.[0-9]+)*\b/) ?? [])[0] || null;
-  if (!hid) return null;
-  const verdict = m ? VERDICT[String(m[2]).toLowerCase()] ?? "open" : "open";
-  const steps = [];
-  let cur = null;
-  for (const line of lines) {
-    if (SUB_STEP.test(line)) {
-      cur = { title: line.replace(SUB_STEP, "").replace(/\*\*/g, "").trim(), refs: [] };
-      steps.push(cur);
-    }
-    if (!cur) continue;
-    for (const r of line.matchAll(CODE_REF)) cur.refs.push(`${r[1]}:${r[2]}`);
-  }
-  // 没有任何带行号引用的步不产边：遥测侧子代理的回参也走这条路，它的证据在 tool 边上
-  return { hid, verdict, steps: steps.filter((x) => x.refs.length > 0) };
-}
-
 export function resolveInput(p) {
   if (fs.existsSync(p) && fs.statSync(p).isDirectory()) {
     const cand = path.join(p, "spans.jsonl");
@@ -285,7 +244,15 @@ function compareHid(a, b) {
   return 0;
 }
 
-export function build(spans) {
+/**
+ * @param spans
+ * @param opts.sourceEvidence  hid → [{title, refs[]}]：代码证据，由 graph-worker 先跑
+ *   source-evidence 两段（正则粗筛 + 模型切分）算好再传进来。**build 本身仍是零模型**。
+ *   2026-09-12 换掉了原来那版纯正则切分：27 条历史 trace 实测召回只有 12.5%（43/343），
+ *   漏的全是回参格式抖动（`## H3 verdict:` / `### 1. …` / 行号写在正文不在反引号里）。
+ * @param opts.sourceVerdict   hid → 裁决：子代理回参里说的，省得等模型在下一次调用写 close=
+ */
+export function build(spans, { sourceEvidence = {}, sourceVerdict = {} } = {}) {
   const nodes = new Map();
   const toolEdges = [];
   const resolveEdges = [];
@@ -327,25 +294,6 @@ export function build(spans) {
     }
     toolCallsAll += 1;
     if (!isMcpTool(s)) {
-      // Agent（派子代理）这一条例外：它本身不是取证，但**回参里带着代码侧的演绎链**。
-      // 仍按本地工具计次（不占 seq、不进工具边），额外抽出 source 边与裁决。
-      if (String(s.name ?? "") === "Agent") {
-        let desc = "";
-        try { desc = String(JSON.parse(String(s.input ?? "{}")).description ?? ""); } catch { /* 入参不是 JSON 就算了 */ }
-        const sub = scanSubagentReturn(s.output_local ?? s.output, desc);
-        if (sub) {
-          const n = ensure(nodes, sub.hid);
-          for (const st of sub.steps) {
-            sourceEdges.push({ kind: "source", basis: "source", from: sub.hid, title: st.title, refs: st.refs, span_id: s.span_id, ts: s.ts });
-          }
-          if (sub.steps.length) n.has_source_evidence = true;
-          if (n.verdict === "open") {
-            n.verdict = sub.verdict;
-            n.closed_by = { from: "子代理裁决", in: "subagent", span_id: s.span_id };
-            resolveEdges.push({ kind: "resolve", from: "子代理裁决", to: sub.hid, verdict: sub.verdict, span_id: s.span_id });
-          }
-        }
-      }
       // 本地工具整体排除：不进工具边、不进未挂列表、不占 seq；只在 summary 里计次，不静默丢
       const name = String(s.name ?? "");
       localExcluded[name] = (localExcluded[name] ?? 0) + 1;
@@ -407,6 +355,24 @@ export function build(spans) {
     }
   }
 
+  // 代码证据（外部算好传进来，见 opts.sourceEvidence）：与工具边同级、靠 basis 区分。
+  // 遥测证据是「支持」，代码证据是「必然」——两种都要（owner 2026-09-12）。
+  for (const [hid, steps] of Object.entries(sourceEvidence)) {
+    if (!Array.isArray(steps) || !steps.length) continue;
+    const n = ensure(nodes, hid);
+    n.has_source_evidence = true;
+    for (const st of steps) {
+      sourceEdges.push({ kind: "source", basis: "source", from: hid, title: st.title ?? "", refs: st.refs ?? [] });
+    }
+  }
+  for (const [hid, verdict] of Object.entries(sourceVerdict)) {
+    if (!verdict || verdict === "open") continue;
+    const n = ensure(nodes, hid);
+    if (n.verdict !== "open") continue;
+    n.verdict = verdict;
+    n.closed_by = { from: "子代理裁决", in: "subagent" };
+    resolveEdges.push({ kind: "resolve", from: "子代理裁决", to: hid, verdict });
+  }
   const nodeList = [...nodes.values()].sort(compareHid);
   // covered_through（2026-09-10）：图覆盖到的事件时间上界 = 参与出图的 span 里最晚的 ts 原值
   // （不取 now——那是出图时刻，不是覆盖面）。server 拿它跟 span 水位 max(ts) 比判「图落后于 span」；
@@ -626,9 +592,9 @@ export function agentConclusion(spans) {
  * 出图：写 forward-path.json / forward-path.md / forward-conclusion.md 到 out 目录。
  * 返回 { md, json, summary }。spans 为空抛错（调用方决定怎么报）。
  */
-export function writeGraph(spans, out, source = {}) {
+export function writeGraph(spans, out, source = {}, opts = {}) {
   if (!spans.length) throw new Error("没有读到 span（检查路径 / --trace / --session）");
-  const g = build(spans);
+  const g = build(spans, opts);
   g.source = source;
   fs.mkdirSync(out, { recursive: true });
   const jp = path.join(out, "forward-path.json");
