@@ -338,9 +338,12 @@ export function renderReverse(chain, { recordId = "" } = {}) {
 }
 
 /** `ground-truth.md`：答案纸（experiment event 的 expected_output；整个可缺 = 无参照题）。 */
-export function renderGroundTruth(expected, { eventId = "" } = {}) {
+export function renderGroundTruth(expected, { eventId = "", corrected = false } = {}) {
   const lines = [`# 答案纸`, ""];
   if (eventId) lines.push(`- 用例（event）：\`${eventId}\``, "");
+  // 答案纸在这一轮跑完之后被改过：判官得知道自己按的是哪一份，否则「agent 当时对着的那份说 X、
+  // 你手上这份说 Y」会被读成 agent 判错。
+  if (corrected) lines.push("- ⚠ **这份答案纸在这一轮诊断跑完之后被更正过**（判题按现在这份判：答案纸是我们对这个 bug 的判断，更正后回溯适用）", "");
   if (typeof expected === "string") return `${lines.join("\n")}\n${expected}\n`;
   const e = expected ?? {};
   if (Array.isArray(e.expected_roots) && e.expected_roots.length) {

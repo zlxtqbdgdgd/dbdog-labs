@@ -176,9 +176,17 @@ for (const summary of events) {
     missing.push(`reverse（${recordsReason || `record ${recordID || "?"} 的 metadata.reverse_chain 为空`}）`);
   }
 
-  const expected = event?.expected_output;
+  // 答案纸取**用例当前的**那份，不是实验事件里的快照。
+  // 两者是不同的东西：题面（`input.prompt`）必须用当时的快照——那才是 agent 看到的；
+  // 而答案纸是**我们对这个 bug 的判断**，它被更正之后旧轨迹也该按更正后的判。
+  // 2026-09-11 的「根因 / 修复分离」清洗就是这么一件事：只认快照的话，那次清洗对历史一轮都不生效，
+  // 重判旧 trace 仍按坏答案纸打分，清洗白做。
+  const expected = record?.expected_output ?? event?.expected_output;
+  const corrected = Boolean(record?.expected_output && event?.expected_output
+    && JSON.stringify(record.expected_output) !== JSON.stringify(event.expected_output));
+  if (corrected) console.error(`  · 答案纸在这一轮跑完之后被更正过，按当前那份判`);
   if (hasGroundTruth(expected)) {
-    fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID }));
+    fs.writeFileSync(path.join(caseDir, "ground-truth.md"), renderGroundTruth(expected, { eventId: eventID, corrected }));
   } else {
     // 没有答案纸 = **题坏了**，不是「另一种可判的题」。每道用例都必须有根因，
     // 取自 issue 正文或它对应的已合入的 PR；两处都取不到的题不该进用例集。
