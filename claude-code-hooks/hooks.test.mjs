@@ -484,7 +484,7 @@ describe("本地全量、上报截断", () => {
     ]);
   }
 
-  it("llm span 采 thinking 块进 thinking_local（全量），text 仍走 output", () => {
+  it("llm span 的 thinking 走 capField：截断值上报、全量留本地（2026-09-12 服务端有列了）", () => {
     const dir = tempObsDir();
     const transcript = longTranscript(dir, { text: "先看进程", thinking: "T".repeat(30), args: { command: "ls" }, result: "ok" });
     seedState(dir, "s1", transcript);
@@ -492,10 +492,12 @@ describe("本地全量、上报截断", () => {
       DBDOG_OBS_CONTENT_CHARS: "10",
     });
     const llm = readSpans(dir).find((s) => s.kind === "llm");
-    expect(llm.thinking_local).toBe("T".repeat(30)); // 不受 contentCap 约束
+    expect(llm.thinking_local).toBe("T".repeat(30)); // 全量副本不受 contentCap 约束
     // 文本块 + tool_use 名字标记（既有语义）；本用例 contentCap=10，读侧口径 x_local ?? x
     expect(llm.output_local ?? llm.output).toBe("先看进程\n[tool_use: Bash]");
-    expect(llm.thinking).toBeUndefined(); // 没有上报字段
+    // 此前这里断言 thinking 恒 undefined（「没有上报字段」）。服务端 2026-09-12 加了 thinking 列
+    // （蓝图 0036），改走 capField——截断值随 span 上报，整条推理过程不再只能在开发机上查。
+    expect(llm.thinking).toBe("T".repeat(10)); // contentCap=10
   });
 
   it("超限正文本地落全量副本：llm output_local、tool input_local/output_local；未超限不落副本", () => {
