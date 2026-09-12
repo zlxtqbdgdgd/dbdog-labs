@@ -46,7 +46,7 @@ import { runAgentCli } from "../e2e/lib/agent-cli.mjs";
 import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { judgeSessionArgs, judgeMcpUrl } from "./lib/judge-session.mjs";
 import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
-import { matchJudgeTargets } from "./lib/judge-queue.mjs";
+import { matchJudgeTargets, walkJudgeQueue } from "./lib/judge-queue.mjs";
 import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, claimDiagnosis, listDiagnoses, operator } from "./lib/case-diag-client.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -146,22 +146,14 @@ try {
 
 // ---- 一条一条地领：判完一条再领下一条 ----
 //
-// **不要一次把待判题的都领走**（2026-09-11 晚改）。租约是「判题超时 × 2」= 默认 1 小时，
-// 而判一例要几十分钟：一次领 3 条，排在后面那条还没轮到，租约就已经过期了——下一轮
-// （skill 推荐 /loop 30m）会把它当卡死行抢走**并真的开判**，于是两个会话判同一条 trace，
-// 批注互相覆盖，先判完的那个推「已判」还会吃 409。
-// 流式领之后，租约永远只覆盖**正在判的那一条**，这个洞就不存在了。
-//
-// `--limit N` = 本轮最多判几条（不给 = 把队列判空为止）。
-// 抢占本身就是互斥：server 那边是单条带 FOR UPDATE SKIP LOCKED 的 UPDATE，两轮同时打进来，
-// 后到的那轮拿到的是下一条或者 204。租约兜的是**进程被杀**：判到一半被 kill，行留在 judging，
-// 靠租约过期被下一轮重新抢回来。
+// 队列怎么走（为什么不是一次领完、为什么配不上的要攥住）单源在 lib/judge-queue.mjs 的
+// `walkJudgeQueue`，那里有判据也有用例；这里只把「怎么判一条」接上去。
 
 /** 把一行放回「待判题」。放不回去也只是等租约，不阻断本轮。 */
-async function release(row) {
+const release = async (row) => {
   try { await advanceDiagnosis({ id: row.id, from: DIAG_JUDGING, to: DIAG_PENDING_JUDGEMENT }); }
   catch { /* 等租约回收 */ }
-}
+};
 
 const UNRESOLVED_WHY = {
   no_trace: "行上没有 trace（诊断侧该在拿到 trace 时才推待判题）",
@@ -170,46 +162,17 @@ const UNRESOLVED_WHY = {
   duplicate_trace: "同一条 trace 本轮已经判过，判两遍批注会互相覆盖",
 };
 
-let okN = 0, failN = 0, skipped = 0;
-const seenRows = new Set();      // 放回去的行会被自己重新领到——认出来就说明队列转了一圈，该停了
-const seenTraces = new Set();
-
-while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
-  let row;
-  try {
-    row = await claimDiagnosis({
-      claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC,
-      from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING,
-    });
-  } catch (e) {
-    console.error(`✗ 抢判题任务失败：${e.message || e}`);
-    break;
-  }
-  if (!row) break;
-  if (seenRows.has(row.id)) { await release(row); break; }   // 队列里剩下的都是本轮配不上的
-  seenRows.add(row.id);
-
-  const { targets, unresolved } = matchJudgeTargets([row], runsByRecord);
-  for (const u of unresolved) {
-    const why = (seenTraces.has(String(u.row.trace_id ?? "")) ? UNRESOLVED_WHY.duplicate_trace : UNRESOLVED_WHY[u.reason]) ?? u.reason;
-    console.error(`· 放回 ${u.row.case_source}：${why}`);
-    await release(u.row);
-    skipped += 1;
-  }
-  const c = targets[0];
-  if (!c) continue;
-  if (seenTraces.has(c.traceId)) { console.error(`· 放回 ${row.case_source}：${UNRESOLVED_WHY.duplicate_trace}`); await release(row); skipped += 1; continue; }
-  seenTraces.add(c.traceId);
-
+/** 判一条：导包 → 判题会话 → 回流 → 推「已判」。回 true 算成。 */
+async function judgeOne(c) {
   console.error(`\n════ 判 ${c.eventId}（trace ${String(c.traceId).slice(0, 10)}，轮次 ${c.experiment}）════`);
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), "judge-pkg-"));
   let thisOk = false;   // 这一例成没成——失败的包要留着给人看，不能按全局计数删
   try {
     const exp = await spawnScript(HERE, "judge-package-export.mjs", ["--project", PROJECT, "--dataset", DATASET, "--experiment", c.experiment, "--cases", c.eventId, "--out", pkg]);
-    if (exp.code !== 0) { console.error(`✗ 导包失败：${c.eventId}`); failN++; continue; }
+    if (exp.code !== 0) { console.error(`✗ 导包失败：${c.eventId}`); return false; }
 
     // dry-run 的包一律留着看；行在 finally 里放回待判题，空跑不该把队列消掉。
-    if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); okN++; continue; }
+    if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); return false; }
 
     console.error(`⚖ 判题会话开跑（判官 ${MODEL}，包在 ${pkg}）…`);
     let prose = "";
@@ -222,7 +185,7 @@ while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
       prose = res.prose || "";
     } catch (e) {
       console.error(`✗ 判题会话失败：${e.message || e}`);
-      failN++; continue;
+      return false;
     }
 
     const annFile = path.join(pkg, "annotations.jsonl");
@@ -230,12 +193,12 @@ while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
       // 没产出批注就不回流：回流一个空文件会把「判过了」的假象写进去，下一轮就再也捞不到它。
       console.error(`✗ 判题会话没写出 annotations.jsonl，不回流（包留在 ${pkg}）`);
       console.error(`  会话结尾：${prose.slice(-300)}`);
-      failN++; continue;
+      return false;
     }
 
     const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", MODEL]);
-    if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); failN++; continue; }
-    okN++; thisOk = true;
+    if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); return false; }
+    thisOk = true;
 
     // 批注回流成功之后才推「已判」：顺序反过来的话，页面会先显示「已判」而批注还没写进去，
     // 中间那段时间里点开看是空的。推不动不算判题失败（批注已落库），但也不是纯显示问题——
@@ -246,6 +209,7 @@ while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
     } catch (e) {
       console.error(`⚠ ${c.row.case_source} 推「已判」失败（批注已回流；这一行会留在判题中，下一轮租约到期会被重判）：${e.message || e}`);
     }
+    return true;
   } finally {
     if (!KEEP && thisOk) { try { fs.rmSync(pkg, { recursive: true, force: true }); } catch { /* */ } }
     // 没判成的**当场放回待判题**，不留在 judging 等租约：留着的话页面上它一直显示
@@ -253,6 +217,23 @@ while (MAX_PER_ROUND === 0 || okN + failN < MAX_PER_ROUND) {
     if (!thisOk) await release(c.row);
   }
 }
+
+const { ok: okN, failed: failN, skipped } = await walkJudgeQueue({
+  claim: () => claimDiagnosis({
+    claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC,
+    from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING,
+  }),
+  // 行上只有 trace_id，而导包要 experiment + event id（judge-package-export 按 event id 挑子集）。
+  // 这座桥在 lib/judge-queue.mjs，配不上的带理由分流出来。
+  resolve: (row) => {
+    const { targets, unresolved } = matchJudgeTargets([row], runsByRecord);
+    return targets[0] ? { target: targets[0] } : { reason: unresolved[0]?.reason };
+  },
+  judge: judgeOne,
+  release,
+  limit: MAX_PER_ROUND,
+  onSkip: (row, reason) => console.error(`· 放回 ${row.case_source}：${UNRESOLVED_WHY[reason] ?? reason}`),
+});
 
 if (okN + failN + skipped === 0) console.error("本轮无事：诊断表里没有待判题的复现。");
 console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例${skipped ? ` · 放回 ${skipped} 条` : ""} ==`);

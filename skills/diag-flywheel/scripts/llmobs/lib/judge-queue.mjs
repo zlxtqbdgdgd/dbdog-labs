@@ -52,3 +52,72 @@ export function matchJudgeTargets(rows, runsByRecord) {
   }
   return { targets, unresolved };
 }
+
+/**
+ * 走一轮判题队列：**领一条 → 判一条 → 再领下一条**。
+ *
+ * ## 为什么不是「先领一批再串行判」
+ *
+ * 租约 = 判题超时 × 2（默认 1 小时），而判一例要几十分钟。一次领 3 条，排在后面那条还没轮到
+ * 租约就过期了——下一轮（loop 默认 30 分钟一次）会把它当成「卡死的行」抢走**并真的开判**：
+ * 两个会话判同一条 trace，批注互相覆盖，先判完那个推「已判」还会吃 409。
+ * 流式领之后，租约永远只覆盖**正在判的那一条**。
+ *
+ * ## 为什么配不上的行要攥住、不当场放回
+ *
+ * server 的抢占是 `... WHERE status = $1 ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED`：
+ * **放回去的行 created_at 没变，下一次 claim 会立刻又领到它**。当场放回 = 队头站着一条别的
+ * 用例集的行，本轮再也走不到自己那几条（诊断表上没有用例集这一维，抢占是全局的）。
+ * 所以这里攥着它们——它们停在 `judging`，等本轮结束一起放回。
+ * 代价：别的用例集的那几条在本轮期间显示「判题中」。真被 kill 了也有租约兜底。
+ *
+ * @param {{
+ *   claim: () => Promise<object|null>,
+ *   resolve: (row: object) => { target?: object, reason?: string },
+ *   judge: (target: object) => Promise<boolean>,
+ *   release: (row: object) => Promise<void>,
+ *   limit?: number,
+ *   onSkip?: (row: object, reason: string) => void,
+ * }} io
+ * @returns {Promise<{ok:number, failed:number, skipped:number}>} `limit` 数的是**判了几条**（ok+failed），
+ *   配不上的不占配额——否则用户说「判 3 条」，可能被别的用例集的三条行吃光。
+ */
+export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0, onSkip }) {
+  const held = [];            // 配不上的：攥到本轮结束再放
+  const seenTraces = new Set();
+  const seenRows = new Set(); // 兜底：真出现同一行被领两次（不该发生），停下来而不是转圈
+  let ok = 0, failed = 0, skipped = 0;
+
+  try {
+    while (limit === 0 || ok + failed < limit) {
+      const row = await claim();
+      if (!row) break;
+      if (seenRows.has(row.id)) { held.push(row); break; }
+      seenRows.add(row.id);
+
+      const { target, reason } = resolve(row) ?? {};
+      if (!target) {
+        onSkip?.(row, reason ?? "unresolved");
+        held.push(row);
+        skipped += 1;
+        continue;
+      }
+      if (seenTraces.has(target.traceId)) {
+        onSkip?.(row, "duplicate_trace");
+        held.push(row);
+        skipped += 1;
+        continue;
+      }
+      seenTraces.add(target.traceId);
+
+      if (await judge(target)) ok += 1;
+      else failed += 1;
+    }
+  } finally {
+    // 攥着的一律放回，哪怕本轮中途出错——留在 judging 的行页面上显示「正在判」，是在骗人
+    for (const row of held) {
+      try { await release(row); } catch { /* 等租约回收 */ }
+    }
+  }
+  return { ok, failed, skipped };
+}
