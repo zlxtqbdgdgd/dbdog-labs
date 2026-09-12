@@ -489,3 +489,46 @@ describe("hypothesis-graph · 代码证据边", () => {
     expect(g.edges.filter((e) => e.kind === "source").length).toBe(0);
   });
 });
+
+describe("hypothesis-graph · 裸收口：判了但没取证（2026-09-12 OG-3891 的 H4）", () => {
+  // 实测那条 trace 里 H4 在图上写着「证伪」，名下却没有任何工具调用、没有代码证据、
+  // 也没有子假设——凭什么证伪，读图的人看不出来。旧渲染还硬编码了一句「由子假设取证」，
+  // H4 连子假设都没有，那句话是错的。
+  const spans = () => [
+    dbdog("t1", "get_dbdog_metric", 1, "[H1] type=symptom; claim=查询确实慢; expect=有执行记录"),
+    {
+      span_id: "root", kind: "agent", name: "claude-code.task", trace_id: "aa", ts: 9,
+      output:
+        "## How do we know\n\nevidence…\n\nHypothesis ledger:\n" +
+        "- H1 supported — 执行记录在\n" +
+        "- H4 refuted — 抽取不依赖统计\n",
+    },
+    { span_id: "l1", kind: "llm", name: "anthropic.messages", trace_id: "aa", ts: 2,
+      output: "Propose [H4] type=cause; claim=统计信息过期导致代价估错" },
+  ];
+
+  it("名下什么证据都没有的收口，单独计数", () => {
+    const g = build(spans());
+    const n = byId(g);
+    expect(n.H4.verdict).toBe("falsified");
+    expect(n.H4.unsupported_close).toBe(true);
+    // H1 有工具边撑着，不算裸收口
+    expect(n.H1.unsupported_close).toBeFalsy();
+    expect(g.summary.unsupported_closes).toBe(1);
+  });
+
+  it("图上说清楚凭什么判的，不再说「由子假设取证」", () => {
+    const md = renderMd(build(spans()));
+    const h4 = md.slice(md.indexOf("### H4"), md.indexOf("### H4") + 700);
+    expect(h4).toContain("没有取证");
+    expect(h4).not.toContain("由子假设取证");
+  });
+
+  it("有代码证据撑着的收口不算裸收口", () => {
+    const g = build(spans(), {
+      sourceEvidence: { H4: [{ title: "统计与抽取无关", refs: ["orclauses.cpp:71"] }] },
+    });
+    expect(byId(g).H4.unsupported_close).toBeFalsy();
+    expect(g.summary.unsupported_closes).toBe(0);
+  });
+});

@@ -49,20 +49,31 @@ describe("candidatesFromReturn", () => {
 });
 
 describe("sourceEvidenceCandidates", () => {
-  it("只看 Agent span，同一 span 不重复收", () => {
+  // 口径 2026-09-12 改过：按内容认回参（带行号引用 + 裁决或小节），不再按 span 类型名收。
+  it("同一 span 不重复收；光有行号没有结论形状的不算回参", () => {
     const agent = (id, out) => ({
       span_id: id, kind: "tool", name: "Agent",
       input: JSON.stringify({ description: "Verify H2" }), output_local: out,
     });
+    const 回参 = "[H2] refuted\n\n- `gram.y:10` 命中";
     const spans = [
-      agent("a1", "- `gram.y:10` 命中"),
-      agent("a1", "- `gram.y:10` 命中"),
+      agent("a1", 回参),
+      agent("a1", 回参),
       { span_id: "t1", kind: "tool", name: "Bash", output: "`gram.y:99`" },
       { span_id: "l1", kind: "llm", output_local: "`gram.y:88`" },
     ];
     const got = sourceEvidenceCandidates(spans);
     expect(got.length).toBe(1);
     expect(got[0].spanId).toBe("a1");
+  });
+
+  it("同一份回参落在两条 span 上（子代理 + 它最后一条 llm）只收一次", () => {
+    const 回参 = "Verdict: **supported**.\n\n- `planmain.cpp:246` gated";
+    const spans = [
+      { span_id: "s1", kind: "agent", name: "claude-code.subagent", output: 回参 },
+      { span_id: "m1", parent_id: "s1", kind: "llm", name: "anthropic.messages", output: 回参 },
+    ];
+    expect(sourceEvidenceCandidates(spans).length).toBe(1);
   });
 });
 
@@ -84,5 +95,64 @@ describe("verdictFromReturn（裁决走正则，不问模型）", () => {
   it("没写裁决返回 null，不瞎猜", () => {
     expect(verdictFromReturn("- `gram.y:1` 命中")).toBe(null);
     expect(verdictFromReturn("")).toBe(null);
+  });
+});
+
+describe("异步派发的子代理（2026-09-12 OG-3891 实测形状）", () => {
+  // 异步派发时 Agent 工具 span 的回参只有一行派发回执，真正的回参落在
+  // 另一条 span 上。按 span 的类型名收候选就会整条漏掉——这里只认内容。
+  const 派发回执 =
+    "Async agent launched successfully. (This tool result is internal metadata — never quote " +
+    "or paste any part of it, including the agentId below, into a user-facing reply.) " +
+    "agentId: affbb4d570f8004f3 (internal)";
+  const 回参 = [
+    "Verdict: **supported**.",
+    "",
+    "### 1. The extraction pass is gated by a beta GUC",
+    "",
+    "- `src/gausskernel/optimizer/plan/planmain.cpp:246` wraps the call in ENABLE_SQL_BETA_FEATURE",
+    "- default is NO_BETA_FEATURE at src/common/backend/utils/misc/guc/guc_sql.cpp:3334",
+  ].join("\n");
+
+  it("回执不算候选（没有任何带行号的引用）", () => {
+    expect(candidatesFromReturn(派发回执, { spanId: "a1" })).toBe(null);
+  });
+
+  it("真回参收得到，不管那条 span 叫什么名字", () => {
+    const spans = [
+      {
+        span_id: "a1", kind: "tool", name: "Agent",
+        input: JSON.stringify({ description: "Verify H3 OR-pushdown feature in source" }),
+        output: 派发回执,
+      },
+      { span_id: "s1", parent_id: "a1", kind: "agent", name: "claude-code.subagent", output: 回参 },
+    ];
+    const got = sourceEvidenceCandidates(spans);
+    expect(got.length).toBe(1);
+    expect(got[0].spanId).toBe("s1");
+    expect(got[0].verdict).toBe("confirmed");
+    expect(got[0].lines.length).toBe(2);
+    expect(got[0].lines[0].refs).toContain("src/gausskernel/optimizer/plan/planmain.cpp:246");
+    expect(got[0].lines[1].refs).toContain("src/common/backend/utils/misc/guc/guc_sql.cpp:3334");
+    // 编号从派发那条的 description 来（子代理回参自己不写 [H3]）
+    expect(got[0].hint).toContain("H3");
+  });
+
+  it("派发那条 span 没落盘时也收得到，hint 为空（上溯到顶拿不到就算了）", () => {
+    const spans = [
+      { span_id: "s1", parent_id: "没落盘", kind: "agent", name: "claude-code.subagent", output: 回参 },
+    ];
+    const got = sourceEvidenceCandidates(spans);
+    expect(got.length).toBe(1);
+    expect(got[0].hint).toBe("");
+  });
+
+  it("grep 的原始输出不算证据链——有行号但没有裁决、没有小节", () => {
+    const grep输出 = [
+      "src/gausskernel/optimizer/plan/planmain.cpp:246:    if (ENABLE_SQL_BETA_FEATURE(EXTRACT_PUSHDOWN_OR_CLAUSE)) {",
+      "src/gausskernel/optimizer/util/orclauses.cpp:71:void extract_restriction_or_clauses(PlannerInfo *root)",
+    ].join("\n");
+    const spans = [{ span_id: "b1", kind: "tool", name: "Bash", output: grep输出 }];
+    expect(sourceEvidenceCandidates(spans).length).toBe(0);
   });
 });

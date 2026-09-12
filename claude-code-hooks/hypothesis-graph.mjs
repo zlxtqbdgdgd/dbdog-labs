@@ -373,6 +373,16 @@ export function build(spans, { sourceEvidence = {}, sourceVerdict = {} } = {}) {
     n.closed_by = { from: "子代理裁决", in: "subagent" };
     resolveEdges.push({ kind: "resolve", from: "子代理裁决", to: hid, verdict });
   }
+  // 裸收口（2026-09-12）：判了，但名下什么都没有——没有工具调用、没有代码证据、也没有子假设。
+  // 判是从哪来的图上就断了：OG-3891 的 H4 写着「证伪」，理由只在结论正文里一句话，
+  // 读图的人问「凭什么证伪」找不到落点。机械判定，不猜那句话讲不讲得通。
+  for (const n of nodes.values()) {
+    if (!n.verdict || n.verdict === "open") continue;
+    const 有工具 = toolEdges.some((e) => e.from === n.id);
+    const 有代码证据 = sourceEdges.some((e) => e.from === n.id);
+    const 有子假设 = parentEdges.some((e) => e.from === n.id);
+    if (!有工具 && !有代码证据 && !有子假设) n.unsupported_close = true;
+  }
   const nodeList = [...nodes.values()].sort(compareHid);
   // covered_through（2026-09-10）：图覆盖到的事件时间上界 = 参与出图的 span 里最晚的 ts 原值
   // （不取 now——那是出图时刻，不是覆盖面）。server 拿它跟 span 水位 max(ts) 比判「图落后于 span」；
@@ -399,6 +409,8 @@ export function build(spans, { sourceEvidence = {}, sourceVerdict = {} } = {}) {
       // 代码证据边：一层子代理回参里带行号的引用（与工具边同级、靠 basis 区分）
       source_edges: sourceEdges.length,
       resolve_edges: resolveEdges.length,
+      // 判了但名下没有任何证据的假设数（见上「裸收口」）
+      unsupported_closes: nodeList.filter((n) => n.unsupported_close).length,
       unattached_tools: unattached.length,
       unattached_intent_without_head: unattached.filter((u) => u.reason === "intent_without_head").length,
       // 2026-09-10：被排除的本地工具调用计次（次数 + 按名分布，name 原样）
@@ -448,7 +460,7 @@ export function renderMd(g) {
       `正文提出 ${s.proposed_in_prose ?? 0}` +
       (s.source_hypotheses ? ` · 源码来源的假设 ${s.source_hypotheses}（其中 ${s.source_without_evidence} 个没有任何现场证据调用）` : ""),
     "",
-    "读法：节点 = 假设；缩进 = `[H2.1<H2]` 声明的父子关系；每个假设下面的表 = 该假设名下的工具调用（seq 是 dbdog（MCP）工具调用的序号，从 1 起连续，可据此看先后；Grep/Read/Bash 等本地工具不计、不进图）代码证据来自一层子代理的回参，与工具证据同级、靠「代码证据」小节区分——遥测证据是「支持」，代码证据是「必然」，两种都要看。",,
+    "读法：节点 = 假设；缩进 = `[H2.1<H2]` 声明的父子关系；每个假设下面的表 = 该假设名下的工具调用（seq 是 dbdog（MCP）工具调用的序号，从 1 起连续，可据此看先后；Grep/Read/Bash 等本地工具不计、不进图）。代码证据来自一层子代理的回参，与工具证据同级、靠「代码证据」小节区分——遥测证据是「支持」，代码证据是「必然」，两种都要看。",
     "",
     "## 假设树（假设↔假设、假设↔工具）",
     "",
@@ -462,6 +474,16 @@ export function renderMd(g) {
   }
   const byId = new Map(g.nodes.map((n) => [n.id, n]));
   const roots = g.nodes.filter((n) => !n.parent || !byId.has(n.parent));
+
+  /** 这个假设的取证落在哪——按图上真有的边说，别照着模板说「由子假设取证」。 */
+  const 取证落在 = (g, n) => {
+    const 子假设 = g.edges.filter((e) => e.kind === "parent" && e.from === n.id).map((e) => e.to);
+    const 代码证据 = g.edges.some((e) => e.kind === "source" && e.from === n.id);
+    if (子假设.length) return `取证在子假设 ${子假设.join("、")} 名下。`;
+    if (代码证据) return "取证是下面那段代码证据。";
+    // 一样都没有的情况下面那行「没有取证」会说清楚，这里不重复一遍。
+    return "";
+  };
 
   const nodeLine = (n, depth) => {
     const typ = TYPE_ZH[n.type] ?? "类型未写";
@@ -478,7 +500,7 @@ export function renderMd(g) {
       const src = n.proposed_in.in === "thinking" ? "思考块" : "正文";
       lines.push(`- 提出于${src}（span \`${n.proposed_in.span_id}\`）：${n.text ?? "（未写 claim=）"}`);
       if (n.expect) lines.push(`- 判据：${n.expect}`);
-      if (!n.declared) lines.push(`- 未声明：没有任何工具调用以 \`[${n.id}]\` 开头（只在正文提出、由子假设取证）。`);
+      if (!n.declared) lines.push(`- 未声明：没有任何工具调用以 \`[${n.id}]\` 开头，${取证落在(g, n)}`);
       else lines.push(`- 首次出现：seq ${n.first_seq}`);
     } else if (!n.declared) {
       lines.push(
@@ -489,6 +511,14 @@ export function renderMd(g) {
       lines.push(`- 假设：${n.text ?? "（未写 claim=）"}`);
       lines.push(`- 判据：${n.expect ?? "（未写 expect=）"}`);
       lines.push(`- 首次出现：seq ${n.first_seq}`);
+    }
+    if (n.unsupported_close) {
+      const ver = VERDICT_ZH[n.verdict] ?? n.verdict;
+      lines.push(
+        "",
+        `- **没有取证**：名下没有工具调用、没有代码证据、也没有子假设。「${ver}」只出自` +
+          `${n.closed_by?.in === "prose" ? "结论正文的假设收口那一行" : "收口"}，凭什么这么判，图上找不到落点。`,
+      );
     }
     const srcEdges = g.edges.filter((e) => e.kind === "source" && e.from === n.id);
     if (srcEdges.length) {
