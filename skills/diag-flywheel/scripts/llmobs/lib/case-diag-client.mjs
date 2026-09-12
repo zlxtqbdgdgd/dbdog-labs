@@ -59,8 +59,16 @@ export const DIAG_JUDGED = "judged";
  */
 export const DIAG_BLOCKED = "blocked";
 
-/** 挡住的四个理由。分两族，族别决定它能不能自己好——判据见 BLOCK_RECOVERABLE。 */
+/** 挡住的五个理由。分两族，族别决定它能不能自己好——判据见 BLOCK_RECOVERABLE。 */
 export const BLOCK_MCP_UNREACHABLE = "mcp_unreachable";
+/**
+ * 连上了，但这次会话拿到的工具集不是我们要的（点名的工具少了几个）。
+ *
+ * 与 `mcp_unreachable` 分开记，因为查法完全不同：不通是地址 / bearer / 服务挂了，
+ * 少工具是 `DBDOG_MCP_URL` 的 toolsets / skillsets 查询串配歪了。压成一个理由，
+ * 页面上看到「MCP 不通」的人会去 ping 地址，而地址是通的。
+ */
+export const BLOCK_MCP_TOOLSET_MISMATCH = "mcp_toolset_mismatch";
 export const BLOCK_PLUGIN_SYNC_FAILED = "plugin_sync_failed";
 export const BLOCK_DATA_EXPIRED = "data_expired";
 export const BLOCK_NO_TELEMETRY = "no_telemetry";
@@ -69,7 +77,7 @@ export const BLOCK_NO_TELEMETRY = "no_telemetry";
  * 「会自己好」那一族：环境类是全局的、暂时的，下一轮探活通过就该把这些行放回队列。
  * 数据类（现场过期 / 窗口里没遥测）好不了——现场已经不存在了，只能重新复现。
  */
-export const BLOCK_RECOVERABLE = [BLOCK_MCP_UNREACHABLE, BLOCK_PLUGIN_SYNC_FAILED];
+export const BLOCK_RECOVERABLE = [BLOCK_MCP_UNREACHABLE, BLOCK_MCP_TOOLSET_MISMATCH, BLOCK_PLUGIN_SYNC_FAILED];
 
 const path = (p) => `${baseUrl().replace(/\/+$/, "")}/api/v1/llm-obs/case-diagnoses${p}`;
 

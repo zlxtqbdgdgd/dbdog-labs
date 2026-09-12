@@ -20,9 +20,12 @@
 // （数据族不自愈），代价比漏挡大得多。理由常量已经在册，等口径定了再接上这一处。
 import { spawnSync } from "node:child_process";
 
-import { BLOCK_RECOVERABLE, DIAG_BLOCKED, advanceDiagnosis, listDiagnoses } from "./case-diag-client.mjs";
+import { BLOCK_MCP_TOOLSET_MISMATCH, BLOCK_RECOVERABLE, DIAG_BLOCKED, advanceDiagnosis, listDiagnoses } from "./case-diag-client.mjs";
 
-/** 守门结论。ok=false 时 reason 是 case-diag-client 里那四个常量之一。 */
+/** `DBDOG_LOOP_EXPECT_TOOLS` 逗号分隔；没配就是空名单（只查非空）。 */
+const envTools = () => String(process.env.DBDOG_LOOP_EXPECT_TOOLS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+
+/** 守门结论。ok=false 时 reason 是 case-diag-client 里那几个常量之一。 */
 const pass = () => ({ ok: true });
 const block = (reason, detail) => ({ ok: false, reason, detail });
 
@@ -36,8 +39,17 @@ const block = (reason, detail) => ({ ok: false, reason, detail });
  *
  * `DBDOG_MCP_URL` 没配时**不挡**，只告警：这道门是新加的，为一个没配的 env 让在跑的流水线
  * 全线停摆，比漏挡更坏。
+ *
+ * ## `expectTools`：连上了不等于拿到的是我们要的那套
+ * `DBDOG_MCP_URL` 带着 toolsets / skillsets 查询串，**配错了是静默的**——会话照起、跑批照跑、
+ * 分数照记，只是考生手上少了半套工具，然后诊断报告写「查不到」。和「悄悄换成便宜模型」是同一类
+ * 静默失败；模型那件事已经在 diag-run 开跑第一行印出来了，工具集这件事此前没人查。
+ *
+ * 名单由调用方给（`--expect-tool` 可重复，或 env `DBDOG_LOOP_EXPECT_TOOLS` 逗号分隔），
+ * **这里不内置一份**：该有哪些工具随 toolsets 选择与 dbdog 版本变，钉在这儿就是第二个真相源。
+ * 没给名单时只查非空（同上：没配不挡）。
  */
-export async function probeMcp({ url = process.env.DBDOG_MCP_URL, bearer = process.env.DBDOG_MCP_BEARER, timeoutMs = 20_000 } = {}) {
+export async function probeMcp({ url = process.env.DBDOG_MCP_URL, bearer = process.env.DBDOG_MCP_BEARER, expectTools = envTools(), timeoutMs = 20_000 } = {}) {
   const target = (url || "").trim();
   if (!target) {
     return { ok: true, skipped: true, detail: "没配 DBDOG_MCP_URL，本轮跳过 MCP 探活（不挡）" };
@@ -72,10 +84,20 @@ export async function probeMcp({ url = process.env.DBDOG_MCP_URL, bearer = proce
     await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "loop-preflight", version: "0.0.0" } }, 1);
     await rpc("notifications/initialized", {});
     const list = await rpc("tools/list", {}, 2);
-    const n = (list?.tools ?? []).length;
+    const names = (list?.tools ?? []).map((t) => String(t?.name ?? ""));
+    const n = names.length;
     // 连上了但一个工具都没有，等同于没连上：考生拿不到任何东西可查。
     if (n === 0) return { ...block("mcp_unreachable", `${target} 连上了但 tools/list 是空的`), probed: target };
-    return { ok: true, detail: `${target} 通，${n} 个工具`, probed: target };
+    const want = (expectTools ?? []).map((t) => String(t).trim()).filter(Boolean);
+    const missing = want.filter((t) => !names.includes(t));
+    if (missing.length) {
+      return {
+        ...block(BLOCK_MCP_TOOLSET_MISMATCH,
+          `${target} 通（${n} 个工具），但点名要的少了 ${missing.length} 个：${missing.join("、")}——多半是查询串里的 toolsets 配歪了`),
+        probed: target,
+      };
+    }
+    return { ok: true, detail: `${target} 通，${n} 个工具${want.length ? `（点名的 ${want.length} 个都在）` : ""}`, probed: target };
   } catch (e) {
     return { ...block("mcp_unreachable", `${target}: ${e.message || e}`), probed: target };
   }
