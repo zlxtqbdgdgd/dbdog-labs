@@ -47,7 +47,8 @@ import { buildMcpConfig } from "../e2e/lib/e2e-agent.mjs";
 import { judgeSessionArgs, judgeMcpUrl } from "./lib/judge-session.mjs";
 import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
 import { matchJudgeTargets, walkJudgeQueue } from "./lib/judge-queue.mjs";
-import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, claimDiagnosis, listDiagnoses, operator } from "./lib/case-diag-client.mjs";
+import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, blockDiagnosis, claimDiagnosis, listDiagnoses, operator } from "./lib/case-diag-client.mjs";
+import { preflight, resumeBlocked } from "./lib/preflight.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -70,6 +71,15 @@ const DRY = has("--dry-run");
 const CLAIMED_BY = argOf("--claimed-by", `loop-judge@${os.hostname()}`);
 // 租约时长按**判题超时 × 2** 取，理由与诊断侧同一条（见 loop-diagnose.mjs）。
 const STALE_AFTER_SEC = Number(argOf("--stale-after-sec", String(TIMEOUT_SEC * 2)));
+
+// ---- 开跑前守门的三个旋钮（owner 2026-09-12）。与诊断 loop 同名同义，两条 loop 同构。----
+// 判题这一侧**逐条真的在开跑那一刻检查**：它本来就是「判完一条再领下一条」。
+// 判官要连 MCP 去活系统主动查证（在线判是默认），MCP 不通时它只能照包里那份判，
+// 而那会把「查不到」判成「模型没想到查」——正是这道门要拦的。
+const MCP_URL = argOf("--mcp-url", process.env.DBDOG_MCP_URL || "");
+const MCP_BEARER = process.env.DBDOG_MCP_BEARER || "";
+const SYNC_CMD = argOf("--sync-cmd", process.env.DBDOG_LOOP_SYNC_CMD || "");
+const TTL_BUFFER_HOURS = Number(argOf("--ttl-buffer-hours", "2")) || 2;
 // `--limit N` = 本轮最多判几条；不给 = 判到队列空为止（一条一条领，见下面的流式循环）。
 const MAX_PER_ROUND = LIMIT > 0 ? LIMIT : 0;
 if (!DATASET) fail("--dataset 必填");
@@ -145,6 +155,11 @@ try {
   console.error(`· 队列：待判题 ${backlog.length} 条 · 判题中 ${inflight.length} 条（各自最多数到 1000）`);
 } catch { /* 看板信息，拿不到不阻断本轮 */ }
 
+// ---- ⓪ 解除：环境类挡住的行，探活通过就放回队列（蓝图 0028）----
+// 两条 loop 都做这一步，判据单源在 lib/preflight.mjs。抢着解除同一批行不要紧：
+// advance 带 from 断言，慢的那个拿 409 什么也不做。
+await resumeBlocked({ mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD });
+
 // ---- 一条一条地领：判完一条再领下一条 ----
 //
 // 队列怎么走（为什么不是一次领完、为什么配不上的要攥住）单源在 lib/judge-queue.mjs 的
@@ -166,13 +181,34 @@ const UNRESOLVED_WHY = {
 /**
  * 判一条：导包 → 判题会话 → 回流 → 推「已判」。
  *
- * 回 `ok` / `failed` / `skipped`（`--dry-run` 回 skipped：包导了但没判，既不算成也不算败，
+ * 回 `ok` / `failed` / `skipped` / `blocked`（`--dry-run` 回 skipped：包导了但没判，既不算成也不算败，
  * 否则空跑一轮的退出码会让 loop 以为判题失败）。**没判成的行不在这里放回**——
  * 放回去下一次 claim 会立刻又领到它（server 按 created_at 排序），队头一条稳定失败的行
  * 能把后面所有行挡住。由 walkJudgeQueue 攥到本轮结束统一放。
  */
 async function judgeOne(c) {
   console.error(`\n════ 判 ${c.eventId}（trace ${String(c.traceId).slice(0, 10)}，轮次 ${c.experiment}）════`);
+
+  // 开跑前守门（owner 2026-09-12）。这一条**真的在开跑那一刻**跑：判题是一条一条领的。
+  // 不过就挡住并记下理由，不是跳过——跳过的话环境长期不通只表现为「队列一直不消」。
+  const verdict = await preflight(c.row, {
+    mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD, bufferHours: TTL_BUFFER_HOURS,
+  });
+  for (const chk of verdict.checks ?? []) {
+    if (chk.skipped) console.error(`  ⚠ 守门·${chk.name}：${chk.detail}`);
+  }
+  if (!verdict.ok) {
+    console.error(`✗ ${c.row.case_source} 被挡住（${verdict.reason}）：${verdict.detail}`);
+    try {
+      // 挡住之后回 "blocked"：**不能回 failed**——failed 会被 walkJudgeQueue 攥到本轮末尾
+      // 放回待判题，下一轮再领到、再挡一次，队头那条能把后面全挡住。
+      if (await blockDiagnosis({ id: c.row.id, from: DIAG_JUDGING, reason: verdict.reason })) return "blocked";
+    } catch (e) {
+      console.error(`⚠ 标记被挡住失败（下轮靠租约回收）：${e.message || e}`);
+    }
+    return "failed";
+  }
+
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), "judge-pkg-"));
   let thisOk = false;   // 这一例成没成——失败的包要留着给人看，不能按全局计数删
   try {
@@ -223,7 +259,7 @@ async function judgeOne(c) {
   }
 }
 
-const { ok: okN, failed: failN, skipped } = await walkJudgeQueue({
+const { ok: okN, failed: failN, skipped, blocked: blockedN } = await walkJudgeQueue({
   claim: () => claimDiagnosis({
     claimedBy: CLAIMED_BY, staleAfterSec: STALE_AFTER_SEC,
     from: DIAG_PENDING_JUDGEMENT, to: DIAG_JUDGING,
@@ -240,6 +276,8 @@ const { ok: okN, failed: failN, skipped } = await walkJudgeQueue({
   onSkip: (row, reason) => console.error(`· 放回 ${row.case_source}：${UNRESOLVED_WHY[reason] ?? reason}`),
 });
 
-if (okN + failN + skipped === 0) console.error("本轮无事：诊断表里没有待判题的复现。");
-console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例${skipped ? ` · 放回 ${skipped} 条` : ""} ==`);
+if (okN + failN + skipped + blockedN === 0) console.error("本轮无事：诊断表里没有待判题的复现。");
+console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例${skipped ? ` · 放回 ${skipped} 条` : ""}${blockedN ? ` · 挡住 ${blockedN} 条` : ""} ==`);
+// 被挡住**不算判题失败**：环境不通不是这条 loop 干砸了，退出码报 1 会让调度器以为判题坏了、
+// 进而触发一堆本不该有的告警。挡住的行在页面上看得见，下一轮探活通过会自己回队列。
 process.exit(failN > 0 ? 1 : 0);

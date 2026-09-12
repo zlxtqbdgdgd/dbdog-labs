@@ -459,7 +459,7 @@ const nonEmpty = (v) => typeof v === "string" && v.trim().length > 0;
  * - items：这一轮新发现的改进点，一条一个落点。三个属性各管一维（ODC 式，互不替代）：
  *   `kind` 谁去干（六类）、`layer` 落在哪一层（tool 必填）、`qualifier` 缺失 / 写错 / 多余（tool、skill 必填）。
  *   `title` / `evidence` 必填（读的人靠它们，不靠 key）；`fix_where` 与 `suggestion` 在 tool / skill / case / env
- *   四类必填（能动手修的必须说改哪里）；`repro` 在 tool 必填；`rule_ref` 在 model 必填；
+ *   四类必填（能动手修的必须说改哪里）；**`repro` 六类全必填**（owner 2026-09-12）；`rule_ref` 在 model 必填；
  *   `suspected_kind` 在 unsure 必填；`unsure` 的 `suggestion` 写要人核什么。
  * - checks：这道题之前几轮提过、还没关的，逐条复验（`fixed` / `still_open` 必须带证据指针）。
  * 旧形状（`attribution`、顶层一段 `fix_where`）直接拒：一段里塞五处改动，数不出哪处修了。
@@ -504,10 +504,19 @@ export function validateFindings(a) {
     if (it.kind !== "tool" && it.layer !== undefined && !TOOL_LAYERS.includes(it.layer)) {
       problems.push(`${w}.layer ${JSON.stringify(it.layer)} 只能是 ${TOOL_LAYERS.join(" / ")}`);
     }
-    // tool 类关它的判据是「重放必须变对」——没有可重放的东西，这一条就永远关不掉。
-    // （Bettenburg 等对 466 名开发者的调查：复现步骤是开发者最想要的字段，也是最常缺的那个。）
-    if (it.kind === "tool" && !nonEmpty(it.repro)) {
-      problems.push(`${w}.repro 缺失（tool 类必填：工具名 + 入参 + 期望 vs 实际，一条命令能重放；关它就靠重放变对）`);
+    // **六类全要写「怎么复现」**（owner 2026-09-12：「所有类别都是各自使用一段话说清楚」）。
+    //
+    // 原来只有 tool 必填，理由是「关它的判据是重放必须变对」。那条对 tool 仍然成立，但它把
+    // 另外五类漏在了外面——而下游拿到一条改进点要做的第一件事，永远是先把它再现一遍。
+    // Bettenburg 等对 466 名开发者的调查：复现步骤是开发者最想要的字段，也是最常缺的那个；
+    // 那份调查问的不是「工具类缺陷」，是所有缺陷。
+    //
+    // **一段话，不是一条命令**（同日 owner 定）。tool 类天然能写成一条命令，写进那段话里最好；
+    // 另外五类本来就没有命令可跑——skill 缺一句话、模型推错一步、题面缺时间窗，这些的「复现」
+    // 是「照着走一遍会看到什么」，逼它们凑一条命令只会凑出一条跑不通的假命令。
+    if (!nonEmpty(it.repro)) {
+      problems.push(`${w}.repro 缺失（六类全必填，一段话说清怎么再现：在哪、做什么、期望什么、实际什么。` +
+        `tool 类能写成一条命令的就写进去——关它的判据是重放变对）`);
     }
     // model 是「前两问都答否」的剩余类，也是归因最不可靠的一类（Who&When Pro：错误类别 macro-F1 ≤ 22.2%、
     // 定位决定性步 ≈ 14%）。所以它得给反证：规矩写在哪一节（证明不是 skill 的锅）+ 指到没照做的那一步。

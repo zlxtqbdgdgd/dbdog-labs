@@ -50,6 +50,26 @@ export const DIAG_DIAGNOSING = "diagnosing";
 export const DIAG_PENDING_JUDGEMENT = "pending_judgement";
 export const DIAG_JUDGING = "judging";
 export const DIAG_JUDGED = "judged";
+/**
+ * 被挡住（蓝图 0028）。**它不在那条流水线上，是一条旁路**：两条 loop 抢到一条之后、发题
+ * 之前要逐条检查依赖的基础环境与代码同步，检查不过就岔到这里，连同理由一起记下来。
+ *
+ * 此前只有两条路，两条都错：不改状态跳过（页面上看不出来，环境长期不通时只表现为
+ * 「队列一直不消」，人得去翻 loop 日志），或推到下一态（撒谎，一次没跑成的诊断被当成跑完了）。
+ */
+export const DIAG_BLOCKED = "blocked";
+
+/** 挡住的四个理由。分两族，族别决定它能不能自己好——判据见 BLOCK_RECOVERABLE。 */
+export const BLOCK_MCP_UNREACHABLE = "mcp_unreachable";
+export const BLOCK_PLUGIN_SYNC_FAILED = "plugin_sync_failed";
+export const BLOCK_DATA_EXPIRED = "data_expired";
+export const BLOCK_NO_TELEMETRY = "no_telemetry";
+
+/**
+ * 「会自己好」那一族：环境类是全局的、暂时的，下一轮探活通过就该把这些行放回队列。
+ * 数据类（现场过期 / 窗口里没遥测）好不了——现场已经不存在了，只能重新复现。
+ */
+export const BLOCK_RECOVERABLE = [BLOCK_MCP_UNREACHABLE, BLOCK_PLUGIN_SYNC_FAILED];
 
 const path = (p) => `${baseUrl().replace(/\/+$/, "")}/api/v1/llm-obs/case-diagnoses${p}`;
 
@@ -125,9 +145,12 @@ export async function claimDiagnosis({ claimedBy, staleAfterSec, from, to }) {
  * 经手人（status_changed_by）由 DBDOG_OPERATOR 给出，不用调用方传——它是**人**，
  * 整条 loop 从头到尾同一个值，让每个调用点各传一次只会漏掉某一处。server 侧必填。
  */
-export async function advanceDiagnosis({ id, from, to, traceId }) {
+export async function advanceDiagnosis({ id, from, to, traceId, reason }) {
   const body = { from, to, by: operator() };
   if (traceId) body.trace_id = traceId;
+  // reason 只在 to=blocked 时给；给错了 server 会 400 而不是静默忽略——
+  // 静默忽略的话调用方以为自己记下了理由，而它哪儿都没落。
+  if (reason) body.reason = reason;
   try {
     const out = await call(path(`/${encodeURIComponent(id)}/advance`), { method: "POST", body: JSON.stringify(body) });
     return out?.data ?? null;
@@ -137,11 +160,27 @@ export async function advanceDiagnosis({ id, from, to, traceId }) {
   }
 }
 
+/**
+ * 把一条**已经抢到手**的行挡住（蓝图 0028）。开跑前的检查不过就走这里。
+ *
+ * 走的是同一条 advance，不是另一条路：挡住本身就是一次带 from 断言的状态变更，而那条断言
+ * 正是防「已经死掉的进程改活任务」的东西。`from` 只能是 diagnosing / judging——loop 是
+ * **先抢到手再检查**的，server 侧也照这条挡（从别的态挡进来它算不出解除时该回哪一步）。
+ *
+ * 解除不用另写函数：把行上的 `resume_status` 原样当 `to` 传给 advanceDiagnosis 就行。
+ */
+export async function blockDiagnosis({ id, from, reason }) {
+  return advanceDiagnosis({ id, from, to: DIAG_BLOCKED, reason });
+}
+
 /** 列诊断行（看积压用）。statuses 为空 = 不筛。 */
-export async function listDiagnoses({ statuses, recordIds, limit } = {}) {
+export async function listDiagnoses({ statuses, recordIds, blockedReasons, limit } = {}) {
   const q = new URLSearchParams();
   if (statuses?.length) q.set("status", statuses.join(","));
   if (recordIds?.length) q.set("record_id", recordIds.join(","));
+  // 只捞「会自己好」那一族（环境族）时用它。数据族捞回来也没用——现场已经不存在了，
+  // 再探一百次也不会变出来，放回队列只会被下一轮再挡一次。
+  if (blockedReasons?.length) q.set("blocked_reason", blockedReasons.join(","));
   if (limit) q.set("limit", String(limit));
   const qs = q.toString();
   const out = await call(path(qs ? `?${qs}` : ""));

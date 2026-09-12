@@ -77,21 +77,28 @@ export function matchJudgeTargets(rows, runsByRecord) {
  * @param {{
  *   claim: () => Promise<object|null>,
  *   resolve: (row: object) => { target?: object, reason?: string },
- *   judge: (target: object) => Promise<"ok"|"failed"|"skipped">,
+ *   judge: (target: object) => Promise<"ok"|"failed"|"skipped"|"blocked">,
  *   release: (row: object) => Promise<void>,
  *   limit?: number,
  *   onSkip?: (row: object, reason: string) => void,
  * }} io
- *   `judge` 回三种结果：`ok` 判完并已推进状态（行不用放回）；`failed` 判砸了；
- *   `skipped` 没判也不算砸（`--dry-run` 就是这种，否则空跑会让退出码骗调度）。抛异常按 `failed` 算。
- * @returns {Promise<{ok:number, failed:number, skipped:number}>} `limit` 数的是**判了几条**（ok+failed），
- *   配不上的不占配额——否则用户说「判 3 条」，可能被别的用例集的三条行吃光。
+ *   `judge` 回四种结果：`ok` 判完并已推进状态（行不用放回）；`failed` 判砸了；
+ *   `skipped` 没判也不算砸（`--dry-run` 就是这种，否则空跑会让退出码骗调度）；
+ *   `blocked` 开跑前守门没过、**行已经被改成 blocked 了**（蓝图 0028）。抛异常按 `failed` 算。
+ *
+ *   `blocked` 与 `failed` 分开是必须的，不是记账好看：failed 的行会被攥到本轮末尾放回
+ *   「待判题」，而 blocked 的行已经不在 judging 了——再放一次只会吃 409，更要紧的是
+ *   放回去下一轮立刻又领到、又挡一次，队头一条就能把后面全挡住（那正是「攥住」这套
+ *   机制当初要治的病）。挡住的行靠下一轮开头的探活统一解除。
+ * @returns {Promise<{ok:number, failed:number, skipped:number, blocked:number}>}
+ *   `limit` 数的是**判了几条**（ok+failed），配不上的与被挡住的都不占配额——
+ *   否则用户说「判 3 条」，可能被别的用例集的三条行、或三条环境不通的行吃光。
  */
 export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0, onSkip }) {
   const held = [];            // 本轮碰过、没判成的：攥到本轮结束再放（理由见上）
   const seenTraces = new Set();
   const seenRows = new Set(); // 兜底：真出现同一行被领两次（攥住之后不该发生），停下来而不是转圈
-  let ok = 0, failed = 0, skipped = 0;
+  let ok = 0, failed = 0, skipped = 0, blocked = 0;
 
   try {
     while (limit === 0 || ok + failed < limit) {
@@ -124,6 +131,8 @@ export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0
         outcome = "failed";
       }
       if (outcome === "ok") { ok += 1; continue; }
+      // blocked 的行**不攥**：它已经被改成 blocked，不在 judging 了。
+      if (outcome === "blocked") { blocked += 1; continue; }
       held.push(row);
       if (outcome === "skipped") skipped += 1;
       else failed += 1;
@@ -134,5 +143,5 @@ export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0
       try { await release(row); } catch { /* 等租约回收 */ }
     }
   }
-  return { ok, failed, skipped };
+  return { ok, failed, skipped, blocked };
 }
