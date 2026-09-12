@@ -53,20 +53,24 @@ const CASES = argOf("--cases", "").split(",").map((s) => s.trim()).filter(Boolea
 const PROJECT = argOf("--project", "default-project");
 const DATASET = argOf("--dataset", "");
 const JUDGE_MODEL = argOf("--judge-model", "");
+// 保留兼容老命令行；upsert 之后它与默认行为等价（见 ensureQueue 注释）。
 const FORCE_RELABEL = has("--force-relabel");
+void FORCE_RELABEL;
 
 if (!EXPERIMENT) fail("--experiment 必填");
 if (!OUT) fail("--out 必填");
 requireCredential();
 
 /**
- * 队列与 label schema：**已有 label 一律读回 id 复用，不重发 PUT。**
+ * 队列与 label schema：**每次都对齐一次词表**（PUT 是幂等的）。
  *
- * 取证（server `internal/storage/postgres/llmobs_annotation_store.go` 的
- * ReplaceAnnotationLabelSchemas）：整份替换是一个事务里的「DELETE 全部 label + 重插」，
- * 而 `llmobs_annotations.label_id` 是 ON DELETE CASCADE——**带不带原 id 都一样**，
- * DELETE 那一步已经把该队列的全部 annotation 连带删了，事后用同一个 id 插回来也救不回来。
- * 所以只有两种情形允许 PUT：队列刚建（还没有 label），或人明确 --force-relabel（会丢批注）。
+ * 2026-09-12 之前不是这样：server 的 ReplaceAnnotationLabelSchemas 实现为「DELETE 全部 label
+ * + 用新 id 重插」，而 `llmobs_annotations.label_id` 是 ON DELETE CASCADE，一发 PUT 就把该队列
+ * 全部批注级联删光。那时这里只好分三档（全新才写 / --force-relabel / 只告警），结果是**词表
+ * 改不动**——要给 verdict 加一个取值，代价是丢掉全部判题历史。
+ *
+ * 那是 server 的 bug，已按 `(queue_id, label)` upsert 修掉：命中已有行时 id 不变，批注挂得住。
+ * 于是这里回到它本该有的样子。`--force-relabel` 保留但已无特殊含义（现在两条路一样安全）。
  */
 async function ensureQueue(projectID) {
   const queues = await listAnnotationQueues({ projectID });
@@ -81,20 +85,21 @@ async function ensureQueue(projectID) {
   const wanted = LABEL_SCHEMA.map(({ label, value_type, options }, i) => ({
     label, value_type, ...(options ? { options } : {}), position: i,
   }));
-  if (labels.length === 0) {
-    labels = await replaceAnnotationLabels(queueID, wanted);
-    console.error(`label schema 首次写入：${labels.length} 条`);
-  } else if (FORCE_RELABEL) {
-    console.error("⚠ --force-relabel：整份替换 label schema，该队列**已有的批注会被级联删光**");
-    labels = await replaceAnnotationLabels(queueID, wanted);
-  } else {
-    const have = new Set(labels.map((l) => l.label));
-    const missing = LABEL_SCHEMA.map((l) => l.label).filter((l) => !have.has(l));
-    if (missing.length) {
-      console.error(`⚠ 队列已有 label，但缺 ${missing.join(", ")}——**不重发 PUT**（会删光已有批注）。`);
-      console.error("  这几项本轮判不了；要补齐得另起队列名，或人确认可丢批注后加 --force-relabel。");
-    }
-  }
+  // **每次都对齐一次词表**（2026-09-12 起）。
+  //
+  // 原先这里分三档：队列全新才写、`--force-relabel` 才整份替换、否则只告警不动——理由是
+  // server 的「整份替换」实现为「删光重建 + 换新 id」，而批注的 `label_id` 是 ON DELETE CASCADE，
+  // 一发 PUT 就把这个队列里所有历史批注级联删光。于是「给 verdict 加一个取值」实际代价是
+  // 「丢掉全部判题历史」，词表改不动，调用方只能绕道在别处另记一份。
+  //
+  // server 已按 `(queue_id, label)` upsert 修掉（命中已有行时 id 不变，批注挂得住），
+  // 所以这条 PUT 现在是安全且幂等的：新增取值、改 display、补一条 label 都能直接生效。
+  // 只有**从词表里去掉**一个 label 才会连带删它名下的值——那是对的，那些值已经没有定义可依。
+  const before = new Set(labels.map((l) => l.label));
+  labels = await replaceAnnotationLabels(queueID, wanted);
+  const added = LABEL_SCHEMA.map((l) => l.label).filter((l) => !before.has(l));
+  if (before.size === 0) console.error(`label schema 首次写入：${labels.length} 条`);
+  else if (added.length) console.error(`label schema 已对齐：补上 ${added.join(", ")}（已有批注不受影响）`);
   return { queueID, labels };
 }
 

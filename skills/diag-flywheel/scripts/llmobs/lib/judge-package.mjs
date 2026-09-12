@@ -22,8 +22,20 @@ export const QUEUE_NAME = "diag-judge";
  *
  * 判题方写前三个 + summary；`finding_kinds` 由 import 从 findings 算出（同一件事不写两遍）；`fix_marks` 由修的人用 fix-mark.mjs 写。
  */
+/**
+ * `verdict` 五档（2026-09-12 加 `not_reproduced`）。
+ *
+ * 原先 `unknown` 一档扛两件事：没答案纸（题坏了）与**现场不成立**（窗口里现象根本没出来，
+ * 诊断做得再对也定位不到）。两件事找的是两拨人——前者回出题那一侧改题，后者回复现那一侧
+ * 重跑——压成一个值，跨轮统计就分不开「题库有问题」和「复现有问题」。
+ *
+ * 早先没拆是因为改枚举值要整份 PUT，而那会级联删光队列里已有的全部批注。那是 server 的 bug
+ * （删光重建 + 换新 id），已按 `(queue_id,label)` upsert 修掉；绕道在别处另记一份是糊纸，不是修。
+ */
+export const VERDICTS = ["correct", "partial", "wrong", "unknown", "not_reproduced"];
+
 export const LABEL_SCHEMA = [
-  { label: "verdict", value_type: "categorical", options: ["correct", "partial", "wrong", "unknown"], display: "结论对不对：对 / 部分对 / 错 / 判不了（没答案纸）" },
+  { label: "verdict", value_type: "categorical", options: VERDICTS, display: "结论对不对：对 / 部分对 / 错 / 判不了（没答案纸） / 这次现场不成立" },
   { label: "evidence", value_type: "categorical", options: ["solid", "weak"], display: "证据撑不撑得住结论" },
   { label: "findings", value_type: "json", display: "改进点（一条一个）+ 对之前几轮条目的复验" },
   { label: "finding_kinds", value_type: "json", display: "改进点类别（由 import 从 findings 算出，筛选用）" },
@@ -34,7 +46,6 @@ export const LABEL_SCHEMA = [
 /** 判题方要写的 label（其余两个由脚本写）。 */
 export const JUDGE_WRITTEN_LABELS = ["verdict", "evidence", "findings", "summary"];
 
-export const VERDICTS = ["correct", "partial", "wrong", "unknown"];
 export const EVIDENCE_VALUES = ["solid", "weak"];
 
 /**
@@ -87,6 +98,15 @@ export const FINDING_QUALIFIERS = ["missing", "incorrect", "extraneous"];
 
 /** 必须给 qualifier 的两类（model 是模型行为、case/env/unsure 没有「实现」可言）。 */
 export const QUALIFIED_KINDS = ["tool", "skill"];
+
+/**
+ * 判官**核到什么程度**（2026-09-12 加）。它是工单的可信度刻度：同一条 `tool` 类缺陷，
+ * 在线试过 / 只看了轨迹 / 想核但核不了，下游拿到手的确信程度差一个量级，而此前工单上看不出来。
+ *   · `online`      —— 自己调 dbdog 核过（判据最硬，`repro` 多半就是他刚跑通的那条）
+ *   · `trace_only`  —— 只看了轨迹，没去活系统
+ *   · `unreachable` —— 想核但核不了（现场已过期 / MCP 不通）
+ */
+export const VERIFIED_LEVELS = ["online", "trace_only", "unreachable"];
 
 /** 修复标记三值（§13.3）：改了等复验 / 要人协助 / 不修。 */
 export const FIX_MARK_STATUSES = ["claimed_fixed", "needs_human", "wont_fix"];
@@ -536,6 +556,14 @@ export function validateFindings(a) {
     }
     // model 是「前两问都答否」的剩余类，也是归因最不可靠的一类（Who&When Pro：错误类别 macro-F1 ≤ 22.2%、
     // 定位决定性步 ≈ 14%）。所以它得给反证：规矩写在哪一节（证明不是 skill 的锅）+ 指到没照做的那一步。
+    // `tool` 的判据本来就是「去活系统核，固定代码重放会不会一样错」——没核过就不该往 tool 上判，
+    // 所以这一类必填。别的类别不逼填（skill 缺一句话、模型推错一步，本来就不靠调 dbdog 核）。
+    if (it.kind === "tool" && !VERIFIED_LEVELS.includes(it.verified)) {
+      problems.push(`${w}.verified ${it.verified === undefined ? "缺失" : JSON.stringify(it.verified)}（tool 类必填，只能是 ${VERIFIED_LEVELS.join(" / ")}）`);
+    }
+    if (it.kind !== "tool" && it.verified !== undefined && !VERIFIED_LEVELS.includes(it.verified)) {
+      problems.push(`${w}.verified ${JSON.stringify(it.verified)} 只能是 ${VERIFIED_LEVELS.join(" / ")}`);
+    }
     if (it.kind === "model" && !nonEmpty(it.rule_ref)) {
       problems.push(`${w}.rule_ref 缺失（model 类必填：规矩写在哪个 skill / 模板的哪一节——查不到就说明这是 skill 缺规矩，不是模型抽风）`);
     }
@@ -569,6 +597,16 @@ export function validateFindings(a) {
     problems.push(...pointerProblems(w, c.pointers, c.status === "fixed" || c.status === "still_open"));
     if (keys.has(c.key)) problems.push(`${w}.key ${c.key} 同时出现在 items 里——又撞上的只写 still_open 复验，不要再提一条`);
   });
+  // `roots.extra`：agent 报了答案纸上**没有**的根因（2026-09-12 加）。
+  // 可能是它对（答案纸不全 → 该记一条 `case`），也可能是它编的（→ `model`）；两种都值钱，
+  // 而此前 roots 只有 matched / missed 两格，这一类观察连落脚处都没有，两种都丢了。
+  // **不参与 verdict 推导**：verdict 只按答案纸上那几条算，多说的另算，否则口径一改就没法重算历史。
+  const extra = a.roots?.extra;
+  if (extra !== undefined) {
+    if (!Array.isArray(extra) || extra.some((x) => typeof x !== "string" || !x.trim())) {
+      problems.push("findings.roots.extra 只能是非空字符串的数组（agent 多说的每条根因写一句话）");
+    }
+  }
   return problems;
 }
 
@@ -634,6 +672,10 @@ export function validateAgainstCase(labels, ctx = {}) {
         problems.push(`这道题没有答案纸，verdict 只能是 unknown（现在是 ${JSON.stringify(labels.verdict)}）——没有答案纸就没有「对」这个判断`);
       }
       if (roots !== undefined) problems.push("这道题没有答案纸，findings.roots 不该有值——先回建用例那一步补根因");
+    } else if (labels?.verdict === "not_reproduced") {
+      // 现场不成立：现象根本没出来，「agent 找没找到根因」这件事本身就不成立，不要求划集合。
+      // 也不拿集合去核 verdict——这一档的下一步是回复现那一侧重跑，不是算分。
+      if (roots !== undefined) problems.push("这次现场不成立（verdict=not_reproduced），findings.roots 不该有值——现象都没出来，谈不上命中");
     } else if (!roots || typeof roots !== "object" || Array.isArray(roots)) {
       problems.push(`findings.roots 缺失：答案纸有 ${expected.length} 条根因，要按顺序编号划进 matched / missed`);
     } else {

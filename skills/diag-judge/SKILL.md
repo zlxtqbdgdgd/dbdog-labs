@@ -1,6 +1,6 @@
 ---
 name: diag-judge
-description: 给一次数据库诊断（一条 trace）判卷：结论对不对（多根因按集合算命中，verdict 由集合推导）、证据撑不撑得住、改进点一条一条分六类（工具错 / skill 错 / 模型抽风 / 题有问题 / 复现环境侧 / 判不出要人看），每条再标落在哪一层、是缺失还是写错，每类绑死一个下一步动作和一种验法，每条指到能核得到的 span 或探针行、说清改哪里。在线判题（默认，去活系统主动查证）与离线包判题同一套判据；产出 annotations.jsonl + summary.md，回流走 diag-flywheel 的 import 脚本。触发词：判题 / 判卷 / diag-judge / 判一下这条 trace / 判这个包 / 哪些要修 / 修好了没有。
+description: 给一次数据库诊断（一条 trace）判卷：结论对不对（多根因按集合算命中，verdict 由集合推导；没答案纸判 unknown、这次现场不成立判 not_reproduced）、证据撑不撑得住、改进点一条一条分六类（工具错 / skill 错 / 模型抽风 / 题有问题 / 复现环境侧 / 判不出要人看），每条再标落在哪一层、是缺失还是写错，每类绑死一个下一步动作和一种验法，每条指到能核得到的 span 或探针行、说清改哪里。在线判题（默认，去活系统主动查证）与离线包判题同一套判据；产出 annotations.jsonl + summary.md，回流走 diag-flywheel 的 import 脚本。触发词：判题 / 判卷 / diag-judge / 判一下这条 trace / 判这个包 / 哪些要修 / 修好了没有。
 ---
 
 > 脚本位置：本插件 `skills/diag-flywheel/scripts/`，下文用 `$S` 指代它
@@ -106,7 +106,7 @@ cases/<event_id>/
 
 | label | 取值 | 回答什么 |
 |---|---|---|
-| `verdict` | `correct` / `partial` / `wrong` / `unknown` | **结论对不对**——对照答案纸的根因，不是对照「说得漂不漂亮」。没有答案纸填 `unknown`（判不了，见「没有答案纸 = 题坏了」），**不许**拿「自洽」冒充 `partial` |
+| `verdict` | `correct` / `partial` / `wrong` / `unknown` / `not_reproduced` | **结论对不对**——对照答案纸的根因，不是对照「说得漂不漂亮」。没有答案纸填 `unknown`（题坏了，见那一节）；**这次现场不成立**填 `not_reproduced`（见下）。**不许**拿「自洽」冒充 `partial` |
 | `evidence` | `solid` / `weak` | **证据撑不撑得住结论**——把结论依赖的证据抽掉一条，结论还站得住吗？站不住就是 `weak`。跟对错无关：结论对但证据撑不住，就是结论对但不是靠证据得出来的 |
 | `findings` | `{ items, checks, roots }` | **改进点，一条一个**（下一节）+ 对之前几轮条目的复验 + 根因命中集合（有答案纸时必填，见「多根因」） |
 | `summary` | ≤ 600 字符 | **总评**：前三句固定——结论对不对、一句为什么；改进点几条、最要紧的一条；判不了的写清缺什么。后面每多一种情况各补一句（未调无碍、本例有 N 条要人核、无答案纸的那句 ⚠），总长仍要 ≤ 600 字符，超了整包拒写 |
@@ -232,6 +232,7 @@ owner 定：「判题层把问题找到就可以了，在哪个仓库修复应�
 | `evidence` | ≤ 3 句：**看到了什么**（带具体值与 span / 探针编号）；**本该是什么**；**为什么是问题**。例：「查 host109 的 schema 时（span 0be77ce9），表 bench.c538 同时出现在 tables 和 not_found 里。not_found 应该只放没解析到的对象。模型据此以为表不存在，绕了一圈。」 |
 | `expected` | **修好之后重放该看到什么**，不是「去哪儿改」（那归修复层）。`tool` / `skill` / `case` 三类与 `unsure` 必填；`skill` 类必须含要加或要改的原句（「」引起来）；`unsure` 写「请核：…（看哪里）」。`env` 不填——环境改不了，没有「修好之后」。它同时是关单判据：修的人打了 `claimed_fixed`，下一轮复验对照的就是这一栏 |
 | `repro` | **六类全必填**（owner 2026-09-12）：**一段话**说清怎么再现——在哪、做什么、期望什么、实际什么。下游拿到一条改进点，第一件事永远是先把它再现一遍。`tool` 类能写成一条命令的就写进这段话里（工具名 + 入参 + 期望 vs 实际）——关掉 `tool` 的判据就是「重放变对」，没有可重放的东西这一条永远关不掉。**另外五类不要凑命令**：skill 缺一句话、模型推错一步、题面缺时间窗，这些的「复现」是「照着走一遍会看到什么」，凑出来的只会是一条跑不通的假命令。一律别写成要搭半小时环境的步骤，那种没人会跑 |
+| `verified` | **核到什么程度**，`tool` 类必填、其余可选：`online` 自己调 dbdog 核过（最硬，`repro` 多半就是你刚跑通的那条）／ `trace_only` 只看了轨迹没去活系统 ／ `unreachable` 想核但核不了（现场已过期、MCP 不通）。它是工单的可信度刻度——同一条缺陷，核过和没核过，下游的确信程度差一个量级。`tool` 的判据本来就是「去活系统核，重放会不会一样错」，没核过就别往 `tool` 上判 |
 | `pointers` | 至少一项：`{"span_id":"…"}`（正向那一步，**从 `forward.md` 调用表的 span 那一列抄**，写全或写前 8 位都行）或 `{"probe":"E3"}` / `{"probe":"online:<看了什么>"}`。**`span_id` 会被回流脚本拿去跟 `trace.json` 对**：轨迹里没有这条 span，或者你写的前缀配到两条以上，整包拒写 |
 
 三条硬规则（违反就等于没判，import 会整包拒写）：
@@ -313,6 +314,27 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 
 **回流会核这件事**：`verdict` 与集合对不上就整包拒写——命中一条根因却判 `correct`，
 是这条 loop 最贵的错（分数是它的主产出之一，而且会一路带偏跨轮对比）。
+
+### 现场不成立：`not_reproduced`，不划集合
+
+按答案纸的「期望现象」自己去活系统查那个窗口，**现象根本没出来**（靶机被重装、换了版本、
+时间窗与现场对不上），那就填 `not_reproduced`，并且**不写 `findings.roots`**——现象都没出来，
+「agent 找没找到根因」这件事本身就不成立，划集合是在给一道没成立的题打分。
+
+这一档 2026-09-12 从 `unknown` 里分出来。此前两件事挤在一个值里：**没答案纸**要回出题那一侧改题，
+**现场不成立**要回复现那一侧重跑——找的是两拨人，压成一个值，跨轮统计就分不开「题库有问题」
+和「复现有问题」。
+
+查得到现象就不是这一档：agent 没查到是 agent 那头的事（`model` / `skill` / `tool`）。
+现场已经过期、你核不了，那既不是这一档也不是别的——是这一例判不了，按 `unsure` 记并写明「现场已过期」。
+
+### `roots.extra`：agent 多说的根因
+
+agent 报了答案纸上**没有**的根因，写进 `roots.extra`（字符串数组，一条一句话）。
+**不参与 `verdict` 推导**——分数只按答案纸那几条算。
+
+记它是因为两种可能都值钱：它对（答案纸不全 → 另记一条 `case`），或它编的（→ 另记一条 `model`）。
+此前 `roots` 只有 `matched` / `missed` 两格，这类观察连落脚处都没有，两种都丢了。
 
 记集合、而不是只留一个三值，还有第二个好处：**以后口径再改（比如改成按权重折算），历史轮次能重算，不用重判**。
 外部的根因定位评测（RCAEval 这类）也是先留住「命中了哪几条、漏了哪几条」，再谈怎么折算成一个分——同一个理由。
@@ -406,6 +428,8 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 
 - [ ] 有答案纸：`findings.roots` 把每条根因都划进 `matched` 或 `missed`（从 1 编号、只写数字），且 `verdict` 与集合对得上
 - [ ] 没答案纸：`verdict` 是 `unknown`、没有 `roots`
+- [ ] 现场不成立：`verdict` 是 `not_reproduced`、没有 `roots`
+- [ ] `tool` 类每条都写了 `verified`（`online` / `trace_only` / `unreachable`）
 - [ ] 每条改进点都有 `title` / `evidence` / `pointers`，且 `span_id` 在这条 trace 里真找得到
 - [ ] 每条都写了 `repro`（六类全必填，一段话）；`tool` 类另外还要 `qualifier` + `expected`
 - [ ] `skill` 类：`qualifier` 在，`expected` 里用「」引出了要加或要改的原句
@@ -432,7 +456,7 @@ node $S/llmobs/case-history.mjs --record <record_id> --before <这一轮的 trac
 **`annotations.jsonl`**：每例一行，一行一个完整 JSON 对象（不换行、不带注释、不加尾逗号）。
 
 ```json
-{"trace_id":"<本例的完整 trace_id，从 manifest.json 抄>","labels":{"verdict":"partial","evidence":"solid","findings":{"items":[{"key":"opengauss-checkpoint.not-collected","kind":"tool","qualifier":"missing","title":"openGauss 的检查点指标没有采","evidence":"直查这台实例的指标库，checkpoints_timed 一个点位都没有；同版本的另一台有。采集项没开，所以整个 org 都没有这组指标。模型因此走不到检查点风暴这条路。","repro":"get_dbdog_metric metric=opengauss.bgwriter.checkpoints_timed instance=host109-og1 窗口 2026-09-11 13:58–14:02(UTC+8)：期望有点位，实际空；换近 7 天任一活窗口仍空","pointers":[{"probe":"online:直查指标库 + 同版本另一台对照"}],"expected":"近 7 天 opengauss.bgwriter.checkpoints_timed 有点位，与同版本另一台一致"},{"key":"dbm-opengauss.metric-reference-checkpoint","kind":"skill","qualifier":"missing","title":"dbm-opengauss skill 没告诉模型该查检查点指标","evidence":"正向假设树里没有任何假设指向检查点（span a1b2c3d4 是最接近的一步，查的是写 I/O）。skill 的指标参考小节没有检查点这一行。模型不知道有这条路。","repro":"照现在这版 dbm-opengauss skill 让模型诊断同一条 trace：期望假设树里出现一条指向检查点的假设，实际一条都没有（最接近的 span a1b2c3d4 查的是写 I/O）","pointers":[{"span_id":"a1b2c3d4"}],"expected":"dbm-opengauss 的指标参考小节里有这一行：「写 I/O 抬头时先看 checkpoints_timed 与 checkpoints_req」"}],"checks":[{"key":"samples.wait-event-filter","status":"fixed","kind":"tool","pointers":[{"span_id":"9f0e1d2c"}],"note":"这一轮加 @db.wait_event_type:CPU 过滤返回 16 条，与不带过滤一致"}],"roots":{"matched":[1],"missed":[2]}},"summary":"两条根因命中一条（写 I/O 饱和），没走到检查点风暴，按集合口径判部分对。改进点两条：检查点指标没采（工具错·缺失），skill 也没教这条路。上一轮的等待事件过滤 bug 这一轮验证修好了。"}}
+{"trace_id":"<本例的完整 trace_id，从 manifest.json 抄>","labels":{"verdict":"partial","evidence":"solid","findings":{"items":[{"key":"opengauss-checkpoint.not-collected","kind":"tool","qualifier":"missing","title":"openGauss 的检查点指标没有采","evidence":"直查这台实例的指标库，checkpoints_timed 一个点位都没有；同版本的另一台有。采集项没开，所以整个 org 都没有这组指标。模型因此走不到检查点风暴这条路。","repro":"get_dbdog_metric metric=opengauss.bgwriter.checkpoints_timed instance=host109-og1 窗口 2026-09-11 13:58–14:02(UTC+8)：期望有点位，实际空；换近 7 天任一活窗口仍空","pointers":[{"probe":"online:直查指标库 + 同版本另一台对照"}],"expected":"近 7 天 opengauss.bgwriter.checkpoints_timed 有点位，与同版本另一台一致","verified":"online"},{"key":"dbm-opengauss.metric-reference-checkpoint","kind":"skill","qualifier":"missing","title":"dbm-opengauss skill 没告诉模型该查检查点指标","evidence":"正向假设树里没有任何假设指向检查点（span a1b2c3d4 是最接近的一步，查的是写 I/O）。skill 的指标参考小节没有检查点这一行。模型不知道有这条路。","repro":"照现在这版 dbm-opengauss skill 让模型诊断同一条 trace：期望假设树里出现一条指向检查点的假设，实际一条都没有（最接近的 span a1b2c3d4 查的是写 I/O）","pointers":[{"span_id":"a1b2c3d4"}],"expected":"dbm-opengauss 的指标参考小节里有这一行：「写 I/O 抬头时先看 checkpoints_timed 与 checkpoints_req」"}],"checks":[{"key":"samples.wait-event-filter","status":"fixed","kind":"tool","pointers":[{"span_id":"9f0e1d2c"}],"note":"这一轮加 @db.wait_event_type:CPU 过滤返回 16 条，与不带过滤一致"}],"roots":{"matched":[1],"missed":[2],"extra":["它还提了「索引膨胀」，答案纸上没有这一条——已另记一条 case"]}},"summary":"两条根因命中一条（写 I/O 饱和），没走到检查点风暴，按集合口径判部分对。改进点两条：检查点指标没采（工具错·缺失），skill 也没教这条路。上一轮的等待事件过滤 bug 这一轮验证修好了。"}}
 ```
 
 `trace_id` 必须与包里 / 现取到的那条**完整**对得上——它是回流时找 interaction 的唯一键。
