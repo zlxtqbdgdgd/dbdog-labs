@@ -75,22 +75,61 @@ export function verdictFromReturn(text) {
   return VERDICT_MAP[String(w).toLowerCase()] ?? VERDICT_MAP[w] ?? null;
 }
 
-/** 整条 trace 的 span 列表 → 候选列表（只看 Agent 工具 span）。 */
+/** 小节标题的形状（`### 1. …` / `**2. …**` / `(a) …` / `1. …`）。 */
+const HEAD_LINE = /^\s*(#{2,4}\s|\*\*\s*(?:\d+\.|[A-Z])|\(?[a-z]\)\s|\d+\.\s)/;
+
+/**
+ * 一段文本是不是**结论式回参**——只看内容，不看它挂在哪种 span 上（owner 2026-09-12 定）。
+ *
+ * 为什么不能按 span 的类型名收：异步派发时 `Agent` 工具 span 的回参只有一行
+ * 「Async agent launched successfully… agentId: …」，真回参落在另一条 span 上；
+ * 换一种派发形态，承载它的 span 又会叫别的名字。2026-09-12 OG-3891 实测整条漏掉。
+ *
+ * 判据是两条一起：**带行号的源码引用**（refs，调用方已算）+ **结论形状**（裁决行，
+ * 或两个以上小节标题）。后一条挡掉 grep/cat 的原始输出——同一轮实测 62 条 Bash span
+ * 里 28 条带行号引用（359 行），它们是取证的原材料而不是演绎链，全进图会把图淹掉，
+ * 而且每条候选要单独调一次模型，SessionEnd 那 30 秒预算扛不住。
+ */
+function looksLikeReturn(body) {
+  const lines = String(body ?? "").split(/\r?\n/);
+  if (verdictFromReturn(body)) return true;
+  return lines.filter((l) => HEAD_LINE.test(l)).length >= 2;
+}
+
+/** 派单 description：自己的入参里有就用，没有就回溯到派发它的那条 span。 */
+function hintFor(span, byId) {
+  for (let s = span, depth = 0; s && depth < 4; s = byId.get(s.parent_id), depth++) {
+    try {
+      const d = JSON.parse(String(s.input ?? "{}")).description;
+      if (d) return String(d);
+    } catch {
+      /* 入参不是 JSON 就往上找 */
+    }
+  }
+  return "";
+}
+
+/** 整条 trace 的 span 列表 → 候选列表（**按内容认回参**，不按 span 类型）。 */
 export function sourceEvidenceCandidates(spans) {
   const out = [];
   const seen = new Set();
+  const seenRefs = new Set();
+  const byId = new Map();
+  for (const s of spans ?? []) if (s?.span_id && !byId.has(s.span_id)) byId.set(s.span_id, s);
   for (const s of spans ?? []) {
-    if (s?.kind !== "tool" || String(s.name ?? "") !== "Agent") continue;
-    if (seen.has(s.span_id)) continue;
+    if (!s || seen.has(s.span_id)) continue;
+    const body = s.output_local ?? s.output;
+    if (!looksLikeReturn(body)) continue;
+    const c = candidatesFromReturn(body, { spanId: s.span_id, hint: hintFor(s, byId) });
+    if (!c) continue;
     seen.add(s.span_id);
-    let hint = "";
-    try {
-      hint = String(JSON.parse(String(s.input ?? "{}")).description ?? "");
-    } catch {
-      /* 入参不是 JSON 就算了 */
-    }
-    const c = candidatesFromReturn(s.output_local ?? s.output, { spanId: s.span_id, hint });
-    if (c) out.push(c);
+    // 同一份回参常同时落在子代理 span 与它最后一条 llm span 上：引用集合一样就只收一次，
+    // 否则同一条证据链会被送两遍模型、在图上画成两条边。
+    const key = c.lines.flatMap((l) => l.refs).sort().join("|");
+    if (key && seenRefs.has(key)) continue;
+    if (key) seenRefs.add(key);
+    out.push(c);
   }
   return out;
 }
+
