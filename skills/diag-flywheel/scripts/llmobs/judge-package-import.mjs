@@ -127,7 +127,11 @@ if (!jsonl) {
       gaps.push(`label ${skipped.join(", ")} 在队列里不存在（export 时已警告过；补齐要另起队列名，重发 PUT labels 会删光已有批注）`);
     }
     const usable = Object.fromEntries(Object.entries(row.labels).filter(([l]) => labelIds[l]));
-    payload.push(...annotationPayload({ interactionId: interactionId ?? "(dry-run)", labels: usable, labelIds, annotator }));
+    payload.push(...annotationPayload({
+      interactionId: interactionId ?? "(dry-run)", labels: usable, labelIds, annotator,
+      // 判的是哪一版口径：export 导包时记的那份（老包没有这一格就不写，不编一个）。
+      rubricVersion: manifest.rubric?.id,
+    }));
   }
   if (DRY) {
     console.error(`[dry-run] 会写 ${payload.length} 条 annotation（${rows.length} 例）`);
@@ -136,6 +140,7 @@ if (!jsonl) {
     wrote += saved.length;
     console.error(`✓ 批注 ${saved.length} 条（${rows.length} 例，annotator=${annotator || "（空）"}）`);
     console.error("  finding_kinds 已从 findings 算出一起写；分数不用另写：server 收到 annotation 后自动投影成 experiment metric 与 root span 的 evaluation.* tag");
+    if (manifest.rubric?.id) console.error(`  rubric_version 一起写：${manifest.rubric.id}`);
   }
 }
 
