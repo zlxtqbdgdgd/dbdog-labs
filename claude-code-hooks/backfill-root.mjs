@@ -71,3 +71,16 @@ export function serverTagDiff(remote, outgoing) {
   }
   return bad;
 }
+
+/**
+ * 拉服务端 root 的结果分类。**「没有」与「取不到」必须分开**：回刷把这个判断提到了流程最
+ * 前面当过滤器用，压成同一个 null 的话，服务端抖一下（2026-09-12 02:25–02:27 dbdog-server
+ * 重启，100 秒 HTTP 000）就会让那段时间的 trace 全被静默跳过，跑完还报成功。
+ * @param {{ok: boolean, status: number}|null} res fetch 的返回；抛异常时传 null
+ * @returns {"ok"|"absent"|"unreachable"}
+ */
+export function remoteReason(res) {
+  if (!res) return "unreachable";
+  if (res.status === 404) return "absent";
+  return res.ok ? "ok" : "unreachable";
+}
