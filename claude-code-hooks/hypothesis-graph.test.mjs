@@ -435,3 +435,78 @@ describe("graph-worker · pushes the graph to the server on the root span", () =
     expect(fs.readFileSync(path.join(dir, "graph-worker.log"), "utf8")).toContain("已推 root+graph");
   });
 });
+
+// ── 代码证据边（2026-09-12）────────────────────────────────────────────────
+// 一层子代理的**返回值**里本来就带着一条带 file:line 的演绎链，之前整条被丢掉：
+// Agent 是本地工具，build() 把它并进 localExcluded 就 continue 了，output 一起没了。
+// 实测（trace 2c461f2e，OG-3197 CTAS AS EXECUTE）：H2 的子代理回了 5633 字符，
+// 逐条钉着 gram.y:24015-24037 / configure.in:1930-1931 / build_options.cmake:172，
+// 连「是不是在 if 里」「有没有 #else」都排过——而图上 0 条边、收口也没拿到。
+// 代码证据与遥测证据**同级但可区分**：两种边都要，靠 basis 分（owner 2026-09-12 定）。
+const SUBAGENT_RETURN = `[H2] refuted
+
+Values:
+
+**1. Rejection site (parse-time, unconditional within PGXC)**
+- \`src/common/backend/parser/gram.y:24015-24037\`: the only production for CTAS+EXECUTE.
+  No \`if\`, GUC, compatibility-mode check; no \`#else\` branch. The error fires before
+  \`ExecuteQuery\` → \`FetchPreparedStatement\` (\`prepare.cpp:380\`) is ever reached.
+- Repo-wide the message exists only in \`gram.y\` and \`src/bin/gsqlerr/errmsg.txt:1028\`.
+
+**2. PGXC is defined in every build variant of this branch**
+- \`configure.in:1930-1931\`: \`CFLAGS="-DPGXC $CFLAGS"\` — top-level, unconditional.
+- \`cmake/src/build_options.cmake:172\`: set(MACRO_OPTIONS ...
+`;
+
+function agentSpan(spanId, ts, desc, output) {
+  return {
+    span_id: spanId, kind: "tool", name: "Agent", trace_id: "aa", ts, tags: {},
+    input: JSON.stringify({ description: desc }), output_local: output,
+  };
+}
+
+describe("hypothesis-graph · 代码证据边", () => {
+  it("一层子代理的返回值解析成 source 边，逐条带 file:line", () => {
+    const g = build([
+      dbdog("t1", "search_dbdog_logs", 1, "[H2] type=cause; claim=feature could be enabled on this instance"),
+      agentSpan("a1", 2, "Verify H2 source conditionality", SUBAGENT_RETURN),
+    ]);
+    const src = g.edges.filter((e) => e.kind === "source");
+    expect(src.length).toBe(2);
+    expect(src.every((e) => e.from === "H2")).toBe(true);
+    expect(src[0].refs).toContain("src/common/backend/parser/gram.y:24015-24037");
+    expect(src[0].refs).toContain("prepare.cpp:380");
+    expect(src[1].refs).toContain("configure.in:1930-1931");
+    expect(src[1].refs).toContain("cmake/src/build_options.cmake:172");
+    // 两种边并存、可区分
+    expect(g.edges.some((e) => e.kind === "tool" && e.from === "H2")).toBe(true);
+    expect(src.every((e) => e.basis === "source")).toBe(true);
+    expect(g.summary.source_edges).toBe(2);
+  });
+
+  it("返回值开头的裁决当收口用——不必等模型在下一次调用写 close=", () => {
+    const g = build([
+      dbdog("t1", "search_dbdog_logs", 1, "[H2] type=cause; claim=x"),
+      agentSpan("a1", 2, "Verify H2", SUBAGENT_RETURN),
+    ]);
+    expect(byId(g).H2.verdict).toBe("falsified");
+    expect(g.edges.some((e) => e.kind === "resolve" && e.to === "H2" && e.verdict === "falsified")).toBe(true);
+  });
+
+  it("VERDICT: 那种写法也认（遥测侧子代理的形状）", () => {
+    const g = build([
+      dbdog("t1", "search_dbdog_logs", 1, "[H1] type=confirm; claim=y"),
+      agentSpan("a1", 2, "Verify H1 runtime evidence",
+        "VERDICT: **inconclusive** — the expected engine-side record is not collectable.\n\n**1. Evidence surfaces**\n- no `openGauss` log ingestion for this instance"),
+    ]);
+    expect(byId(g).H1.verdict).toBe("open");
+    // 没有 file:line 的步不产 source 边（遥测侧的证据仍走 tool 边）
+    expect(g.edges.filter((e) => e.kind === "source").length).toBe(0);
+  });
+
+  it("认不出假设编号的 Agent 返回不制造孤儿边", () => {
+    const g = build([agentSpan("a1", 1, "Locate blob cast code path", "找到了 `gram.y:14321`")]);
+    expect(g.edges.filter((e) => e.kind === "source").length).toBe(0);
+    expect(g.summary.source_edges).toBe(0);
+  });
+});
