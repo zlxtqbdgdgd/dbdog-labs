@@ -42,6 +42,7 @@ N 缺省是 5。用户说「dbdog test loop 3」就是 `--max-per-round 3`。
 | `DBDOG_MCP_URL` | 诊断会话连的 MCP 地址，带 toolsets/skillsets 查询串 |
 | `DBDOG_MCP_BEARER` | 连 MCP 的 bearer。**用 bearer 不走 OAuth，所以远端 http 地址可以直连**，不用回环反代 |
 | `DIAG_WORKDIR` | **被诊断的那棵源码树**，会话的 cwd，要对得上被复现的那个版本 |
+| `CLAUDE_CONFIG_DIR` | **考生跑在哪份配置下**（决定被测模型与端点）。没有就问用户要，别自己挑一份——它随机器和项目阶段漂 |
 | `DENY_ROOT`（可多个） | **禁读根**，见下 |
 
 ### trace 是**跑完当场**写回诊断行的，不等整轮结束
@@ -98,25 +99,29 @@ node $S/llmobs/loop-diagnose.mjs \
 ## 开跑第一行会印被测模型，**看一眼再走开**
 
 ```
-被测模型=deepseek-v4-flash[1M]（来源 env，端点 api.deepseek.com）
+被测模型=<解开后的真模型名>（来源 env，端点 <网关 host>）
 ```
 
 不传 `--model` 时，headless 会话走的是 `ANTHROPIC_MODEL` / `ANTHROPIC_BASE_URL` 两个环境
 变量（多半从 `~/.claude/settings.json` 的 `env` 块继承）。**换台机器、或者哪天改了那两行，
 被测模型就悄悄换了**，而跑批照跑、分数照记。所以开跑时印出来，也一并记进 run metadata。
 
-### 本项目的分工（owner 2026-09-11 定，配置不对就别跑）
+### 本项目的分工（owner 2026-09-11 定）
 
-| 角色 | 模型 | 从哪来 |
+| 角色 | 该用哪一档 | 从哪来 |
 |---|---|---|
-| **被诊断的 agent**（本 skill 起的会话） | **DeepSeek flash** | `~/.claude/settings.json` 的 `env` 块 |
-| **判官**（`judge-run` 起的会话） | **GLM-5.3**（owner 2026-09-12 改） | 切 `CLAUDE_CONFIG_DIR=~/.claude-glm`，`--model opus` 在那份配置里解析成 glm-5.3 |
+| **被诊断的 agent**（本 skill 起的会话） | 便宜快的那一档 | 考生那份 `CLAUDE_CONFIG_DIR` 的 `env` 块 |
+| **判官**（`judge-run` 起的会话） | 强的那一档 | 判官那份 `CLAUDE_CONFIG_DIR`，见 `judge-run` |
 
 **考生用便宜快的、判官用强的**：诊断要跑很多轮、很长，成本在这儿；判卷判错了整条 loop
 的产出都不可信。
 
-开跑前核一眼印出来的那行**是不是 flash**。如果印的是别的，说明环境被改过，那一轮跟历史
-轮次不可比，而且成本可能高一个量级——**停下来问用户**，别闷头跑完。
+**具体是哪个模型、哪个目录，这里不写死**：它随机器和项目阶段漂（判官那一档两天里就换过一次），
+钉在正文里就是把一个会漂的事实做成第二个真相源。**每轮开跑前问用户要「考生跑哪份配置」**，
+拿到了再核开跑那行印出来的是不是它。
+
+印出来的与用户说的对不上，或者跟上一轮不是同一个——**停下来问用户**，别闷头跑完：
+那一轮跟历史轮次不可比，成本还可能高一个量级。
 
 ## 看输出
 
