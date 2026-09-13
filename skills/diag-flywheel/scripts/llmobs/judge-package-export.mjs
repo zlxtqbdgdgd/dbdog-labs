@@ -22,6 +22,7 @@
 //                        /probe.json    探针结果（由 probe.mjs 写；已有则原样保留）
 //                        /prior-judgments.json  这道题**之前几轮**的判题（改进点 items、复验 checks、修复标记，旧的在前）；
 //                                       判这一轮时逐条复验还没关的（飞轮设计 §13.3）。空数组 = 之前没判过
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -268,24 +269,6 @@ if (queued.length) {
   await addAnnotationInteractions(queueID, queued.map((c) => ({ content_id: c.trace_id, content_kind: "trace" })));
 }
 
-const manifest = {
-  generated_at: new Date().toISOString(),
-  server: baseUrl(),
-  project: { id: project.id, name: PROJECT },
-  dataset: datasetName || null,
-  experiment: { id: run.id, name: run.name ?? EXPERIMENT },
-  queue: { id: queueID, name: QUEUE_NAME },
-  // label id 是这个包的一等资产：回写时按它认 label，**永不重发 PUT labels**（重发 = 删光批注）。
-  label_schema: labels.map((l) => ({
-    id: l.id, label: l.label, value_type: l.value_type,
-    ...(l.options ? { options: l.options } : {}), position: l.position,
-    display: LABEL_SCHEMA.find((s) => s.label === l.label)?.display ?? "",
-  })),
-  judge_model: JUDGE_MODEL || null,
-  cases,
-};
-fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
-
 // 判题 skill 正文随包走（蓝区没有 MCP，读不到 Resource）。
 // 判卷口径只住在插件 dbdog-agent-obs 的 diag-judge skill（2026-09-11 起，mcp 不再下发）。
 // 本脚本有两种落点：插件里（`<plugin>/skills/diag-flywheel/scripts/llmobs/` → rubric 在 `../../../diag-judge/SKILL.md`）
@@ -298,6 +281,56 @@ const RUBRIC_CANDIDATES = [
 const rubric = RUBRIC_CANDIDATES.find((p) => fs.existsSync(p));
 if (!rubric) fail(`找不到判卷口径 diag-judge/SKILL.md（找过：${RUBRIC_CANDIDATES.join(" / ")}）——它住在插件 dbdog-agent-obs 的 skills/diag-judge/`);
 fs.copyFileSync(rubric, path.join(OUT, "skill", "SKILL.md"));
+
+/**
+ * 这一版判卷口径的身份：`<插件版本>+<正文前 12 位 sha256>`。
+ *
+ * **两样都要**：插件版本是人看得懂的那个数，但开发期改了正文不升版本是常事；正文哈希不会骗人，
+ * 却没人记得住。拼在一起，跨轮聚合按它分组时既读得懂又分得开。
+ * 找不到 plugin.json（母版检出直接跑）时版本位写 `unknown`——**不编一个**。
+ */
+function rubricIdentity(rubricPath) {
+  const body = fs.readFileSync(rubricPath);
+  const sha = createHash("sha256").update(body).digest("hex").slice(0, 12);
+  let version = "unknown";
+  let dir = path.dirname(rubricPath);
+  for (let i = 0; i < 4; i++) {
+    const manifestPath = path.join(dir, ".claude-plugin", "plugin.json");
+    if (fs.existsSync(manifestPath)) {
+      try {
+        version = String(JSON.parse(fs.readFileSync(manifestPath, "utf8")).version ?? "unknown");
+      } catch { /* 版本读不出来就留 unknown：哈希那一半照样认得出是哪一版 */ }
+      break;
+    }
+    dir = path.dirname(dir);
+  }
+  return { version, sha256: sha, id: `${version}+${sha}` };
+}
+
+const manifest = {
+  generated_at: new Date().toISOString(),
+  server: baseUrl(),
+  project: { id: project.id, name: PROJECT },
+  dataset: datasetName || null,
+  experiment: { id: run.id, name: run.name ?? EXPERIMENT },
+  queue: { id: queueID, name: QUEUE_NAME },
+  // label id 是这个包的一等资产：回写时按它认 label。（2026-09-12 之前这里写的是「永不重发
+  // PUT labels（重发 = 删光批注）」——那是 server 把整份替换实现成「删光重建 + 换新 id」造成的，
+  // 已按 (queue_id,label) upsert 修掉；现在每次导出都会对齐一次词表。）
+  label_schema: labels.map((l) => ({
+    id: l.id, label: l.label, value_type: l.value_type,
+    ...(l.options ? { options: l.options } : {}), position: l.position,
+    display: LABEL_SCHEMA.find((s) => s.label === l.label)?.display ?? "",
+  })),
+  judge_model: JUDGE_MODEL || null,
+  // 判的是**哪一版口径**（2026-09-12）。开跑前守门逐例同步 plugin，所以一轮里前后几例用的
+  // 可能不是同一版 rubric；不记就分不清跨轮差异来自「判官变了」还是「口径变了」，
+  // 而 `annotator` 当初存在的理由正是要把这两件事分开。import 照它写进 `rubric_version`。
+  rubric: rubricIdentity(rubric),
+  cases,
+};
+fs.writeFileSync(path.join(OUT, "manifest.json"), JSON.stringify(manifest, null, 1));
+
 fs.writeFileSync(path.join(OUT, "skill", "README.md"), `# 在蓝区离线判这一包
 
 蓝区没有 dbdog、连不上 server，判题模型**不能回头追问**——材料就这一包，缺什么如实写进 \`summary.md\`。

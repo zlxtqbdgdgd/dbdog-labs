@@ -20,7 +20,8 @@ export const QUEUE_NAME = "diag-judge";
  * `value_type` 走 server 的枚举（boolean / categorical / string / score / json），投影按 value_type 与值的形状算，
  * 不认 label 名（server ADR-0051 附注）。`options` 只有枚举型才发：nil = 不是枚举，`[]` = 是枚举但没配选项——两档不同，别混。
  *
- * 判题方写前三个 + summary；`finding_kinds` 由 import 从 findings 算出（同一件事不写两遍）；`fix_marks` 由修的人用 fix-mark.mjs 写。
+ * 判题方写前三个 + summary；`finding_kinds` 由 import 从 findings 算出（同一件事不写两遍）；
+ * `fix_marks` 由修的人用 fix-mark.mjs 写；`rubric_version` 由 import 从包里记的那份写。
  */
 /**
  * `verdict` 五档（2026-09-12 加 `not_reproduced`）。
@@ -41,6 +42,7 @@ export const LABEL_SCHEMA = [
   { label: "finding_kinds", value_type: "json", display: "改进点类别（由 import 从 findings 算出，筛选用）" },
   { label: "summary", value_type: "string", display: "总评（大白话，≤ 600 字符）" },
   { label: "fix_marks", value_type: "json", display: "修复标记（改了等复验 / 要人协助 / 不修；fix-mark.mjs 写）" },
+  { label: "rubric_version", value_type: "string", display: "判的是哪一版判卷口径（由 import 从包里记的那份写）" },
 ];
 
 /** 判题方要写的 label（其余两个由脚本写）。 */
@@ -809,8 +811,11 @@ export function validateLabels(labels) {
   if (labels.summary !== undefined && typeof labels.summary === "string" && labels.summary.length > 600) {
     problems.push(`summary 太长（${labels.summary.length} 字，上限 600）——总评三句以内，细节写进各条改进点`);
   }
-  for (const k of ["finding_kinds", "fix_marks"]) {
-    if (labels[k] !== undefined) problems.push(`${k} 不由判题方写（finding_kinds 由 import 从 findings 算出；fix_marks 由 fix-mark.mjs 写）`);
+  for (const k of ["finding_kinds", "fix_marks", "rubric_version"]) {
+    if (labels[k] !== undefined) {
+      problems.push(`${k} 不由判题方写（finding_kinds 由 import 从 findings 算出；fix_marks 由 fix-mark.mjs 写；` +
+        `rubric_version 由 import 从包里记的那份写——判官自己填多半会填错自己跑的是哪一版）`);
+    }
   }
   for (const k of ["trustworthy", "needs_fix", "lucky_guess", "attribution_tags", "attribution"]) {
     if (labels[k] !== undefined) problems.push(`${k} 是 2026-09-11 之前的旧词表——结论看 verdict，证据看 evidence，其余都是 findings 里一条条的改进点`);
@@ -821,21 +826,30 @@ export function validateLabels(labels) {
 }
 
 /**
- * 一行 labels → POST annotations 的条目。label id **只从 manifest 取**（PUT labels 不带原 id
- * 重发会把该队列已有的 annotation 级联删光——这是取证到的坑，所以 id 是包的一等资产）。
+ * 一行 labels → POST annotations 的条目。label id **只从 manifest 取**：包里那份是导出当时
+ * 对齐过的，照它写就不会因为词表期间又变过而错挂。
+ * （2026-09-12 之前这里还有一条更硬的理由——「重发 PUT labels 会把该队列已有的 annotation
+ * 级联删光」。那是 server 把整份替换实现成「删光重建 + 换新 id」造成的，已按
+ * `(queue_id,label)` upsert 修掉，PUT 现在幂等且安全。）
+ *
  * `finding_kinds` 在这里从 findings 算出来一起发：判题方写的那份（如果有）被覆盖。
+ * `rubric_version` 同理由调用方给（export 记在 manifest 里）——**判的是哪一版口径**要跟着批注走：
+ * 开跑前守门逐例同步 plugin，一轮里前后几例可能用的不是同一版 rubric，不记就分不清
+ * 「判官变了」还是「口径变了」，而 `annotator` 当初存在的理由正是要把这两件事分开。
  */
-export function annotationPayload({ interactionId, labels, labelIds, annotator }) {
+export function annotationPayload({ interactionId, labels, labelIds, annotator, rubricVersion }) {
   const withKinds = labels.findings !== undefined ? { ...labels, finding_kinds: deriveFindingKinds(labels.findings) } : labels;
+  // 老包的 manifest 里没有这一格：不写，也不编一个——一个猜出来的版本号比没有更坏。
+  const withRubric = rubricVersion ? { ...withKinds, rubric_version: String(rubricVersion) } : withKinds;
   const out = [];
   for (const { label } of LABEL_SCHEMA) {
-    if (withKinds[label] === undefined) continue;
+    if (withRubric[label] === undefined) continue;
     const labelId = labelIds[label];
     if (!labelId) throw new Error(`manifest 里没有 label ${label} 的 id——包过期了，重跑 export`);
     out.push({
       interaction_id: interactionId,
       label_id: labelId,
-      value: withKinds[label],
+      value: withRubric[label],
       ...(annotator ? { annotator } : {}),
     });
   }
