@@ -91,6 +91,22 @@ const MCP_BEARER = process.env.DBDOG_MCP_BEARER || "";
 // 同步考生那份代码的命令。**不内置默认值**：装机形态与配置目录都因机器而异，
 // 写死一条在这儿等于把一个会漂的事实钉成第二个真相源。没给就跳过这一项并告警。
 const SYNC_CMD = argOf("--sync-cmd", process.env.DBDOG_LOOP_SYNC_CMD || "");
+/**
+ * 这一轮**必须拿得到**的工具。连上了不等于拿到的是我们要的那套：`DBDOG_MCP_URL` 带着
+ * toolsets 查询串，配歪了是静默的——会话照起、跑批照跑，只是考生手上少半套工具，
+ * 然后诊断报告写「查不到」，而判官多半会把它判成「模型没想到查」。
+ *
+ * 名单**写在这里而不是问用户要**：它不是会漂的环境事实，是**我们自己声明的依赖**——
+ * 诊断口径（dbm-* 的 investigate）第一步就要 health signals，取证要指标与活动会话。
+ * 要加别的用 `DBDOG_LOOP_EXPECT_TOOLS`（逗号分隔），环境里给了就以环境为准。
+ */
+const REQUIRED_TOOLS = [
+  "get_dbdog_database_health_signals",   // investigate 第 2 步：DBM 三查，一次都不能少
+  "get_dbdog_metric",                    // 引擎与主机侧的实际点位
+  "search_dbdog_database_samples",       // 活动会话 / 阻塞方归因
+  "get_dbdog_database_query_performance",
+];
+const EXPECT_TOOLS = (process.env.DBDOG_LOOP_EXPECT_TOOLS || "").split(",").map((t) => t.trim()).filter(Boolean);
 // 现场过期的安全余量。复现方那边已经减过他那一份，这里再减一道——他排期失准时
 // 我们不该跟着烧一轮 agent 预算。
 const TTL_BUFFER_HOURS = Number(argOf("--ttl-buffer-hours", "2")) || 2;
@@ -199,13 +215,20 @@ if (claimed.length) {
 // 一次守门——那个文件是 dbdog-mcp 的镜像（一致性有守门测试钉着），改它是跨仓的另一条改动。
 // 先做成这样：它已经能挡住「环境整个不通」与「这条的现场已经过期」两类，
 // 而那正是眼下会把环境故障记成模型错的两类。
+// 插件在守门这一遍里被同步到了新版本时置位。诊断这一侧比判题干净：守门跑在**发题之前**，
+// 所以什么都还没跑，整批放回、本轮不跑就行（详见 preflight 的 syncPlugin：热更新做不到，
+// loop 进程已经把脚本加载进内存了）。
+let pluginChanged = null;
 const blocked = [];
 if (claimed.length) {
   const keep = [];
   for (const d of claimed) {
     const verdict = await preflight(d, {
       mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD, bufferHours: TTL_BUFFER_HOURS,
+      expectTools: EXPECT_TOOLS.length ? EXPECT_TOOLS : REQUIRED_TOOLS,
+      configDir: process.env.CLAUDE_CONFIG_DIR,
     });
+    if (verdict.pluginChanged) pluginChanged = verdict.pluginChanged;
     for (const c of verdict.checks ?? []) {
       if (c.skipped) console.error(`  ⚠ ${d.case_source} 守门·${c.name}：${c.detail}`);
     }
@@ -223,6 +246,16 @@ if (claimed.length) {
     }
   }
   claimed = keep;
+}
+// 插件版本变了：**整批放回、本轮不跑**。接着跑等于用旧代码跑完这一批，
+// 而那批数据和新版本不可比、外面却看不出差别——宁可这一轮不跑。
+if (pluginChanged && claimed.length) {
+  console.error(`⚠ 插件已从 ${pluginChanged.from} 同步到 ${pluginChanged.to}——本轮不发题，${claimed.length} 条整批放回。`);
+  console.error("  **重启这条 loop** 就按新版跑：正在跑的进程换不了已经加载的脚本。");
+  for (const d of claimed) {
+    try { await advanceDiagnosis({ id: d.id, from: DIAG_DIAGNOSING, to: DIAG_PENDING }); } catch { /* 等租约回收 */ }
+  }
+  claimed = [];
 }
 if (blocked.length) {
   const by = new Map();

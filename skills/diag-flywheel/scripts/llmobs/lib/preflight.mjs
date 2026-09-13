@@ -19,6 +19,9 @@
 // ——指标？DBM 活动会话？按哪个实例？定错了会把好行挡在门外，而被挡住的行不会自动回来
 // （数据族不自愈），代价比漏挡大得多。理由常量已经在册，等口径定了再接上这一处。
 import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { BLOCK_MCP_TOOLSET_MISMATCH, BLOCK_RECOVERABLE, DIAG_BLOCKED, advanceDiagnosis, listDiagnoses } from "./case-diag-client.mjs";
 
@@ -112,11 +115,12 @@ export async function probeMcp({ url = process.env.DBDOG_MCP_URL, bearer = proce
  *
  * 没配时不挡，只告警——同 MCP 那条的理由。
  */
-export function syncPlugin({ cmd = process.env.DBDOG_LOOP_SYNC_CMD, timeoutMs = 120_000 } = {}) {
+export function syncPlugin({ cmd = process.env.DBDOG_LOOP_SYNC_CMD, configDir = process.env.CLAUDE_CONFIG_DIR, pluginId = PLUGIN_ID, timeoutMs = 120_000 } = {}) {
   const line = (cmd || "").trim();
   if (!line) {
     return { ok: true, skipped: true, detail: "没配 --sync-cmd / DBDOG_LOOP_SYNC_CMD，本轮跳过代码同步（不挡）" };
   }
+  const before = installedPluginVersion(configDir, pluginId);
   const r = spawnSync(line, { shell: true, encoding: "utf8", timeout: timeoutMs });
   if (r.error) return block("plugin_sync_failed", `${line}: ${r.error.message}`);
   if (r.status !== 0) {
@@ -124,7 +128,44 @@ export function syncPlugin({ cmd = process.env.DBDOG_LOOP_SYNC_CMD, timeoutMs = 
     const tail = String(r.stderr || r.stdout || "").trim().split("\n").slice(-3).join(" / ");
     return block("plugin_sync_failed", `${line} 退出码 ${r.status}${tail ? `：${tail}` : ""}`);
   }
-  return { ok: true, detail: `${line} 跑通` };
+  // **版本变了不挡这一条，但要告诉调用方收尾停轮。**
+  //
+  // owner 2026-09-12 要的是「每个用例同步一下代码（plugin）」＝改了马上生效。做不到：
+  // loop 进程启动时已经把脚本加载进内存，而判题会话读的 rubric 是 judge-package-export 从
+  // **正在运行的那份脚本自己的目录**拷进包里的（`.../<版本>/skills/diag-judge/SKILL.md`）。
+  // 同步到新版本，本轮照样用旧脚本、旧口径，`rubric_version` 也照样记旧的，
+  // 还会造出「会话挂新插件的 hooks、判的却是旧口径」这种新的不一致。
+  //
+  // 能给的最接近的东西是「发现变了就停下」：别用旧代码把剩下几十例跑完，
+  // 跑出来那批和新口径不可比、外面却看不出差别。重启 loop 就是新的。
+  //
+  // 读不到版本（没装过 / 配置目录不对）**不当成变了**——那会让每一例都停轮。
+  const after = installedPluginVersion(configDir, pluginId);
+  if (before && after && before !== after) {
+    return { ok: true, changed: true, from: before, to: after, detail: `${line} 跑通；插件 ${before} → ${after}` };
+  }
+  return { ok: true, detail: `${line} 跑通${after ? `（插件 ${after}）` : ""}` };
+}
+
+/** 我们自己的插件 id——这是本仓声明的依赖，不是会漂的环境值，所以钉得住。 */
+const PLUGIN_ID = "dbdog-agent-obs@dbdog-labs";
+
+/** 读配置目录里这个插件当前装的是哪一版；读不到一律回空串（缺配置是常态，不是异常）。 */
+function installedPluginVersion(configDir, pluginId) {
+  if (!configDir) return "";
+  try {
+    const raw = fs.readFileSync(path.join(expandHome(configDir), "plugins", "installed_plugins.json"), "utf8");
+    const rows = JSON.parse(raw)?.plugins?.[pluginId];
+    return Array.isArray(rows) && rows[0]?.version ? String(rows[0].version) : "";
+  } catch {
+    return "";
+  }
+}
+
+/** `~/.claude-glm` 这种写法在命令行里很常见，展开它。 */
+function expandHome(p) {
+  const s = String(p);
+  return s.startsWith("~/") ? path.join(os.homedir(), s.slice(2)) : s;
 }
 
 /**
@@ -157,13 +198,16 @@ export function checkExpiry(row, { bufferHours = 2, now = new Date() } = {}) {
  * 一条用例开跑前的完整守门。回第一个不过的那项——**短路**是有意的：
  * MCP 不通时再去跑一次同步只是浪费两分钟，而理由只记得下一个。
  */
-export async function preflight(row, { mcpUrl, mcpBearer, syncCmd, bufferHours, now } = {}) {
+export async function preflight(row, { mcpUrl, mcpBearer, expectTools, syncCmd, configDir, bufferHours, now } = {}) {
   const checks = [];
-  const mcp = await probeMcp({ url: mcpUrl, bearer: mcpBearer });
+  // 名单要**从调用方传下来**：两条 loop 各自依赖哪几个工具是它们自己声明的
+  // （判题要 llmobs 那几个、诊断要 dbm 那几个），preflight 不该替它们内置一份。
+  // 此前这里没转发，probeMcp 只好回落到读 env，于是两条 loop 声明的依赖根本送不到闸上。
+  const mcp = await probeMcp({ url: mcpUrl, bearer: mcpBearer, ...(expectTools ? { expectTools } : {}) });
   checks.push({ name: "mcp", ...mcp });
   if (!mcp.ok) return { ok: false, reason: mcp.reason, detail: mcp.detail, checks };
 
-  const sync = syncPlugin({ cmd: syncCmd });
+  const sync = syncPlugin({ cmd: syncCmd, configDir });
   checks.push({ name: "plugin", ...sync });
   if (!sync.ok) return { ok: false, reason: sync.reason, detail: sync.detail, checks };
 
@@ -171,7 +215,8 @@ export async function preflight(row, { mcpUrl, mcpBearer, syncCmd, bufferHours, 
   checks.push({ name: "expiry", ...exp });
   if (!exp.ok) return { ok: false, reason: exp.reason, detail: exp.detail, checks };
 
-  return { ok: true, checks };
+  // 版本变了照样放行这一条（它本身没问题），但把信号交上去——调用方判完这一条就收尾停轮。
+  return { ok: true, checks, ...(sync.changed ? { pluginChanged: sync } : {}) };
 }
 
 /**
