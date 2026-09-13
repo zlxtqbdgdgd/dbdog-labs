@@ -88,6 +88,25 @@ const STALE_AFTER_SEC = Number(argOf("--stale-after-sec", String(TIMEOUT_SEC * 2
 const MCP_URL = argOf("--mcp-url", process.env.DBDOG_MCP_URL || "");
 const MCP_BEARER = process.env.DBDOG_MCP_BEARER || "";
 const SYNC_CMD = argOf("--sync-cmd", process.env.DBDOG_LOOP_SYNC_CMD || "");
+/**
+ * 这一轮**必须拿得到**的工具。连上了不等于拿到的是我们要的那套：`DBDOG_MCP_URL` 带着
+ * toolsets 查询串，配歪了是静默的——会话照起、判题照跑，只是判官手上少半套工具，
+ * 然后把「查不到」判成「模型没想到查」。
+ *
+ * 名单**写在这里而不是问用户要**：它不是会漂的环境事实，是**我们自己声明的依赖**——
+ * 判卷口径正文与 judge-session 点名要用的就是这几个。要加别的用
+ * `DBDOG_LOOP_EXPECT_TOOLS`（逗号分隔）追加一份，环境里给了就以环境为准。
+ */
+const REQUIRED_TOOLS = [
+  // 判题取材：整棵 trace、答案纸、那一次执行的 event、已有批注
+  "get_llmobs_trace", "search_llmobs_spans", "get_llmobs_dataset_records",
+  "get_llmobs_experiment_event", "get_llmobs_annotations_by_content_ids",
+  // 在线判题要自己去活系统核（默认模式），dbm 面缺了「要不要修 dbdog」就判不出来
+  "get_dbdog_database_health_signals", "get_dbdog_metric",
+];
+const EXPECT_TOOLS = (process.env.DBDOG_LOOP_EXPECT_TOOLS || "").split(",").map((t) => t.trim()).filter(Boolean);
+// 插件在本轮中途被同步到新版本时置位：判完手上这条就收手（详见 preflight 的 syncPlugin）。
+let pluginChanged = null;
 const TTL_BUFFER_HOURS = Number(argOf("--ttl-buffer-hours", "2")) || 2;
 // `--limit N` = 本轮最多判几条；不给 = 判到队列空为止（一条一条领，见下面的流式循环）。
 const MAX_PER_ROUND = LIMIT > 0 ? LIMIT : 0;
@@ -210,7 +229,13 @@ async function judgeOne(c) {
   // 不过就挡住并记下理由，不是跳过——跳过的话环境长期不通只表现为「队列一直不消」。
   const verdict = await preflight(c.row, {
     mcpUrl: MCP_URL, mcpBearer: MCP_BEARER, syncCmd: SYNC_CMD, bufferHours: TTL_BUFFER_HOURS,
+    expectTools: EXPECT_TOOLS.length ? EXPECT_TOOLS : REQUIRED_TOOLS,
+    configDir: process.env.CLAUDE_CONFIG_DIR,
   });
+  if (verdict.pluginChanged) {
+    pluginChanged = verdict.pluginChanged;
+    console.error(`  ⚠ 插件已同步到 ${pluginChanged.to}（原 ${pluginChanged.from}）——判完这一条就收手`);
+  }
   for (const chk of verdict.checks ?? []) {
     if (chk.skipped) console.error(`  ⚠ 守门·${chk.name}：${chk.detail}`);
   }
@@ -293,10 +318,16 @@ const { ok: okN, failed: failN, skipped, blocked: blockedN } = await walkJudgeQu
   release,
   limit: MAX_PER_ROUND,
   onSkip: (row, reason) => console.error(`· 放回 ${row.case_source}：${UNRESOLVED_WHY[reason] ?? reason}`),
+  shouldStop: () => Boolean(pluginChanged),
 });
 
 if (okN + failN + skipped + blockedN === 0) console.error("本轮无事：诊断表里没有待判题的复现。");
 console.error(`\n== 本轮判题：成 ${okN} 例 · 败 ${failN} 例${skipped ? ` · 放回 ${skipped} 条` : ""}${blockedN ? ` · 挡住 ${blockedN} 条` : ""} ==`);
+if (pluginChanged) {
+  console.error(`⚠ 本轮提前收手：插件已从 ${pluginChanged.from} 同步到 ${pluginChanged.to}。`);
+  console.error("  剩下的行还在队列里，**重启这条 loop** 就按新版判——正在跑的进程换不了脚本，");
+  console.error("  而包里那份 rubric 也是从当前这份脚本的目录拷的，接着跑等于用旧口径判完剩下几十例。");
+}
 // 被挡住**不算判题失败**：环境不通不是这条 loop 干砸了，退出码报 1 会让调度器以为判题坏了、
 // 进而触发一堆本不该有的告警。挡住的行在页面上看得见，下一轮探活通过会自己回队列。
 process.exit(failN > 0 ? 1 : 0);

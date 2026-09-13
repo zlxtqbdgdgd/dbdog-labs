@@ -94,7 +94,7 @@ export function matchJudgeTargets(rows, runsByRecord) {
  *   `limit` 数的是**判了几条**（ok+failed），配不上的与被挡住的都不占配额——
  *   否则用户说「判 3 条」，可能被别的用例集的三条行、或三条环境不通的行吃光。
  */
-export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0, onSkip }) {
+export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0, onSkip, shouldStop }) {
   const held = [];            // 本轮碰过、没判成的：攥到本轮结束再放（理由见上）
   const seenTraces = new Set();
   const seenRows = new Set(); // 兜底：真出现同一行被领两次（攥住之后不该发生），停下来而不是转圈
@@ -130,12 +130,20 @@ export async function walkJudgeQueue({ claim, resolve, judge, release, limit = 0
         console.error(`✗ 判 ${target.eventId ?? row.id} 抛错：${e?.message ?? e}`);
         outcome = "failed";
       }
-      if (outcome === "ok") { ok += 1; continue; }
+      if (outcome === "ok") ok += 1;
       // blocked 的行**不攥**：它已经被改成 blocked，不在 judging 了。
-      if (outcome === "blocked") { blocked += 1; continue; }
-      held.push(row);
-      if (outcome === "skipped") skipped += 1;
-      else failed += 1;
+      else if (outcome === "blocked") blocked += 1;
+      else {
+        held.push(row);
+        if (outcome === "skipped") skipped += 1;
+        else failed += 1;
+      }
+      // **收手信号**（2026-09-12）：插件在本轮中途被同步到了新版本，判完手上这条就停。
+      // 热更新做不到——loop 进程已经把脚本加载进内存，包里那份 rubric 也是从正在跑的
+      // 那份脚本自己的目录拷的。所以「变了就停下，重启即新的」，别用旧代码把剩下几十例跑完，
+      // 跑出来那批和新口径不可比、外面却看不出差别。
+      // **收尾不是硬退**：手上这条已经判完、状态推干净了，攥着的行照常在 finally 里放回。
+      if (shouldStop?.()) break;
     }
   } finally {
     // 攥着的一律放回，哪怕本轮中途出错——留在 judging 的行页面上显示「正在判」，是在骗人
