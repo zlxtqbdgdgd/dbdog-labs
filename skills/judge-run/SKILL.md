@@ -73,7 +73,8 @@ export DBDOG_BASE_URL=<server 的 API 面>          # 控制面在 API 口，不
 export DBDOG_OBS_API_KEY=<控制台签发的 key>        # 与 hooks 上报 span 同一把
 export DBDOG_MCP_URL=<dbdog-mcp 的 /mcp 地址>      # 判题会话取证用，带上 databases=<引擎>
 export DBDOG_MCP_BEARER=<短时 JWT>                 # dbdog-mcp 仓的 scripts/llmobs/mint-mcp-jwt.mjs 铸（不在插件里）
-DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-glm   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
+DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=<判官那份配置目录>   node $S/llmobs/loop-judge.mjs \
+  --dataset <用例集名> --model <判官模型档> --timeout-sec 1800 [--limit N]
 ```
 
 前四个变量 2026-09-11 实测都卡过人，**一个都不能省**：
@@ -85,7 +86,10 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-glm   node $S/llmobs/lo
   注意那个脚本**不在插件里**（`$S/llmobs/` 下没有），插件只镜像了飞轮这一套客户端脚本；
 - 地址与 key 的实际取值看家族 `SECRET-INDEX.md` 与环境总表，**别写进本文**。
 
-`CLAUDE_CONFIG_DIR` **不能省**，省了判官会跑成便宜模型或直接 401，理由见下一节。
+`CLAUDE_CONFIG_DIR` 与 `--model` 这两样**这里不写死，每轮开跑前问用户要**——它们随机器和
+项目阶段漂（判官那一档两天里就换过一次），钉在正文里就是把一个会漂的事实做成第二个真相源。
+**别自己挑一份**：挑错了判题照跑、分数照记，理由见下一节。
+`CLAUDE_CONFIG_DIR` 缺了脚本当场拒跑（在抢任何一条待判题之前）。
 
 `DBDOG_OPERATOR` 也**不能省**（如 `qinqiang`）：它落进诊断表的 `status_changed_by`，
 控制台「状态」列底下那行显的就是它。没有就问用户要，别自己编——loop 在导包起会话**之前**
@@ -107,44 +111,38 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-glm   node $S/llmobs/lo
 
 ## 判官用 `opus` 这个档，**而且必须切配置目录**
 
-| 角色 | 模型 | 怎么来 |
+| 角色 | 该用哪一档 | 怎么来 |
 |---|---|---|
-| 被诊断的 agent（`diag-run` 起的） | DeepSeek flash | `~/.claude/settings.json` 的 `env` 块 |
-| **判官（本 skill 起的）** | **GLM-5.3**（owner 2026-09-12 改，此前是 claude-max 的 opus） | **`CLAUDE_CONFIG_DIR=~/.claude-glm`**，`--model opus` |
+| 被诊断的 agent（`diag-run` 起的） | 便宜快的那一档 | 考生那份配置目录的 `env` 块 |
+| **判官（本 skill 起的）** | **强的那一档** | **问用户要**：判官那份 `CLAUDE_CONFIG_DIR` + `--model` |
 
 考生用便宜快的、判官用强的：诊断要跑很多轮很长，成本在那儿；判卷判错了整条 loop 的产出
 都不可信。
 
-### `opus` 不是一个模型，是**这份配置目录里的一个槽位**
+### `opus` 这类名字不是一个模型，是**某份配置目录里的一个槽位**
 
-同一个 `--model opus`，三份配置给出三个模型：
+同一个 `--model opus`，换一份配置目录就是另一个模型：本机现有三份配置，一份解析成某个国产大模型、
+一份是订阅登录态（`env` 块都没有，解不开）、还有一份解析成考生用的那家的 pro 档。
+**具体各是什么，跑的时候自己看开跑第一行印出来的**——写在这里的任何一个具体值过两周都是错的。
 
-| 配置目录 | `opus` 解析成 | 端点 |
-|---|---|---|
-| `~/.claude-glm` | **`glm-5.3`**（判官现在用这个） | open.bigmodel.cn |
-| `~/.claude-max` | 订阅登录态，没有 env 块——只有 CLI 自己知道 | anthropic |
-| `~/.claude` | `deepseek-v4-pro[1M]` | api.deepseek.com |
+所以**光在命令行上写个模型名不够**，配置目录一错就跑错模型。而且这个错会越来越隐蔽：
+早先某份配置没配 opus 别名，落到那儿会报 `401 Authentication Fails`（响亮）；
+配上别名之后，同样的手误会**静默跑成便宜模型去判卷**，判题照跑、分数照记。
 
-所以**光在命令行上写个模型名不够**，`CLAUDE_CONFIG_DIR` 一省就跑错模型。而且这个错
-2026-09-12 起变得更隐蔽了：以前 `~/.claude` 那份没配 opus 别名，落到那儿会报
-`401 Authentication Fails`（响亮）；现在配了，会**静默跑成 DeepSeek 的 pro 去判卷**，
-判题照跑、分数照记。
-
-```bash
-CLAUDE_CONFIG_DIR=~/.claude-glm node $S/llmobs/loop-judge.mjs --dataset <用例集名> ...
-```
+这就是为什么这两样要问用户、而不是写在这里：写死的那个值过两周就是错的，
+而照着错值跑出来的一轮，外面一点迹象都没有。
 
 ### 开跑第一行会印出解开后的真名，**看一眼再走开**
 
 ```
-⚖ 判题会话开跑（判官 glm-5.3，别名 opus，端点 open.bigmodel.cn，包在 …）…
+⚖ 判题会话开跑（判官 <解开后的真模型名>，别名 <你传的 --model>，端点 <网关 host>，包在 …）…
 ```
 
-印的不是 `glm-5.3` 就说明配置目录不对——停下来，别闷头判完一整轮。
-（印成「别名没解开」是正常的：`~/.claude-max` 那种订阅登录态的配置里本来就没有这一行，
+印出来的**跟用户说的那一档对不上就停下**，别闷头判完一整轮。
+（印成「别名没解开」是正常的：订阅登录态那种配置里本来就没有 `env` 块这一行，
 那时留着别名是诚实的，**编一个模型名比留别名更坏**。）
 
-批注的 `annotator` 记的也是**解开后的真名**（`glm-5.3`），不是别名。理由同上：
+批注的 `annotator` 记的也是**解开后的真名**，不是别名。理由同上：
 annotator 存在就是为了「两轮结论不一样时分得清是 agent 变了还是判官换了」，
 而换配置目录之后新老两批都写着 `opus` 却指两个模型，它就作废了。
 
