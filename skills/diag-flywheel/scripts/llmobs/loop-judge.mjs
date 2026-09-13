@@ -49,6 +49,7 @@ import { resolveDatasetTraces } from "./lib/dataset-traces.mjs";
 import { matchJudgeTargets, walkJudgeQueue } from "./lib/judge-queue.mjs";
 import { DIAG_JUDGED, DIAG_JUDGING, DIAG_PENDING_JUDGEMENT, advanceDiagnosis, blockDiagnosis, claimDiagnosis, listDiagnoses, operator } from "./lib/case-diag-client.mjs";
 import { preflight, resumeBlocked } from "./lib/preflight.mjs";
+import { resolveConfiguredModel } from "./lib/agent-identity.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const argOf = (n, d) => { const i = process.argv.indexOf(n); return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -63,6 +64,14 @@ const LIMIT = Number(argOf("--limit", "0"));
 // "default"——而 annotator 存在的理由正是「两轮结论不一样时分得清是 agent 变了还是判官换了」。
 // 判官换模型就显式传 `--model`，别靠环境里的默认值。
 const MODEL = argOf("--model", "opus");
+// `opus` 不是一个模型，是**这份配置目录里的一个槽位**：`~/.claude-glm` 指 glm-5.3、
+// `~/.claude-max` 指 opus[1m]、`~/.claude` 指 deepseek-v4-pro[1M]。判官 2026-09-12 从
+// claude-max 换到 claude-glm，`annotator` 要是还只记别名，新行与老行都写 `opus` 却指两个模型，
+// 而且静默——annotator 存在的理由正是「两轮结论不一样时分得清是 agent 变了还是判官换了」。
+// 解不开（订阅登录态那种配置没有 env 块）就留别名并在开跑那行标出来，**不编一个**。
+const JUDGE_ID = resolveConfiguredModel({ alias: MODEL });
+// 发给会话的仍是别名：CLI 自己会按配置解析，我们替它解只是为了**记账**。
+const ANNOTATOR = JUDGE_ID.model;
 const TIMEOUT_SEC = Number(argOf("--timeout-sec", "1800")) || 1800;
 const TIMEOUT_MS = TIMEOUT_SEC * 1000;
 const KEEP = has("--keep-package");
@@ -218,7 +227,9 @@ async function judgeOne(c) {
     // dry-run 的包一律留着看；行由 walkJudgeQueue 在本轮结束放回，空跑不该把队列消掉。
     if (DRY) { console.error(`（--dry-run）包在 ${pkg}，不起判题会话、不回流`); return "skipped"; }
 
-    console.error(`⚖ 判题会话开跑（判官 ${MODEL}，包在 ${pkg}）…`);
+    console.error(`⚖ 判题会话开跑（判官 ${ANNOTATOR}${JUDGE_ID.source === "config" ? `，别名 ${MODEL}` : ""}` +
+      `${JUDGE_ID.source === "unresolved" ? "（别名没解开：配置目录里没有对应那一行）" : ""}` +
+      `，端点 ${JUDGE_ID.endpoint}，包在 ${pkg}）…`);
     let prose = "";
     try {
       // 参数（含「必须挂 MCP」那条硬判据）单源在 lib/judge-session.mjs。
@@ -240,7 +251,7 @@ async function judgeOne(c) {
       return "failed";
     }
 
-    const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", MODEL]);
+    const imp = await spawnScript(HERE, "judge-package-import.mjs", ["--package", pkg, "--annotator", ANNOTATOR]);
     if (imp.code !== 0) { console.error(`✗ 回流失败：${c.eventId}（包留在 ${pkg}）`); return "failed"; }
     thisOk = true;
 

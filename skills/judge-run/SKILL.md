@@ -73,7 +73,7 @@ export DBDOG_BASE_URL=<server 的 API 面>          # 控制面在 API 口，不
 export DBDOG_OBS_API_KEY=<控制台签发的 key>        # 与 hooks 上报 span 同一把
 export DBDOG_MCP_URL=<dbdog-mcp 的 /mcp 地址>      # 判题会话取证用，带上 databases=<引擎>
 export DBDOG_MCP_BEARER=<短时 JWT>                 # dbdog-mcp 仓的 scripts/llmobs/mint-mcp-jwt.mjs 铸（不在插件里）
-DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
+DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-glm   node $S/llmobs/loop-judge.mjs --dataset <用例集名> --timeout-sec 1800 [--limit N]
 ```
 
 前四个变量 2026-09-11 实测都卡过人，**一个都不能省**：
@@ -105,38 +105,51 @@ DBDOG_OPERATOR=<你是谁>   CLAUDE_CONFIG_DIR=~/.claude-max   node $S/llmobs/lo
 **`--limit` 数的是「判了几条」，不是「领了几条」**：抢占是全局的（诊断表上没有用例集这一维），
 会领到别的用例集的行，那些当场放回、不占配额。
 
-## 判官用 opus，**而且必须切配置目录**（owner 2026-09-11 定）
+## 判官用 `opus` 这个档，**而且必须切配置目录**
 
 | 角色 | 模型 | 怎么来 |
 |---|---|---|
 | 被诊断的 agent（`diag-run` 起的） | DeepSeek flash | `~/.claude/settings.json` 的 `env` 块 |
-| **判官（本 skill 起的）** | **claude-max 的 opus** | **`CLAUDE_CONFIG_DIR=~/.claude-max`** |
+| **判官（本 skill 起的）** | **GLM-5.3**（owner 2026-09-12 改，此前是 claude-max 的 opus） | **`CLAUDE_CONFIG_DIR=~/.claude-glm`**，`--model opus` |
 
 考生用便宜快的、判官用强的：诊断要跑很多轮很长，成本在那儿；判卷判错了整条 loop 的产出
 都不可信。
 
-### 光在命令行上写个模型名不够，会 401（或者更糟：静默跑成便宜模型）
+### `opus` 不是一个模型，是**这份配置目录里的一个槽位**
 
-`~/.claude` 那份配置的 `env.ANTHROPIC_BASE_URL` 指着 DeepSeek 网关、key 也是 DeepSeek 的。
-在那份配置下要 opus，就是拿**DeepSeek 的 key 去那个端点要 opus**，2026-09-11 实测报：
+同一个 `--model opus`，三份配置给出三个模型：
 
-```
-Failed to authenticate. API Error: 401 Authentication Fails, Your api key: ****hgAA is invalid
-```
+| 配置目录 | `opus` 解析成 | 端点 |
+|---|---|---|
+| `~/.claude-glm` | **`glm-5.3`**（判官现在用这个） | open.bigmodel.cn |
+| `~/.claude-max` | 订阅登录态，没有 env 块——只有 CLI 自己知道 | anthropic |
+| `~/.claude` | `deepseek-v4-pro[1M]` | api.deepseek.com |
 
-claude-max 是**另一份配置目录**（`~/.claude-max`，走订阅登录态，没有 env 覆盖）。
-切过去实测秒回。所以起判题会话时：
+所以**光在命令行上写个模型名不够**，`CLAUDE_CONFIG_DIR` 一省就跑错模型。而且这个错
+2026-09-12 起变得更隐蔽了：以前 `~/.claude` 那份没配 opus 别名，落到那儿会报
+`401 Authentication Fails`（响亮）；现在配了，会**静默跑成 DeepSeek 的 pro 去判卷**，
+判题照跑、分数照记。
 
 ```bash
-CLAUDE_CONFIG_DIR=~/.claude-max node $S/llmobs/loop-judge.mjs --dataset <用例集名> ...
+CLAUDE_CONFIG_DIR=~/.claude-glm node $S/llmobs/loop-judge.mjs --dataset <用例集名> ...
 ```
 
-跑之前确认 `~/.claude-max` 在、登录态没过期。**别用 flash 判**——判出来的结论不可信，
-而且这个错是静默的：判题照跑、分数照记。
+### 开跑第一行会印出解开后的真名，**看一眼再走开**
 
-判官模型由 `--model` 定，**默认 `opus`**（2026-09-11 晚起）。以前默认空串，有两个后果：会话跑成那份配置的
-默认模型（可能是便宜模型），批注的 `annotator` 还会记成 `default`——而 annotator 存在的理由正是
-「两轮结论不一样时分得清是 agent 变了还是判官换了」。换判官就显式传 `--model`。
+```
+⚖ 判题会话开跑（判官 glm-5.3，别名 opus，端点 open.bigmodel.cn，包在 …）…
+```
+
+印的不是 `glm-5.3` 就说明配置目录不对——停下来，别闷头判完一整轮。
+（印成「别名没解开」是正常的：`~/.claude-max` 那种订阅登录态的配置里本来就没有这一行，
+那时留着别名是诚实的，**编一个模型名比留别名更坏**。）
+
+批注的 `annotator` 记的也是**解开后的真名**（`glm-5.3`），不是别名。理由同上：
+annotator 存在就是为了「两轮结论不一样时分得清是 agent 变了还是判官换了」，
+而换配置目录之后新老两批都写着 `opus` 却指两个模型，它就作废了。
+
+判官模型由 `--model` 定，**默认 `opus`**。以前默认空串，会话会跑成那份配置的默认模型，
+`annotator` 还落成 `default`。换判官就显式传 `--model`。
 
 ## 看输出
 

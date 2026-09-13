@@ -110,7 +110,7 @@ node $S/llmobs/loop-diagnose.mjs \
 | 角色 | 模型 | 从哪来 |
 |---|---|---|
 | **被诊断的 agent**（本 skill 起的会话） | **DeepSeek flash** | `~/.claude/settings.json` 的 `env` 块 |
-| **判官**（`judge-run` 起的会话） | **claude-max 的 opus** | 切 `CLAUDE_CONFIG_DIR=~/.claude-max` |
+| **判官**（`judge-run` 起的会话） | **GLM-5.3**（owner 2026-09-12 改） | 切 `CLAUDE_CONFIG_DIR=~/.claude-glm`，`--model opus` 在那份配置里解析成 glm-5.3 |
 
 **考生用便宜快的、判官用强的**：诊断要跑很多轮、很长，成本在这儿；判卷判错了整条 loop
 的产出都不可信。
